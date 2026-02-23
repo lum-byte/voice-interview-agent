@@ -1,0 +1,421 @@
+# loki-config.yaml — Voice Pipeline Log Aggregation
+#
+# Loki runs in single-process mode (all components in one binary).
+# For higher write throughput, switch to microservices mode with a
+# distributed backend (S3 + DynamoDB or object storage with a key-value index).
+#
+# Log pipeline in this stack:
+#   Python app (structlog JSON to stdout)
+#     → Docker log driver
+#     → Promtail (or alloy) agent
+#       → Loki distributor (port 3100)
+#         → Ingester → Chunks → Local filesystem (dev) / S3 (prod)
+#
+# Log-to-trace correlation:
+#   Every structlog record emitted by observability.py includes trace_id and
+#   span_id fields when OTEL_ENABLED=true. Grafana's Loki datasource is
+#   configured with derivedFields that turn those fields into hyperlinks to
+#   the corresponding Tempo trace.
+#
+# Label strategy (critical for Loki performance):
+#   Use only low-cardinality labels. High-cardinality labels (session_id,
+#   request_id, trace_id) must live in the log line JSON, not as Loki labels.
+#   Cardinality explosion slows chunk lookup and inflates index size.
+#
+# Labels attached by the Promtail scrape config (not this file):
+#   service = "voice-pipeline"
+#   component = "stt" | "llm" | "tts" | "session" | "pipeline" | ...
+#   env = "development" | "production"
+#   host = <hostname>
+#
+# Querying logs for a specific session (LogQL):
+#   {service="voice-pipeline"} | json | session_id="<sid>"
+#
+# Querying logs for a specific trace:
+#   {service="voice-pipeline"} | json | trace_id="<32-char-hex>"
+#
+# Querying LLM errors only:
+#   {service="voice-pipeline"} | json | service_field="llm" | level="error"
+#
+# Querying circuit breaker events:
+#   {service="voice-pipeline"} | json | kind=~"circuit_breaker_.*"
+
+
+auth_enabled: false
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVER
+# ─────────────────────────────────────────────────────────────────────────────
+
+server:
+  # HTTP API and Grafana datasource endpoint.
+  http_listen_port: 3100
+  http_listen_address: 0.0.0.0
+
+  # Internal gRPC port for inter-component communication (ingester ↔ querier
+  # in microservices mode). In single-process mode, this is used by the
+  # ruler and compactor for internal coordination.
+  grpc_listen_port: 9096
+  grpc_listen_address: 0.0.0.0
+
+  # Maximum size of a gRPC message in bytes. Must be large enough to hold
+  # a single log batch push request. The app generates structured JSON lines
+  # that can be up to 1 MB each (set in limits_config.max_line_size).
+  # 4 MB gives ample headroom for a full batch.
+  grpc_server_max_recv_msg_size: 4194304
+  grpc_server_max_send_msg_size: 4194304
+
+  # Log verbosity for the Loki process itself.
+  # warn reduces noise from internal timing info. Use info or debug only when
+  # troubleshooting ingestion or query issues.
+  log_level: warn
+
+  # Log format: logfmt (default) or json. Use json for structured log forwarding
+  # (e.g. Loki logging its own logs to a central aggregator — yes, recursive).
+  log_format: logfmt
+
+  # HTTP request timeout. Keep generous for long-running LogQL queries.
+  http_server_read_timeout: 60s
+  http_server_write_timeout: 60s
+  http_server_idle_timeout: 120s
+
+  # Graceful shutdown timeout. Loki waits this long for in-flight requests
+  # to complete before forcibly closing connections.
+  graceful_shutdown_timeout: 30s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMON (shared path/ring/storage defaults for single-process mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+common:
+  # Base path prefix for all Loki data directories. All paths in storage,
+  # compactor, and ingester sections are relative to this prefix.
+  path_prefix: /loki
+
+  instance_addr: 127.0.0.1
+  instance_interface_names: [ eth0, lo ]
+
+  storage:
+    filesystem:
+      # Chunk storage: compressed log data blocks.
+      chunks_directory: /loki/chunks
+
+      # Rule storage: alerting rules managed by the Loki ruler component.
+      rules_directory: /loki/rules
+
+  # Replication factor: number of copies of each chunk.
+  # 1 = no redundancy (development only). Set to 3 for production high-availability.
+  replication_factor: 1
+
+  ring:
+    kvstore:
+      # In-memory ring for single-process mode. For multi-replica Loki, switch
+      # to consul or etcd so all replicas share the same ring state.
+      store: inmemory
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEMA — defines the storage engine and index format per time period
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The schema defines how Loki indexes and stores chunks.
+# Never delete old schema entries — doing so makes historical data unqueryable.
+# Add new entries at the END of the list when upgrading the schema version.
+#
+# Current recommendation: store=tsdb, schema=v13 (Loki 2.9+).
+# TSDB is faster and more resource-efficient than boltdb-shipper for
+# production workloads.
+
+schema_config:
+  configs:
+    # Initial schema covering all historical data from this date forward.
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        # Index file prefix. All index entries for this period have this prefix.
+        prefix: index_
+
+        # How often a new index file is created. 24h = one file per day.
+        # Shorter periods improve compaction efficiency at higher metadata overhead.
+        period: 24h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INGESTER
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The ingester buffers incoming log lines in memory before writing chunks to
+# the store. Tuning the ingester is the primary lever for controlling ingest
+# latency and memory usage.
+
+ingester:
+  # How long to wait before flushing a chunk that hasn't received new lines.
+  # 5 minutes is a common value. Shorter = more frequent flushes, lower latency
+  # for query visibility. Longer = larger chunks (better compression), higher
+  # latency before logs appear in queries.
+  chunk_idle_period: 5m
+
+  # Flush a chunk when it reaches this size (uncompressed bytes).
+  # 1 MB is the default. Larger chunks compress better but delay flush.
+  # For the voice pipeline's low-volume structured JSON logs, 256 KB is fine.
+  chunk_target_size: 262144
+
+  # Maximum chunk age before it is forcibly flushed, regardless of idle period.
+  # Ensures logs appear in Grafana within this window even under very low traffic.
+  max_chunk_age: 1h
+
+  # Number of chunks to keep in memory per stream, even after flushing.
+  # 0 = flush immediately and release memory. Higher values speed up queries
+  # for recent logs at the cost of memory.
+  chunk_retain_period: 30s
+
+  # WAL (Write-Ahead Log) — persists in-memory chunks to disk so they survive
+  # ingester restarts without data loss. Strongly recommended for production.
+  wal:
+    enabled: true
+    dir: /loki/wal
+
+    # Flush WAL to storage after this many operations or this much time,
+    # whichever comes first.
+    flush_on_shutdown: true
+
+    # How long to wait for WAL replay on startup before timing out.
+    replay_memory_ceiling: 4GB
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERIER
+# ─────────────────────────────────────────────────────────────────────────────
+
+querier:
+  # Maximum number of queries to execute concurrently. Scale up for faster
+  # dashboard loads at the cost of higher peak memory during concurrent queries.
+  max_concurrent: 10
+
+  # How long a query worker waits for a new query before shutting down. In
+  # single-process mode, this controls idle goroutine lifetime.
+  query_timeout: 5m
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERY SCHEDULER
+# ─────────────────────────────────────────────────────────────────────────────
+
+query_scheduler:
+  max_outstanding_requests_per_tenant: 256
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERY FRONTEND
+# ─────────────────────────────────────────────────────────────────────────────
+
+frontend:
+  # Maximum queue depth per tenant in the query frontend.
+  max_outstanding_per_tenant: 256
+
+  # Log slow queries slower than this threshold. Useful for identifying
+  # LogQL queries that scan large time ranges or high-cardinality labels.
+  log_queries_longer_than: 5s
+
+  # Compress query responses. Grafana supports gzip — this cuts bandwidth
+  # for large log responses by ~60-80%.
+  compress_responses: true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LIMITS (per-tenant rate limiting and size guards)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These are global defaults. Per-tenant overrides can be set via the /loki/api/v1/rules
+# endpoint or a tenant-specific runtime_config file if multi-tenancy is enabled.
+
+limits_config:
+  # Reject log lines larger than this. observability.py emits large JSON blobs
+  # (full ObsEvent with all optional fields) — the largest realistic line is the
+  # LLM response with a full conversation history, which may hit 50-100 KB.
+  # 1 MB is a safe ceiling.
+  max_line_size: 1MB
+
+  # Rate limit for push requests per tenant (bytes/second ingested).
+  # The voice pipeline generates ~1-5 KB of logs per pipeline run.
+  # At 100 concurrent sessions with 1 turn every 10 seconds:
+  #   100 × 5 KB / 10s = 50 KB/s average ingestion rate.
+  # 16 MB/s (default) is far above this — no need to lower unless multi-tenanted.
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+
+  # Maximum number of active streams (unique label-set combinations) per tenant.
+  # With low-cardinality labels, this pipeline generates < 100 unique streams.
+  max_streams_per_user: 10000
+
+  # Maximum number of chunks returned by a single query. Prevents runaway scans.
+  max_chunks_per_query: 2000000
+
+  # Maximum number of log entries returned by a log query (not metric query).
+  # 50,000 lines is enough for any session-scoped query.
+  max_entries_limit_per_query: 50000
+
+  # Maximum total bytes of log data returned by a single query.
+  max_query_bytes_read: 500MB
+
+  # Maximum time range a single query may span. 30 days covers most analytics
+  # use cases without risking runaway full-scan queries.
+  max_query_range: 720h
+
+  # Cardinality enforcement: reject label value counts above this threshold.
+  # Protects against accidental high-cardinality labels (e.g. if session_id
+  # were ever added as a Loki label instead of a JSON field).
+  max_label_names_per_series: 30
+  max_label_value_length: 2048
+
+  # Reject pushes that include future-dated log timestamps beyond this window.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h    # 7 days — covers delayed batch uploads
+
+  # Allow slightly future-dated logs (clock skew tolerance).
+  creation_grace_period: 10m
+
+  # Data retention per tenant. 336h = 14 days. Matches Loki compactor config.
+  # Increase to 90d (2160h) for longer historical analysis, but ensure disk
+  # capacity on /loki/chunks supports the retention period × ingestion rate.
+  retention_period: 336h
+
+  # Split log queries into sub-queries of this duration to enable parallelism.
+  # Shorter splits = more parallelism = faster queries but more overhead.
+  # 1h is a good default for moderate traffic.
+  split_queries_by_interval: 1h
+
+  # Maximum number of unique series returned by a metric query.
+  max_query_series: 500
+
+  # Per-query parallelism: number of shards to split a single query into.
+  max_query_parallelism: 16
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHUNK STORE
+# ─────────────────────────────────────────────────────────────────────────────
+
+chunk_store_config: { }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STORAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+storage_config:
+  tsdb_shipper:
+    active_index_directory: /loki/tsdb-index
+    cache_location: /loki/tsdb-cache
+    cache_ttl: 24h
+
+    # For production: use S3 or GCS as the object store and set shared_store to
+    # "s3" or "gcs", with credentials in environment variables or an IAM role.
+    # shared_store: s3
+
+  filesystem:
+    directory: /loki/chunks
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPACTOR — manages chunk compaction and data retention
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The compactor merges small index files into larger ones (reducing open file
+# handles) and enforces retention by deleting chunks older than limits_config
+# retention_period.
+
+compactor:
+  working_directory: /loki/compactor
+  shared_store: filesystem
+
+  # Enforce retention policies. When false, data accumulates forever.
+  retention_enabled: true
+
+  # After marking a chunk for deletion, wait this long before physically
+  # removing it. Allows cancellation if a mistake is made.
+  retention_delete_delay: 2h
+
+  # Number of deletion worker goroutines. Scale up if retention backlog grows.
+  retention_delete_worker_count: 150
+
+  # How often the compactor runs. Every 10 minutes keeps index files tidy
+  # without excessive overhead.
+  compaction_interval: 10m
+
+  # Apply retention logic during each compaction cycle.
+  apply_retention_interval: 1h
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RULER — alerting on log data (optional)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The ruler evaluates LogQL metric queries on a schedule and fires alerts
+# via Alertmanager. This enables log-based alerts like:
+#   "Circuit breaker opened more than 3 times in the last 5 minutes"
+#   "Prompt injection detected in the last hour"
+#   "Redis disconnected in the last minute"
+#
+# Uncomment and configure to enable:
+# ruler:
+#   storage:
+#     type: local
+#     local:
+#       directory: /loki/rules
+#   rule_path: /loki/rules
+#   alertmanager_url: http://alertmanager:9093
+#   ring:
+#     kvstore:
+#       store: inmemory
+#   enable_api: true
+#   # Example alert rule file at /loki/rules/fake/pipeline_alerts.yaml:
+#   # groups:
+#   #   - name: pipeline_alerts
+#   #     rules:
+#   #       - alert: CircuitBreakerOpened
+#   #         expr: |
+#   #           sum(count_over_time({service="voice-pipeline"} | json | kind="circuit_breaker_opened" [5m])) > 3
+#   #         for: 0m
+#   #         labels:
+#   #           severity: warning
+#   #         annotations:
+#   #           summary: "Circuit breaker opened frequently"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICS / USAGE REPORTING
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Disable Grafana's anonymous usage reporting. In a closed deployment, this
+# data is not useful and represents unnecessary outbound network traffic.
+
+analytics:
+  reporting_enabled: false
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CACHES (optional performance optimisations)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Loki can use memcached or Redis for index, chunk, and query result caches.
+# In development, in-process embedded caches are used automatically.
+# For production, external caches dramatically reduce disk I/O and query latency.
+#
+# chunk_cache_config:
+#   memcached_client:
+#     host: memcached:11211
+#     service: memcached
+#     consistent_hash: true
+#     max_idle_conns: 16
+#     timeout: 100ms
+#
+# index_cache_config:
+#   redis:
+#     endpoint: redis:6379
+#     db: 1         # use a different DB from the pipeline's Redis to avoid eviction conflicts
+#     expiration: 1h

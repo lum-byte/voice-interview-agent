@@ -1,0 +1,94 @@
+# dashboards.yaml — Grafana Dashboard Provisioning
+# Mounted at: /etc/grafana/provisioning/dashboards/
+#
+# This file tells Grafana to watch a directory for dashboard JSON files
+# and automatically load them on startup and whenever they change.
+#
+# How dashboard provisioning works:
+#   1. This file is read by Grafana at startup.
+#   2. Grafana begins polling the path directory every updateIntervalSeconds.
+#   3. Any .json file found in that directory is loaded as a dashboard.
+#   4. observability.py's write_grafana_dashboard() writes:
+#        ./grafana/dashboards/ai_pipeline.json
+#      at application startup, which Grafana detects and loads.
+#   5. If the dashboard JSON changes (e.g. new panels added), Grafana reloads
+#      it automatically within updateIntervalSeconds seconds.
+#
+# Dashboard JSON file conventions:
+#   - The JSON must contain a valid Grafana dashboard schema (schemaVersion >= 36).
+#   - The "uid" field in the JSON uniquely identifies the dashboard. Grafana uses
+#     the uid, not the filename, to track and update dashboards.
+#   - If two files share the same uid, the last-loaded file wins (avoid this).
+#   - The "__inputs" section (datasource placeholders) is processed automatically
+#     — Grafana replaces placeholders with the provisioned datasource UIDs.
+#
+# Dashboard file layout expected by observability.write_grafana_dashboard():
+#   grafana/
+#     dashboards/
+#       ai_pipeline.json          — main pipeline observability dashboard
+#     provisioning/
+#       dashboards/
+#         ai_pipeline.yaml        — this file (written dynamically by Python too)
+#       datasources/
+#         prometheus.yaml         — Prometheus datasource (written by Python)
+#         tempo.yaml              — Tempo datasource (written by Python)
+#         loki.yaml               — Loki datasource (written by Python)
+
+
+apiVersion: 1
+
+providers:
+
+  # ── Voice Assistant Pipeline Dashboards ────────────────────────────────────
+  # Primary dashboard provider: loads all .json files from the dashboards path.
+  - name: Voice Assistant Pipeline
+    orgId: 1
+
+    # type: file means Grafana reads dashboard JSON from a filesystem path.
+    # Other types (git, url) are available in Grafana Enterprise.
+    type: file
+
+    # When false, dashboards provisioned by this file cannot be deleted
+    # from the Grafana UI. Set to true in development for easy cleanup.
+    # In production, set to false to prevent accidental UI deletions from
+    # removing dashboards that are managed via version control.
+    disableDeletion: false
+
+    # How often (in seconds) Grafana rescans the path for new or changed JSON files.
+    # 30s gives near-real-time feedback during development. Increase to 300s
+    # in production to reduce filesystem stat overhead.
+    updateIntervalSeconds: 30
+
+    # Allow dashboard edits from the Grafana UI. Changes made in the UI are
+    # written back to the JSON file on disk (if Grafana has write permission).
+    # In production, set allowUiUpdates: false to enforce GitOps discipline:
+    # all dashboard changes must go through the code review process.
+    allowUiUpdates: true
+
+    options:
+      # Absolute or container-relative path to the directory containing
+      # dashboard JSON files. This path is inside the Grafana container.
+      # docker-compose.yml should volume-mount ./grafana/dashboards to this path:
+      #   volumes:
+      #     - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      path: /var/lib/grafana/dashboards
+
+      # If true, subdirectory names are used as Grafana folder names.
+      # Example: dashboards/stt/latency.json → folder "stt", dashboard "latency"
+      # Enable this when you have many dashboards organised by service or team.
+      foldersFromFilesStructure: true
+
+  # ── Infrastructure Dashboards (optional second provider) ──────────────────
+  # A second provider for infrastructure dashboards (node exporter, cAdvisor,
+  # redis exporter) kept separate from the application dashboards.
+  # Uncomment if you mount a second dashboards directory.
+  #
+  # - name: Infrastructure
+  #   orgId: 1
+  #   type: file
+  #   disableDeletion: true
+  #   updateIntervalSeconds: 300
+  #   allowUiUpdates: false
+  #   options:
+  #     path: /var/lib/grafana/dashboards/infra
+  #     foldersFromFilesStructure: false

@@ -1,0 +1,468 @@
+# otel-collector-config.yaml — Voice Pipeline OpenTelemetry Collector
+#
+# The OTel Collector is the telemetry hub between the application and backends.
+#
+# Data flow:
+#
+#   Python app (observability.py, OTEL_ENABLED=true)
+#     OTLP/gRPC → Collector :4319
+#     OTLP/HTTP → Collector :4318
+#       ↓  memory_limiter processor
+#       ↓  resource processor (adds deployment.environment, service.namespace)
+#       ↓  attributes processor (adds/transforms span attributes)
+#       ↓  batch processor
+#       ↓
+#     → Tempo :4317 (gRPC)    — trace storage
+#     → debug exporter        — stdout for troubleshooting
+#
+# Why use a Collector instead of exporting directly to Tempo?
+#   1. Fan-out: forward to multiple backends (Tempo + Jaeger) without code changes.
+#   2. Batching + retry: collector absorbs burst load; the app never blocks on export.
+#   3. Attribute enrichment: add cluster/env labels centrally.
+#   4. Sampling: add a tail-sampler here to sample only error traces in production.
+#   5. Filtering: drop noisy health-check spans from the pipeline.
+#
+# Span naming conventions used by observability.py:
+#   ai.pipeline.api / ai.pipeline.stream    — root pipeline spans
+#   ai.stt.transcribe                        — Whisper transcription
+#   ai.llm.generate / ai.llm.stream          — OpenAI LLM call
+#   ai.tts.synthesize / ai.tts.stream        — TTS synthesis
+#   ai.eval.score                            — evaluation engine
+#   ai.session.<operation>                   — session store operations
+#   ai.memory.resolve / commit / compress    — conversation memory
+#   ai.sanitize                              — TTS pre-processing sanitizer
+#
+# Key span attributes (OpenTelemetry semantic conventions + ai.*):
+#   ai.session.id          — session correlation key
+#   ai.request.id          — per-turn correlation key
+#   ai.pipeline.stage      — current pipeline stage
+#   ai.pipeline.qos_tier   — REALTIME | STANDARD | BATCH
+#   gen_ai.system          — "openai"
+#   gen_ai.request.model   — requested model name
+#   gen_ai.response.model  — actual model used (post-fallback)
+#   gen_ai.usage.prompt_tokens
+#   gen_ai.usage.completion_tokens
+#   ai.llm.cache_hit       — true when served from Redis
+#   ai.stt.language
+#   ai.stt.language_confidence
+#   ai.tts.voice
+#   ai.circuit_breaker.*   — CB name, state, failure count
+#   ai.latency_budget.*    — remaining budget, used percentage
+#
+# Enable tracing in the app:
+#   OTEL_ENABLED=true in .env
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318  (or :4319 for gRPC)
+#   OTEL_SERVICE_NAME=voice-pipeline
+#   OTEL_TRACE_SAMPLE_RATE=1.0                          (1.0 = record everything)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXTENSIONS — health, profiling, and configuration management
+# ─────────────────────────────────────────────────────────────────────────────
+
+extensions:
+
+  # Health check HTTP endpoint. Docker healthcheck, load balancers, and
+  # Kubernetes readiness probes use this to confirm the collector is alive.
+  # curl http://localhost:13133/  → 200 OK when ready
+  # NOTE: check_collector_pipeline was introduced in contrib v0.101+; omit it
+  # for 0.99.0 to avoid extension config-validation failure.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # pprof profiling endpoint — accessible at http://localhost:1777/debug/pprof/
+  # Use this during performance profiling of the collector itself, not the app.
+  # Disable in production if the collector is internet-facing.
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+  # zpages — diagnostic web UI at http://localhost:55679/debug/tracez
+  # Shows recent spans processed by the collector. Useful for verifying
+  # that spans from the app are arriving correctly.
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+  # Bearer token authentication for the collector's own HTTP endpoints.
+  # Uncomment and configure to secure the health_check, pprof, and zpages endpoints.
+  # bearertokenauth/self:
+  #   token: <collector-admin-token>
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECEIVERS — how the collector accepts telemetry from the app
+# ─────────────────────────────────────────────────────────────────────────────
+
+receivers:
+
+  # OTLP receiver — the primary ingress for traces from observability.py.
+  # observability.py uses OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True).
+  # The app sends to either the HTTP or gRPC endpoint depending on the SDK config.
+  otlp:
+    protocols:
+
+      # gRPC endpoint — lower overhead than HTTP, preferred for high-throughput.
+      # observability.py defaults to gRPC via OTLPSpanExporter.
+      # App config: OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4319
+      grpc:
+        endpoint: 0.0.0.0:4319
+        # max_recv_msg_size_mib: 4    # maximum incoming message size in MiB
+        # keepalive:
+        #   server_parameters:
+        #     max_connection_idle: 11s
+        #     max_connection_age: 12s
+        #     max_connection_age_grace: 5s
+        #     time: 10s
+        #     timeout: 1s
+
+      # HTTP endpoint — used by browser-based instrumentation and some SDKs.
+      # App config: OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+      http:
+        endpoint: 0.0.0.0:4318
+
+        # CORS for browser-originated telemetry (web frontend instrumentation).
+        cors:
+          allowed_origins:
+            - "http://localhost:*"
+            - "http://127.0.0.1:*"
+            - "https://*.yourdomain.com"     # add your production frontend domain
+          allowed_headers:
+            - "*"
+          max_age: 7200
+
+
+  # Prometheus receiver — scrapes metrics from the Prometheus endpoint that
+  # observability.py exposes via start_http_server(PROMETHEUS_PORT).
+  # This enables the collector to forward Prometheus metrics via OTLP to
+  # backends that prefer push-based metrics (e.g. Signoz, Datadog).
+  #
+  # Disabled by default — the Prometheus server already scrapes the app endpoint.
+  # Enable this only if you want to centralise metric collection through the collector.
+  #
+  # prometheus:
+  #   config:
+  #     scrape_configs:
+  #       - job_name: voice_pipeline_metrics
+  #         scrape_interval: 15s
+  #         static_configs:
+  #           - targets: ['host.docker.internal:9091']
+
+  # Jaeger receiver — accepts spans from services using the Jaeger client SDK.
+  # Useful if you are integrating with existing Jaeger-instrumented services.
+  #
+  # jaeger:
+  #   protocols:
+  #     grpc:
+  #       endpoint: 0.0.0.0:14250
+  #     thrift_http:
+  #       endpoint: 0.0.0.0:14268
+  #     thrift_compact:
+  #       endpoint: 0.0.0.0:6831
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROCESSORS — transform and filter spans before export
+# ─────────────────────────────────────────────────────────────────────────────
+
+processors:
+
+  # Memory safeguard — drop spans if the collector process exceeds memory limits.
+  # This prevents the collector from being a source of OOM pressure on the host.
+  # check_interval: how often to check current memory usage.
+  # limit_mib: hard limit — spans are dropped above this.
+  # spike_limit_mib: soft limit — the garbage collector is triggered above this.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+    # limit_percentage: 80     # alternative: % of total system memory
+
+  # Resource processor — add uniform labels to every span.
+  # These appear as resource attributes on every span in Tempo and
+  # are queryable in TraceQL as resource.<key>.
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: development
+        action: upsert
+
+      - key: service.namespace
+        value: voice-pipeline
+        action: upsert
+
+      - key: service.version
+        value: "v2"
+        action: insert
+
+      # Uncomment to tag spans with the hosting infrastructure:
+      # - key: cloud.provider
+      #   value: aws
+      #   action: upsert
+      # - key: cloud.region
+      #   value: us-east-1
+      #   action: upsert
+      # - key: host.name
+      #   value: ${HOSTNAME}
+      #   action: upsert
+
+  # Attributes processor — transform individual span attributes.
+  # Useful for redacting sensitive data, normalising inconsistent values,
+  # and extracting fields for better indexing.
+  attributes:
+    actions:
+      # Mask any raw IP addresses that accidentally appear in span attributes.
+      # The app uses ip_masked (HMAC fingerprint), but this is a safety net.
+      - key: client.address
+        action: hash
+
+      # Remove full audio path to avoid high-cardinality directory paths in indexes.
+      - key: ai.stt.audio_path
+        action: delete
+
+  # Transform processor — apply OTTL (OpenTelemetry Transformation Language) expressions.
+  # More powerful than the attributes processor for conditional logic.
+  transform:
+    error_mode: ignore   # continue processing even if a transformation fails
+    trace_statements:
+      - context: span
+        statements:
+          # Truncate long error messages in span attributes.
+          - truncate_all(attributes, 500)
+
+          # If the span has no ai.session.id but has one in resource attributes,
+          # copy it down. This handles cases where session context is lost.
+          - |
+            set(attributes["ai.session.id"], resource.attributes["ai.session.id"])
+            where attributes["ai.session.id"] == nil and resource.attributes["ai.session.id"] != nil
+
+  # Filter processor — drop spans that are not interesting.
+  # Reduces Tempo storage costs by filtering health checks and noise.
+  filter:
+    error_mode: ignore
+    traces:
+      span:
+        # Drop health check spans — these are extremely high volume and low value.
+        - 'name == "health_check" or name == "/health" or name == "GET /health"'
+
+        # Drop metrics-only spans (Prometheus scrape spans from the SDK's
+        # internal exemplar attachment, if any).
+        - 'name == "prometheus_scrape"'
+
+        # Drop any span shorter than 1 millisecond with status OK — these are
+        # typically internal bookkeeping operations, not user-facing calls.
+        # Adjust or remove if you want complete traces.
+        # - 'duration < 1000000 and status.code == STATUS_CODE_OK'
+
+  # Batch processor — the most important processor for throughput.
+  # Groups spans into batches before export to reduce HTTP/gRPC overhead.
+  #
+  # send_batch_size: export when batch reaches this many spans.
+  # send_batch_max_size: hard cap on batch size (prevents runaway memory).
+  # timeout: export after this time even if batch is not full.
+  #
+  # Under load: the LLM stage alone emits ~6 spans per pipeline run
+  # (pipeline_root, llm_span, memory_resolve, memory_commit, sanitize, tts).
+  # At 100 concurrent pipelines, that's 600 spans per run × turns/sec.
+  # 1024 send_batch_size with 5s timeout handles up to 200 spans/sec comfortably.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+  # Tail sampling: makes sampling decisions on the COMPLETE trace, not on the
+  # first span. This ensures 100% of error traces and slow traces are always
+  # captured — critical for debugging failed interview sessions — while
+  # sampling only a fraction of fast, healthy traces to control storage costs.
+  #
+  # decision_wait must be >= the longest span in any pipeline trace.
+  # For voice AI: LLM streaming can take up to 45s, so 60s is safe.
+  tail_sampling:
+    decision_wait: 60s
+    num_traces: 100000          # max traces held in memory awaiting decision
+    expected_new_traces_per_sec: 200
+    policies:
+      # Always capture traces containing an error span.
+      # Any failed STT, LLM, TTS, or session operation shows up here.
+      - name: errors
+        type: status_code
+        status_code: { status_codes: [ ERROR ] }
+
+      # Always capture slow traces (root span > 10s).
+      # These are the sessions where the user experienced a bad interview.
+      - name: slow_requests
+        type: latency
+        latency: { threshold_ms: 10000 }
+
+      # Always capture traces involving a circuit breaker state change.
+      # These signal systemic failures affecting many concurrent users.
+      - name: circuit_breakers
+        type: string_attribute
+        string_attribute:
+          key: ai.cb.state
+          values: [ OPEN, HALF_OPEN ]
+
+      # Always capture prompt injection detections — security audit trail.
+      - name: injection_detected
+        type: string_attribute
+        string_attribute:
+          key: ai.sanitize.injection_detected
+          values: [ "true" ]
+
+      # Sample 25% of healthy, fast traces for baseline performance data.
+      # Increase to 100% if storage allows; decrease if Tempo fills up.
+      - name: standard_rate
+        type: probabilistic
+        probabilistic: { sampling_percentage: 25 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORTERS — where the collector sends processed telemetry
+# ─────────────────────────────────────────────────────────────────────────────
+
+exporters:
+
+  # Tempo trace backend (Grafana Tempo).
+  # Receives spans via OTLP/gRPC and stores them for Grafana to query.
+  # Grafana's Tempo datasource queries port 3200; spans arrive at port 4317.
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true    # use false + tls config for production TLS
+      # ca_file: /etc/otel/tls/ca.crt
+      # cert_file: /etc/otel/tls/client.crt
+      # key_file: /etc/otel/tls/client.key
+
+    # Retry failed exports with exponential backoff.
+    # Critical for resilience when Tempo is temporarily unavailable.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s    # stop retrying after 5 minutes
+
+    # Sending queue: buffer spans in memory while Tempo is slow or unreachable.
+    # num_consumers: parallel sending goroutines.
+    # queue_size: maximum span batches to buffer.
+    sending_queue:
+      enabled: true
+      num_consumers: 10
+      queue_size: 1000
+      # storage:               # uncomment to persist queue to disk across collector restarts
+      #   storage_id: file_storage/traces
+
+  # Jaeger exporter — additional trace backend (optional).
+  # Enable if you are running Jaeger alongside Tempo for comparison,
+  # or if your operations team uses Jaeger as their primary trace viewer.
+  #
+  # otlp/jaeger:
+  #   endpoint: jaeger:4317
+  #   tls:
+  #     insecure: true
+  #   retry_on_failure:
+  #     enabled: true
+
+  # Datadog exporter — forward traces to Datadog APM.
+  # Requires the opentelemetry-collector-contrib datadog exporter.
+  #
+  # datadog:
+  #   api:
+  #     key: ${DATADOG_API_KEY}
+  #     site: datadoghq.com
+  #   traces:
+  #     span_name_remappings:
+  #       ai.pipeline.api: ai.pipeline
+  #     compute_stats_by_span_kind: true
+
+  # OTLP/HTTP exporter — forward to any OTLP-compatible backend (Signoz, Honeycomb, etc.)
+  #
+  # otlphttp/signoz:
+  #   endpoint: https://ingest.signoz.io:443
+  #   headers:
+  #     signoz-ingestion-key: ${SIGNOZ_INGESTION_KEY}
+
+  # Debug exporter — logs span summaries to the collector's stdout.
+  # Invaluable during initial integration testing.
+  # verbosity: basic    = span name, duration, status
+  # verbosity: detailed = all attributes (very verbose, disable in production)
+  debug:
+    verbosity: basic
+    sampling_initial: 5          # log first 5 spans without rate limiting
+    sampling_thereafter: 500     # log 1 in 500 subsequent spans
+
+  # Prometheus exporter — expose OTel metrics as a Prometheus scrape target.
+  # This is in addition to the prometheus_client metrics the app already exposes.
+  # Enable if you want OTel SDK metrics (span counts, export latency) in Grafana.
+  #
+  # prometheus:
+  #   endpoint: "0.0.0.0:9464"
+  #   namespace: otelcol
+  #   send_timestamps: true
+  #   metric_expiration: 3m
+  #   enable_open_metrics: true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SERVICE — wire receivers → processors → exporters into pipelines
+# ─────────────────────────────────────────────────────────────────────────────
+
+service:
+  extensions:
+    - health_check
+    - pprof
+    - zpages
+
+  pipelines:
+
+    # ── Trace pipeline ───────────────────────────────────────────────────────
+    # Processor order matters:
+    #   1. memory_limiter first — shed load before any processing
+    #   2. filter — drop noise early to avoid wasting CPU on unwanted spans
+    #   3. resource — add deployment metadata
+    #   4. attributes — transform span attributes
+    #   5. transform — OTTL-based transformations
+    #   6. tail_sampling — keep all errors/slow/CB traces, sample 25% of healthy
+    #   7. batch last — group spans for efficient export
+    traces:
+      receivers:
+        - otlp
+      processors:
+        - memory_limiter
+        - filter
+        - resource
+        - attributes
+        - transform
+        - tail_sampling
+        - batch
+      exporters:
+        - otlp/tempo
+        - debug
+
+    # ── Metrics pipeline (collector's own metrics) ───────────────────────────
+    # Uncomment if you have the prometheus receiver enabled above.
+    # metrics:
+    #   receivers:
+    #     - prometheus
+    #   processors:
+    #     - memory_limiter
+    #     - resource
+    #     - batch
+    #   exporters:
+    #     - prometheus
+
+  # Collector's own telemetry — scraped by Prometheus at :8888.
+  # These metrics cover the collector's own health: span receive/export rates,
+  # queue depth, memory usage, and processor error counts.
+  telemetry:
+    logs:
+      level: warn
+      # development: false    # set true to enable debug log sampling
+    metrics:
+      level: detailed          # detailed includes per-pipeline metrics
+      address: 0.0.0.0:8888
+
+      # Readers let you also push collector self-metrics via OTLP if needed.
+      # readers:
+      #   - pull:
+      #       exporter:
+      #         prometheus:
+      #           host: 0.0.0.0
+      #           port: 8888

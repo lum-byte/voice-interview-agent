@@ -1,0 +1,299 @@
+groups:
+
+  # ── Pipeline throughput ────────────────────────────────────────────────────
+  # Pre-computes rate() over the four label dimensions so Grafana overview
+  # panels render instantly across 90-day time ranges.
+  - name: pipeline_throughput
+    interval: 15s
+    rules:
+
+      # Total request rate regardless of outcome — primary capacity metric.
+      - record: job:ai_pipeline_requests_total:rate2m
+        expr: sum(rate(ai_pipeline_requests_total[2m])) by (tier, mode, version)
+
+      # Success rate — status="ok" requests per second.
+      - record: job:ai_pipeline_requests_ok:rate2m
+        expr: sum(rate(ai_pipeline_requests_total{status="ok"}[2m])) by (tier, mode)
+
+      # Error rate as a fraction of all requests (0–1). Used for SLO burn-rate alerts.
+      - record: job:ai_pipeline_error_rate:rate2m
+        expr: |
+          sum(rate(ai_pipeline_requests_total{status="error"}[2m])) by (tier, mode)
+          /
+          sum(rate(ai_pipeline_requests_total[2m])) by (tier, mode)
+
+      # Load-shed rate — requests turned away before entering the pipeline.
+      # Denominator includes shed requests so the fraction is "shed / all attempted".
+      - record: job:ai_pipeline_load_shed_rate:rate2m
+        expr: |
+          sum(rate(ai_pipeline_load_shed_total[2m])) by (tier)
+          /
+          (
+            sum(rate(ai_pipeline_requests_total[2m])) by (tier)
+            + sum(rate(ai_pipeline_load_shed_total[2m])) by (tier)
+          )
+
+      # Degraded-path rate — pipelines that completed via apology/fallback.
+      - record: job:ai_pipeline_degraded_rate:rate2m
+        expr: |
+          sum(rate(ai_pipeline_degraded_total[2m])) by (stage)
+          /
+          sum(rate(ai_pipeline_requests_total[2m]))
+
+      # Abort rate — non-recoverable mid-flight failures.
+      - record: job:ai_pipeline_abort_rate:rate2m
+        expr: |
+          sum(rate(ai_pipeline_aborted_total[2m])) by (reason)
+          /
+          sum(rate(ai_pipeline_requests_total[2m]))
+
+      # Cancellation rate — user interrupts and PTT mid-pipeline drops.
+      - record: job:ai_pipeline_cancel_rate:rate2m
+        expr: |
+          sum(rate(ai_pipeline_cancelled_total[2m])) by (stage)
+          /
+          sum(rate(ai_pipeline_requests_total[2m]))
+
+
+  # ── End-to-end latency percentiles ────────────────────────────────────────
+  # histogram_quantile over wide time ranges is the most expensive PromQL
+  # operation. Pre-computing P50/P95/P99 makes the latency panel viable on
+  # 7-day or 30-day views without query timeout.
+  - name: pipeline_latency
+    interval: 15s
+    rules:
+
+      - record: job:ai_pipeline_latency_seconds_p50:rate5m
+        expr: |
+          histogram_quantile(0.50,
+            sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le, tier, mode)
+          )
+
+      - record: job:ai_pipeline_latency_seconds_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le, tier, mode)
+          )
+
+      - record: job:ai_pipeline_latency_seconds_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le, tier, mode)
+          )
+
+
+  # ── Per-stage latency percentiles ─────────────────────────────────────────
+  # Broken out by stage so the dashboard can show STT / LLM / TTS individually.
+  # stage label values: "stt", "llm", "tts", "eval", "sanitize"
+  - name: stage_latency
+    interval: 15s
+    rules:
+
+      - record: job:ai_pipeline_stage_latency_seconds_p50:rate5m
+        expr: |
+          histogram_quantile(0.50,
+            sum(rate(ai_pipeline_stage_latency_seconds_bucket[5m])) by (le, stage)
+          )
+
+      - record: job:ai_pipeline_stage_latency_seconds_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_pipeline_stage_latency_seconds_bucket[5m])) by (le, stage)
+          )
+
+      - record: job:ai_pipeline_stage_latency_seconds_p99:rate5m
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(ai_pipeline_stage_latency_seconds_bucket[5m])) by (le, stage)
+          )
+
+      # Per-stage error rate by error_type — distinguishes timeout vs API error vs parse.
+      - record: job:ai_pipeline_stage_error_rate:rate2m
+        expr: sum(rate(ai_pipeline_stage_errors_total[2m])) by (stage, error_type)
+
+      # Per-stage retry rate — retries without errors signals flaky upstream.
+      - record: job:ai_pipeline_stage_retry_rate:rate2m
+        expr: sum(rate(ai_pipeline_stage_retries_total[2m])) by (stage)
+
+
+  # ── LLM cache efficiency ──────────────────────────────────────────────────
+  - name: llm_cache
+    interval: 30s
+    rules:
+
+      # Cache hit rate (0–1). backend label: "redis" | "lru".
+      # Dropping to lru means Redis is degraded — cost jumps immediately.
+      - record: job:ai_llm_cache_hit_rate:rate5m
+        expr: |
+          sum(rate(ai_llm_cache_hits_total[5m])) by (backend)
+          /
+          (
+            sum(rate(ai_llm_cache_hits_total[5m]))
+            + sum(rate(ai_llm_cache_misses_total[5m]))
+          )
+
+      # LLM request rate by status and model.
+      - record: job:ai_llm_requests_total:rate2m
+        expr: sum(rate(ai_llm_requests_total[2m])) by (status, model, mode)
+
+      # LLM error rate per model — identifies which model is struggling.
+      - record: job:ai_llm_error_rate:rate2m
+        expr: |
+          sum(rate(ai_llm_requests_total{status="error"}[2m])) by (model)
+          /
+          sum(rate(ai_llm_requests_total[2m])) by (model)
+
+      # Token burn rate per second — multiply by cost/token for spend rate.
+      - record: job:ai_llm_tokens_total:rate5m
+        expr: sum(rate(ai_llm_tokens_total[5m])) by (model, kind)
+
+      # Model fallback rate — how often the primary circuit breaker is open.
+      - record: job:ai_llm_model_fallback_rate:rate5m
+        expr: |
+          sum(rate(ai_llm_model_fallback_total[5m])) by (primary, fallback)
+          /
+          sum(rate(ai_llm_requests_total[5m]))
+
+      # LLM P95 latency per model and mode.
+      - record: job:ai_llm_latency_seconds_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model, mode)
+          )
+
+
+  # ── STT efficiency ────────────────────────────────────────────────────────
+  - name: stt_efficiency
+    interval: 30s
+    rules:
+
+      - record: job:ai_stt_requests_total:rate2m
+        expr: sum(rate(ai_stt_requests_total[2m])) by (status)
+
+      - record: job:ai_stt_error_rate:rate2m
+        expr: |
+          sum(rate(ai_stt_requests_total{status="error"}[2m]))
+          /
+          sum(rate(ai_stt_requests_total[2m]))
+
+      - record: job:ai_stt_latency_seconds_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le)
+          )
+
+      # Empty audio rate — high value means PTT debounce is not working.
+      - record: job:ai_stt_empty_rate:rate5m
+        expr: |
+          rate(ai_stt_empty_audio_total[5m])
+          /
+          sum(rate(ai_stt_requests_total[5m]))
+
+      # Remote fallback rate — how often local STT is failing over.
+      - record: job:ai_stt_fallback_rate:rate5m
+        expr: |
+          rate(ai_stt_remote_fallback_total[5m])
+          /
+          sum(rate(ai_stt_requests_total[5m]))
+
+
+  # ── TTS efficiency ────────────────────────────────────────────────────────
+  - name: tts_efficiency
+    interval: 30s
+    rules:
+
+      - record: job:ai_tts_requests_total:rate2m
+        expr: sum(rate(ai_tts_requests_total[2m])) by (status, voice)
+
+      - record: job:ai_tts_error_rate:rate2m
+        expr: |
+          sum(rate(ai_tts_requests_total{status="error"}[2m]))
+          /
+          sum(rate(ai_tts_requests_total[2m]))
+
+      - record: job:ai_tts_latency_seconds_p95:rate5m
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice)
+          )
+
+      # Apology fallback rate — TTS is failing and serving canned audio.
+      - record: job:ai_tts_apology_rate:rate5m
+        expr: |
+          rate(ai_tts_apology_fallback_total[5m])
+          /
+          sum(rate(ai_tts_requests_total[5m]))
+
+
+  # ── Session health ────────────────────────────────────────────────────────
+  - name: session_health
+    interval: 30s
+    rules:
+
+      - record: job:ai_session_created:rate5m
+        expr: rate(ai_session_created_total[5m])
+
+      # Rejection rate broken out by reason.
+      - record: job:ai_session_rejected:rate5m
+        expr: sum(rate(ai_session_rejected_total[5m])) by (reason)
+
+      # Fraction of all session attempts that were rejected.
+      - record: job:ai_session_rejection_rate:rate5m
+        expr: |
+          sum(rate(ai_session_rejected_total[5m]))
+          /
+          (
+            sum(rate(ai_session_created_total[5m]))
+            + sum(rate(ai_session_rejected_total[5m]))
+          )
+
+      # IP abuse rate — sessions killed for exceeding SESSION_MAX_IP_CHANGES.
+      - record: job:ai_session_ip_limit_rate:rate5m
+        expr: |
+          rate(ai_session_ip_limit_total[5m])
+          /
+          sum(rate(ai_session_created_total[5m]))
+
+      # LRU fallback rate — Redis down, sessions served from in-process cache.
+      - record: job:ai_session_lru_rate:rate5m
+        expr: |
+          rate(ai_session_lru_hits_total[5m])
+          /
+          sum(rate(ai_session_created_total[5m]))
+
+
+  # ── Resilience subsystems ─────────────────────────────────────────────────
+  - name: resilience
+    interval: 15s
+    rules:
+
+      # Rate-limit exhaustion fraction per service.
+      - record: job:ai_rate_limit_exhaustion_rate:rate2m
+        expr: |
+          sum(rate(ai_rate_limit_exhausted_total[2m])) by (service)
+          /
+          (
+            sum(rate(ai_rate_limit_acquired_total[2m])) by (service)
+            + sum(rate(ai_rate_limit_exhausted_total[2m])) by (service)
+          )
+
+      # Bulkhead saturation rate per pool.
+      - record: job:ai_bulkhead_saturation_rate:rate2m
+        expr: |
+          sum(rate(ai_bulkhead_saturated_total[2m])) by (name)
+          /
+          (
+            sum(rate(ai_bulkhead_saturated_total[2m])) by (name)
+            + sum(rate(ai_rate_limit_acquired_total[2m]))
+          )
+
+      # Latency budget breach rate per stage.
+      - record: job:ai_latency_budget_breach_rate:rate2m
+        expr: sum(rate(ai_latency_budget_breached_total[2m])) by (stage)
+
+      # Injection detection rate — prompt attacks reaching the sanitizer.
+      - record: job:ai_sanitize_injection_rate:rate5m
+        expr: |
+          rate(ai_sanitize_injection_total[5m])
+          /
+          sum(rate(ai_sanitize_total[5m]))

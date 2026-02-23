@@ -1,0 +1,1327 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  Voice Pipeline — Full Observability Stack
+#
+#  Usage:
+#    Start (detached):  docker compose up -d
+#    Tail logs:         docker compose logs -f
+#    Stop (keep data):  docker compose down
+#    Stop (wipe data):  docker compose down -v
+#    Hot-reload Prom:   curl -X POST http://localhost:9090/-/reload
+#
+#  Service map and ports:
+#    redis             → session store + LLM cache          localhost:6379
+#    redis-exporter    → Redis → Prometheus metrics         localhost:9121
+#    mongo             → observability event sink           localhost:27017
+#    prometheus        → scrapes all metrics                localhost:9090  (UI)
+#    grafana           → dashboards                         localhost:3000  (UI)
+#    tempo             → OTel trace storage                 localhost:3200  (UI)
+#                                                           localhost:4317  (gRPC ingest)
+#    otel              → OTel collector (relay → Tempo)     localhost:4318  (HTTP OTLP)
+#                                                           localhost:4319  (gRPC OTLP)
+#                                                           localhost:8888  (self-metrics)
+#                                                           localhost:55679 (zpages debug)
+#    loki              → log aggregation                    localhost:3100
+#    promtail          → ships Docker logs → Loki           (internal, no host port)
+#    node-exporter     → host OS metrics                    localhost:9100
+#    cadvisor          → per-container metrics              localhost:8080
+#
+#  Network topology (three isolated bridge networks):
+#    backend      — Redis, Mongo, redis-exporter (data tier, isolated from metrics)
+#    observability — Prometheus, Grafana, Tempo, OTel, Loki, Promtail, cAdvisor
+#    metrics      — node-exporter, cAdvisor, Prometheus (host-metrics tier)
+#
+#  Your Python app runs on the HOST (not in Docker), so Prometheus reaches it
+#  via host.docker.internal:${PROMETHEUS_PORT}. Set PROMETHEUS_PORT=9091 in
+#  .env so it does not collide with Prometheus's own container port :9090.
+#
+#  Config files live under ./infra/ — all volume bind-mounts reflect this:
+#    ./infra/redis/redis.conf
+#    ./infra/prometheus/prometheus.yaml
+#    ./infra/loki/loki-config.yaml
+#    ./infra/otel-collector/otel-collector-config.yaml
+#    ./infra/grafana/provisioning/dashboards/dashboards.yaml
+#    ./infra/grafana/provisioning/datasources/datasources.yaml
+#    ./infra/grafana/dashboards/            ← written by write_grafana_dashboard()
+#
+#  Required .env keys (place .env at project root alongside this file):
+#    OPENAI_API_KEY        — your OpenAI key (used by the Python app, not Docker)
+#    GRAFANA_PASSWORD      — Grafana admin UI password
+#    GRAFANA_SECRET_KEY    — 32-char secret for Grafana cookie signing (auto-defaulted)
+#    REDIS_PASSWORD        — Redis requirepass value; also used by redis-exporter
+#    MONGO_USERNAME        — MongoDB root username
+#    MONGO_PASSWORD        — MongoDB root password
+#    PROMETHEUS_PORT       — port your Python app exposes /metrics on (e.g. 9091)
+#
+#  ⚠ Windows Docker Desktop note:
+#    promtail, node-exporter, and cadvisor require Linux kernel interfaces
+#    (/proc, /sys, /dev/kmsg, unix sockets). They will fail on Windows.
+#    Comment those three services out if running on Windows — everything else
+#    (Redis, Mongo, Prometheus, Grafana, Tempo, OTel, Loki) works fine.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── Network definitions ────────────────────────────────────────────────────────
+#
+# Three isolated bridge networks enforce the principle of least privilege:
+#
+#   backend      — data tier only. Redis and Mongo are reachable from the app
+#                  pool and the redis-exporter, but completely invisible to
+#                  Grafana, Tempo, Loki etc. A compromised observability container
+#                  cannot reach session data or the LLM cache directly.
+#
+#   observability — telemetry tier. All metrics, traces, and log pipelines live
+#                   here. Prometheus, Grafana, Tempo, OTel, Loki, and Promtail
+#                   all share this network so they can talk to each other.
+#                   redis-exporter bridges backend and observability so it can
+#                   scrape Redis (backend) and be scraped by Prometheus
+#                   (observability) without giving Prometheus a backend route.
+#
+#   metrics      — host-observability tier. node-exporter and cAdvisor attach
+#                  here. Prometheus also attaches here to scrape them. Keeping
+#                  this separate from backend prevents host-metrics containers
+#                  from accidentally reaching Redis or Mongo.
+networks:
+  # Internal app + data tier: Redis, Mongo, redis-exporter.
+  backend:
+    driver: bridge
+  # Observability tier: Prometheus, Grafana, Tempo, OTel, Loki, Promtail.
+  observability:
+    driver: bridge
+  # Host-metrics tier: node-exporter, cAdvisor.
+  metrics:
+    driver: bridge
+
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  DATA TIER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  #
+  # Redis serves three distinct workloads for this pipeline:
+  #
+  #   [LLM]     LLM response cache — keys: llm:v3:*
+  #             Stores serialised LLM responses keyed by prompt hash.
+  #             TTL = LLM_CACHE_TTL (default 3600s). Eviction = allkeys-lru
+  #             so the cache shrinks gracefully under memory pressure.
+  #             A cache hit skips the OpenAI API call entirely, saving
+  #             ~500ms–3s of latency and the associated token cost.
+  #
+  #   [LOCK]    Cache stampede locks — keys: llm:stampede:*
+  #             SETNX locks that serialise concurrent requests for the same
+  #             prompt hash. Without this, 50 simultaneous requests for the
+  #             same question would all fire OpenAI calls before any response
+  #             is cached. TTL = 30s; lock is deleted once the first caller
+  #             stores the response.
+  #
+  #   [SESSION] IP-locked session store — keys: session:lock:v1:*,
+  #             session:data:v1:*, session:meta:v1:*
+  #             TTL = SESSION_TTL_S (default 1800s). Keyspace notifications
+  #             (Kxg) let the app decrement ai_session_active when a session
+  #             expires silently (user never calls POST /session/end).
+  #
+  # Persistence: AOF with fsync every second. A crash loses ≤1s of data.
+  # AOF rewrite (BGREWRITEAOF) runs automatically when the file reaches 2×
+  # its last rewrite size, keeping the AOF file compact.
+  #
+  # Password: injected via --requirepass "${REDIS_PASSWORD}" at runtime.
+  # Never hard-coded in redis.conf — that file is version-controlled.
+  # REDIS_PASSWORD env var is forwarded into the container so the healthcheck
+  # redis-cli -a invocation can authenticate without a separate secret file.
+  #
+  # io-threads 4: parallelises network I/O across 4 threads while the main
+  # Redis event loop stays single-threaded for command processing. Doubles
+  # throughput on the LLM-cache GET hot path. Safe on any ≥4 core machine.
+  #
+  # activedefrag yes: background jemalloc defragmentation prevents gradual
+  # heap fragmentation from LLM cache churn (many 2–8 KB blobs created and
+  # deleted continuously). Keeps mem_fragmentation_ratio near 1.0 without
+  # a restart, at ~5% CPU cost on the defrag thread.
+  #
+  # notify-keyspace-events Kxg: publishes to __keyevent@0__:expired and
+  # __keyspace@0__:* when keys expire or are deleted. The session store
+  # subscribes on __keyevent@0__:expired to detect silent session expiry
+  # and decrement the Prometheus gauge correctly.
+  redis:
+    image: redis:7.2-alpine
+    container_name: vp_redis
+    restart: unless-stopped
+    networks:
+      - backend
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      # redis.conf bind-mount is intentionally removed for Windows Docker Desktop
+      # compatibility. All settings are passed as inline CLI flags below so no
+      # host-path translation is required. On Linux you can restore the bind-mount:
+      #   - ./infra/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      # and change the command back to: redis-server /usr/local/etc/redis/redis.conf ...
+    # All Redis tuning is expressed as CLI flags so the container starts cleanly
+    # on Windows Docker Desktop without a redis.conf bind-mount.
+    # --requirepass        — auth password, never stored in a version-controlled file
+    # --appendonly yes     — enable AOF persistence (survives container restart)
+    # --appendfsync everysec — fsync once/second: ≤1s data loss on crash
+    # --maxmemory 512mb    — hard memory cap; prevents Redis OOM-killing the host
+    # --maxmemory-policy allkeys-lru — evict least-recently-used keys when full
+    # --io-threads 4       — parallelise network I/O for the LLM-cache hot path
+    # --io-threads-do-reads yes — also thread the read path (doubles GET throughput)
+    # --activedefrag yes   — background jemalloc defrag; prevents fragmentation creep
+    # --notify-keyspace-events Kxg — publish key-expiry events for session TTL tracking
+    # --loglevel notice    — meaningful events without spam (use warning in production)
+    # --timeout 300        — close idle client connections after 5 min
+    # --tcp-keepalive 60   — send TCP ACK probes every 60s to detect broken connections
+    # --maxclients 512     — LLM pool (200) + session pool (200) + admin overhead
+    command: >
+      redis-server
+      --requirepass "${REDIS_PASSWORD}"
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --io-threads 4
+      --io-threads-do-reads yes
+      --activedefrag yes
+      --notify-keyspace-events Kxg
+      --loglevel notice
+      --timeout 300
+      --tcp-keepalive 60
+      --maxclients 512
+    environment:
+      # Forwarded so redis-cli in the healthcheck can authenticate.
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+    healthcheck:
+      # redis-cli PING returns "+PONG" on success.
+      # -a supplies the password so the check works with requirepass enabled.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"       # 4 io-threads + command thread + activedefrag thread
+          memory: 700M      # 512 MB maxmemory (redis.conf) + ~150 MB process overhead
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Redis Exporter ─────────────────────────────────────────────────────────
+  #
+  # Translates Redis INFO, CONFIG GET, and DBSIZE into Prometheus metrics.
+  # Prometheus scrapes this at /metrics on port 9121.
+  #
+  # Key metrics and pipeline relevance:
+  #   redis_keyspace_hits_total / redis_keyspace_misses_total
+  #     → LLM cache hit rate. A drop means prompts are not being cached and
+  #       every request hits OpenAI — latency and cost spike simultaneously.
+  #   redis_evicted_keys_total
+  #     → maxmemory pressure. Rising evictions = increase maxmemory in
+  #       redis.conf or reduce LLM_CACHE_TTL so entries expire before eviction.
+  #   redis_connected_clients
+  #     → pool utilisation. LLM + session pools each hold up to 200 connections
+  #       (REDIS_MAX_CONN=200). If this approaches 400, pools are exhausted
+  #       and new requests will queue or timeout.
+  #   redis_expired_keys_total
+  #     → session TTL churn rate. Spikes = burst of session expirations.
+  #   redis_commands_total{cmd="setnx"}
+  #     → stampede lock rate. High setnx = many concurrent identical prompts.
+  #   redis_memory_used_bytes / redis_memory_max_bytes
+  #     → headroom. Alert when used > 80% of max to prevent OOM evictions.
+  #
+  # REDIS_EXPORTER_CHECK_KEYS: forces per-namespace key counts emitted as
+  # redis_key_size gauges — gives independent cardinality visibility for
+  # LLM cache vs session keys vs stampede locks.
+  #
+  # Attached to both backend (to reach Redis:6379) and observability (to be
+  # scraped by Prometheus:9121) — the only container that bridges these two
+  # networks.
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.61.0-alpine
+    container_name: vp_redis_exporter
+    restart: unless-stopped
+    networks:
+      - backend       # must reach redis:6379
+      - observability # must be reachable by prometheus on port 9121
+    ports:
+      - "9121:9121"
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      REDIS_PASSWORD: "${REDIS_PASSWORD}"
+      # Export per-command statistics for setnx/get/set breakdown.
+      REDIS_EXPORTER_INCL_SYSTEM_METRICS: "true"
+      # Track key counts across all three pipeline namespaces.
+      REDIS_EXPORTER_CHECK_KEYS: "llm:v3:*,session:lock:v1:*,session:data:v1:*,session:meta:v1:*"
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ── MongoDB ────────────────────────────────────────────────────────────────
+  #
+  # Persistent sink for all ObsEvent documents emitted by observability.emit().
+  # Every pipeline run produces structured event documents for STT, LLM, TTS,
+  # eval, session lifecycle, circuit breaker state changes, and rate limit hits.
+  #
+  # Storage layout:
+  #   DB:         ai_observability
+  #   Collection: pipeline_events  (created lazily by observability.py on first write)
+  #
+  # Why MongoDB instead of writing directly to Loki/Prometheus?
+  #   1. ObsEvents are rich nested documents, not flat key-value metrics.
+  #   2. Post-hoc analysis ("all sessions where LLM latency > 5s") needs
+  #      ad-hoc queries that PromQL and LogQL cannot express efficiently.
+  #   3. Session replay reads full event streams per session_id — MongoDB
+  #      handles this natively with a covering index on session_id + timestamp.
+  #
+  # Auth is enabled via MONGO_INITDB_ROOT_USERNAME/PASSWORD. These become the
+  # admin credentials. The Python app connects with these same credentials.
+  #
+  # The healthcheck uses mongosh (modern shell) with --quiet to suppress the
+  # startup banner and return just "1" on success, making exit code reliable.
+  # start_period=20s gives Mongo time to complete journal init on first boot.
+  mongo:
+    image: mongo:7
+    container_name: vp_mongo
+    restart: unless-stopped
+    networks:
+      - backend
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_USERNAME}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_PASSWORD}"
+      # Creates the target DB on first boot. Collection is created by the app
+      # on first write (MongoDB creates collections lazily).
+      MONGO_INITDB_DATABASE: ai_observability
+    healthcheck:
+      # Plain string form: Docker Compose treats this as CMD-SHELL automatically.
+      # Avoids all YAML list/escaping issues. Uses {ping:1} (no inner quotes needed).
+      # grep -q 1 ensures non-zero exit if mongosh can't auth or ping fails.
+      test: "mongosh --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' --quiet | grep -q 1"
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  OBSERVABILITY TIER
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  #
+  # Time-series metrics database. Scrapes all instrumented services on the
+  # intervals defined in infra/prometheus/prometheus.yaml.
+  #
+  # Scrape targets (configured in prometheus.yaml):
+  #   app:8000/metrics                                 — Python app (FastAPI /metrics route)
+  #   redis-exporter:9121/metrics                      — Redis stats
+  #   otel:8888/metrics                                — OTel Collector self-metrics
+  #   grafana:3000/metrics                             — Grafana health
+  #   tempo:3200/metrics                               — Tempo internals
+  #   loki:3100/metrics                                — Loki internals
+  #   node-exporter:9100/metrics                       — host OS metrics
+  #   cadvisor:8080/metrics                            — per-container metrics
+  #
+  # Storage flags:
+  #   retention.time=90d   — 90 days of history for long-term pipeline analysis.
+  #   retention.size=20GB  — hard cap; oldest blocks deleted when reached.
+  #   wal-compression=true — ~50% WAL disk I/O reduction with zero data-loss risk.
+  #
+  # --web.enable-remote-write-receiver:
+  #   Required so Tempo's metrics_generator can push service-graph and
+  #   span-metrics time series into Prometheus via remote_write. This powers
+  #   Grafana's service map panel and tracesToMetrics correlation.
+  #
+  # --web.enable-lifecycle:
+  #   Enables POST /-/reload for config hot-reload without container restart.
+  #   Usage: curl -X POST http://localhost:9090/-/reload
+  #
+  # Query safety flags:
+  #   query.timeout=2m         — kills runaway PromQL before it OOM-kills Prometheus.
+  #   query.max-concurrency=20 — prevents dashboard load spikes from starving queries.
+  #   query.max-samples=50M    — prevents multi-day histogram queries from allocating
+  #                              gigabytes of intermediate sample buffers.
+  #
+  # extra_hosts host-gateway: on Linux, resolves to the Docker bridge IP so
+  # Prometheus can reach the Python app running on the host. On Docker Desktop
+  # (Mac/Windows) host.docker.internal is resolved natively by the VM.
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: vp_prometheus
+    restart: unless-stopped
+    networks:
+      - observability
+      - metrics           # must reach node-exporter and cadvisor
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      # 90 days — long-term interview performance history.
+      - --storage.tsdb.retention.time=90d
+      - --storage.tsdb.retention.size=20GB
+      # WAL compression cuts disk I/O by ~50% with zero data loss risk.
+      - --storage.tsdb.wal-compression
+      - --web.console.libraries=/etc/prometheus/console_libraries
+      - --web.console.templates=/etc/prometheus/consoles
+      # Hot-reload: curl -X POST http://localhost:9090/-/reload
+      - --web.enable-lifecycle
+      # Required for Tempo metrics_generator remote_write.
+      - --web.enable-remote-write-receiver
+      # Prevent runaway PromQL queries from OOM-killing Prometheus.
+      - --query.timeout=2m
+      - --query.max-concurrency=20
+      - --query.max-samples=50000000
+    # host.docker.internal resolves to the Docker host on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis-exporter:
+        condition: service_started
+      otel:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G      # 90-day TSDB + WAL + 50M sample query buffer headroom
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  #
+  # Visualisation and alerting platform. Auto-provisions three datasources
+  # (Prometheus, Tempo, Loki) from infra/grafana/provisioning/datasources/ and
+  # loads dashboard JSON from infra/grafana/dashboards/ automatically.
+  #
+  # Dashboard provisioning flow:
+  #   1. Grafana starts and reads provisioning/dashboards/dashboards.yaml.
+  #   2. It polls infra/grafana/dashboards/ every 30s for *.json files.
+  #   3. observability.write_grafana_dashboard() writes ai_pipeline.json there
+  #      on the Python app's first startup.
+  #   4. Grafana detects the new file and loads it within 30s — no restart needed.
+  #
+  # Datasource correlation chain (configured in datasources.yaml):
+  #   Prometheus ──exemplar──▶ Tempo ──tracesToLogsV2──▶ Loki
+  #                                ▲                         │
+  #                                └────derivedFields─────────┘
+  #   Click a histogram exemplar dot in Prometheus → opens the trace in Tempo.
+  #   Click a span in Tempo → shows correlated log lines in Loki.
+  #   Click a log line in Loki → jumps back to the trace in Tempo.
+  #
+  # GF_SECURITY_SECRET_KEY: signs Grafana session cookies and encrypts datasource
+  # passwords at rest. Override the default with GRAFANA_SECRET_KEY in .env
+  # before deploying to any shared or internet-facing environment.
+  #
+  # GF_FEATURE_TOGGLES_ENABLE:
+  #   traceqlEditor  — TraceQL query editor in Explore for Tempo searches.
+  #   traceToProfiles — continuous profiling correlation (Pyroscope, future use).
+  #   tempoApmTable  — APM summary table on the Tempo datasource page.
+  #
+  # GF_DATAPROXY_TIMEOUT=120: Grafana proxies datasource queries through its
+  # backend. 120s covers the slowest PromQL queries over 90-day ranges.
+  #
+  # GF_INSTALL_PLUGINS: pre-installs community panels at startup.
+  #   grafana-clock-panel  — timestamp overlays on dashboards.
+  #   grafana-piechart-panel — error distribution pie charts.
+  #
+  # Volume mount note: infra/grafana/dashboards is mounted WITHOUT :ro because
+  # write_grafana_dashboard() writes JSON files there at app startup.
+  # Create this directory before first run: mkdir -p infra/grafana/dashboards
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: vp_grafana
+    restart: unless-stopped
+    networks:
+      - observability
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD}"
+      GF_SECURITY_SECRET_KEY: "${GRAFANA_SECRET_KEY:-change_this_32_char_secret_key_}"
+
+      # Disable public access — internal company tool, login required.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_BASIC_ENABLED: "true"
+
+      # Feature flags: TraceQL editor + APM table for Tempo, profile linking.
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor traceToProfiles tempoApmTable"
+
+      # Expose /metrics so Prometheus can scrape Grafana's own health metrics.
+      GF_METRICS_ENABLED: "true"
+
+      # Increase query proxy timeout for long-range metric queries.
+      GF_DATAPROXY_TIMEOUT: "120"
+      GF_DATAPROXY_KEEP_ALIVE_SECONDS: "30"
+
+      # Pre-install panels used by community dashboard JSON imports.
+      GF_INSTALL_PLUGINS: "grafana-clock-panel,grafana-piechart-panel"
+
+      GF_LOG_LEVEL: "warn"
+      GF_LOG_MODE: "console"
+    volumes:
+      # Provisioning config (datasources + dashboard paths) — read-only, managed by git.
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      # NOT :ro — write_grafana_dashboard() writes ai_pipeline.json here at startup.
+      # Pre-create with: mkdir -p infra/grafana/dashboards
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards
+      # Grafana internal DB (sqlite), sessions, and plugin cache. Persistent so
+      # dashboards created in the UI survive container restarts.
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      # Plugin installation and provisioning run at startup — allow extra time.
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Tempo (OTel trace storage) ─────────────────────────────────────────────
+  #
+  # Stores and queries distributed traces generated by observability.py when
+  # OTEL_ENABLED=true. Every pipeline run produces a trace tree:
+  #
+  #   ai.pipeline.api  (root — total wall-clock time)
+  #     ├─ ai.stt.transcribe          (Whisper API latency)
+  #     ├─ ai.llm.generate            (or ai.llm.stream)
+  #     │    ├─ ai.memory.resolve     (context injection)
+  #     │    └─ ai.memory.commit      (history persistence)
+  #     ├─ ai.sanitize                (output sanitisation)
+  #     └─ ai.tts.synthesize          (or ai.tts.stream)
+  #   ai.eval.score  (separate async root — off the critical path)
+  #
+  # metrics_generator (configured in tempo_config inline below):
+  #   Reads ingested spans and produces two Prometheus metric families pushed
+  #   via remote_write to http://prometheus:9090/api/v1/write:
+  #
+  #   tempo_service_graph_request_*
+  #     → directed call-graph metrics between pipeline stages. Powers Grafana's
+  #       service map panel showing inter-stage latency and error rates.
+  #
+  #   traces_spanmetrics_*
+  #     → per-span histogram metrics. Powers tracesToMetrics in Grafana: click
+  #       a slow span → see a P95 latency histogram for that span across all
+  #       traces, filtered by the span's attributes (session, model, tier).
+  #
+  # Port layout:
+  #   4317 — gRPC OTLP ingest  (OTel Collector → Tempo, internal)
+  #   3200 — Tempo HTTP API    (Grafana datasource + /ready healthcheck)
+  #
+  # Config is injected via the Docker `configs` key (inline YAML in tempo_config
+  # at the bottom of this file) rather than a bind-mount, so it stays co-located
+  # with the service definition that references its ports and volume paths.
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: vp_tempo
+    restart: unless-stopped
+    networks:
+      - observability
+    ports:
+      - "4317:4317"    # gRPC OTLP ingest (OTel Collector → Tempo)
+      - "3200:3200"    # Tempo HTTP API (Grafana datasource)
+    volumes:
+      - tempo_data:/var/tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    configs:
+      - source: tempo_config
+        target: /etc/tempo.yaml
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3200/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G    # WAL + ingester blocks + metrics_generator registry
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── OTel Collector ─────────────────────────────────────────────────────────
+  #
+  # Telemetry hub between the Python app and the storage backends (Tempo).
+  # The app exports OTLP to the collector; the collector fans out to Tempo.
+  #
+  # Why a collector instead of exporting directly from the app to Tempo?
+  #   1. Decoupling — the app never blocks waiting for Tempo. The collector
+  #      batches spans and retries on transient backend failures silently.
+  #   2. Fan-out — add a second backend (Jaeger, Honeycomb, Datadog) in
+  #      otel-collector-config.yaml without changing any application code.
+  #   3. Attribute enrichment — the collector adds deployment.environment,
+  #      service.namespace, and resource attributes centrally.
+  #   4. Tail sampling — add a tail_sampling processor to keep only error
+  #      traces in high-volume environments, reducing Tempo storage costs.
+  #   5. Filtering — drop health-check spans (GET /health) that would
+  #      otherwise fill trace storage with noise.
+  #
+  # Port layout:
+  #   4318  — HTTP OTLP receiver ← set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+  #   4319  — gRPC OTLP receiver ← alternate transport (prefer if you have gRPC clients)
+  #   8888  — Collector self-metrics (scraped by Prometheus for collector health)
+  #   13133 — Health check HTTP endpoint (used by the healthcheck below)
+  #   55679 — zpages debug UI: http://localhost:55679/debug/tracez shows live
+  #            span counts, error rates, and per-span latency distributions —
+  #            the first place to look when traces stop appearing in Grafana.
+  otel:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: vp_otel
+    restart: unless-stopped
+    networks:
+      - observability
+    ports:
+      - "4318:4318"    # HTTP OTLP — OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+      - "4319:4319"    # gRPC OTLP — alternate transport
+      - "8888:8888"    # Collector self-metrics scraped by Prometheus
+      - "13133:13133"  # Health check endpoint
+      - "55679:55679"  # zpages debug UI — http://localhost:55679/debug/tracez
+    volumes:
+      - ./infra/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      tempo:
+        condition: service_healthy
+    # No healthcheck: otel-collector-contrib is a distroless image with no
+    # shell, wget, or curl available to run a check. The collector is healthy
+    # if it starts without errors — verify via: docker logs vp_otel
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M  # batch processor queue + retry buffer
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Loki (log aggregation) ─────────────────────────────────────────────────
+  #
+  # Aggregates all structured logs emitted by observability.py. Every log line
+  # is a JSON document matching the ObsEvent dataclass, containing:
+  #   session_id, trace_id, span_id, request_id  — correlation IDs
+  #   kind       — event type (llm_cache_hit, circuit_breaker_opened, etc.)
+  #   level      — debug / info / warning / error
+  #   latency_ms — stage duration
+  #   + stage-specific fields (tokens, model, language, voice, etc.)
+  #
+  # Loki index labels (low-cardinality, set by Promtail relabeling):
+  #   service   = "voice-pipeline"
+  #   component = "stt" | "llm" | "tts" | "session" | "pipeline" | ...
+  #   level     = "info" | "warning" | "error"
+  #   kind      = event type string
+  #   env       = "development" | "production"
+  #
+  # High-cardinality fields (trace_id, session_id) stay in the JSON body and
+  # are queried with `| json` in LogQL — NOT promoted to Loki labels because
+  # high-cardinality labels cause the Loki index to balloon.
+  #
+  # Key LogQL patterns for debugging concurrent sessions:
+  #   All logs for one session:
+  #     {service="voice-pipeline"} | json | session_id="<sid>"
+  #   Circuit breaker events:
+  #     {service="voice-pipeline"} | json | kind="circuit_breaker_opened"
+  #   Injection detections:
+  #     {service="voice-pipeline"} | json | kind="sanitize_injection_detected"
+  #
+  # user "10001:10001": Loki drops to UID 10001 inside the container for
+  # security. The loki_data named volume is automatically chowned on first start.
+  loki:
+    image: grafana/loki:2.9.6
+    container_name: vp_loki
+    restart: unless-stopped
+    networks:
+      - observability
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./infra/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    # user: "10001:10001" is intentionally omitted for Windows Docker Desktop
+    # compatibility. On Windows, named volumes are owned by root and Loki cannot
+    # chown them when running as UID 10001, causing an immediate crash.
+    # On Linux you can restore this for security hardening:
+    #   user: "10001:10001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G    # chunk cache + boltdb-shipper index + ingester WAL
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Promtail ───────────────────────────────────────────────────────────────
+  #
+  # Log shipping agent. Tails all Docker container stdout/stderr via the Docker
+  # daemon socket and pushes to Loki with structured labels.
+  #
+  # Without Promtail, Loki receives no logs at all — every LogQL query returns
+  # empty and log→trace correlation in Grafana does not work.
+  #
+  # How it works:
+  #   1. Docker SD (docker_sd_configs) discovers all running containers via
+  #      the Docker socket and generates one scrape target per container.
+  #   2. Relabeling extracts the container name, strips "vp_" for a clean
+  #      `component` label (vp_redis → redis), and applies service=voice-pipeline
+  #      to app containers (those matching "app|voice.*").
+  #   3. Pipeline stages unwrap the Docker json-file envelope, parse the inner
+  #      structlog JSON, and promote level/kind to Loki labels. trace_id and
+  #      session_id stay in the JSON body (high-cardinality — not indexed).
+  #   4. The positions file persists log read offsets so Promtail never
+  #      re-ships historical logs after a restart.
+  #
+  # batchwait=1s / batchsize=1MB: accumulates log entries for 1 second or until
+  # 1 MB before pushing to Loki. Amortises HTTP overhead while keeping log
+  # latency under 1 second. Reduce batchwait to 100ms for live debugging.
+  #
+  # ⚠ WINDOWS: Commented out. Promtail requires /var/lib/docker/containers and
+  # /var/run/docker.sock bind-mounts that do not translate correctly from the
+  # WSL2 VM to the Windows host path layer on Docker Desktop, causing the
+  # container to crash on startup. Loki will still run — you just won't have
+  # automatic container log shipping until this is re-enabled on Linux.
+  # To restore on Linux: uncomment the entire block below.
+  #
+  # promtail:
+  #   image: grafana/promtail:2.9.6
+  #   container_name: vp_promtail
+  #   restart: unless-stopped
+  #   networks:
+  #     - observability
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+  #     - /var/lib/docker/containers:/var/lib/docker/containers:ro
+  #     - promtail_positions:/tmp/positions
+  #   configs:
+  #     - source: promtail_config
+  #       target: /etc/promtail/config.yaml
+  #   command: -config.file=/etc/promtail/config.yaml
+  #   depends_on:
+  #     loki:
+  #       condition: service_healthy
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.25"
+  #         memory: 128M
+  #       reservations:
+  #         cpus: "0.05"
+  #         memory: 64M
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
+
+# ════════════════════════════════════════════════════════════════════════════
+  #  APP — Voice Pipeline (Gunicorn + Uvicorn workers)
+  #
+  #  Paste this block into docker-compose.yaml inside the `services:` section,
+  #  before the closing `networks:` block at the bottom of the file.
+  #
+  #  After adding this, update your .env:
+  #    REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379   ← was localhost
+  #    OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:4319      ← was 127.0.0.1
+  #
+  #  And update infra/prometheus/prometheus.yaml:
+  #    Change host.docker.internal:9091 → app:9091
+  # ════════════════════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vp_app
+    restart: unless-stopped
+
+    # Both networks are required:
+    #   backend      — reaches Redis (session store + LLM cache) and Mongo
+    #   observability — reaches OTel collector (traces + metrics) and is
+    #                   reachable by Prometheus at app:9091
+    networks:
+      - backend
+      - observability
+
+    ports:
+      # FastAPI / Gunicorn — main API port. Prometheus scrapes /metrics here too
+      # (start_prometheus=False in main.py; metrics are an ASGI route on port 8000).
+      - "${PORT:-8000}:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      # Override localhost URLs to Docker service names.
+      # These take priority over the same keys in .env.
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel:4319
+      - MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongo:27017
+      # Tell the app it's running inside Docker (optional — useful for
+      # conditional logic like skipping UVICORN_STARTED checks)
+      - RUNNING_IN_DOCKER=true
+
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      otel:
+        condition: service_started
+
+    # Audio directories — persist recordings and TTS output across restarts.
+    # Remove these if you don't want audio files to survive container restarts.
+    volumes:
+      - audio_input:/app/audio/temp_IN
+      - audio_output:/app/audio/temp_OUT
+
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s   # give Gunicorn time to boot all workers
+
+    # Resource limits — tune based on your machine.
+    # Remove the deploy block entirely if not using Docker Swarm.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2G
+        reservations:
+          cpus: "1"
+          memory: 512M
+
+
+# ── Add these to the volumes: block at the bottom of docker-compose.yaml ──────
+# (your file already has redis_data, mongo_data etc. — add these alongside them)
+#
+# volumes:
+#   audio_input:
+#   audio_output:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  #  HOST METRICS TIER
+  #  ⚠ WINDOWS: Both services below are commented out. node-exporter requires
+  #  network_mode: host and Linux-only /proc, /sys, /rootfs bind-mounts that
+  #  do not work on Windows Docker Desktop. cAdvisor requires privileged mode
+  #  and /dev/kmsg which is not a shared mount on Windows WSL2.
+  #  To restore on Linux: uncomment both service blocks below.
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # ── Node Exporter ──────────────────────────────────────────────────────────
+  #
+  # Exposes host OS metrics to Prometheus. Essential for capacity planning and
+  # correlating application latency with host resource saturation.
+  #
+  # Key metrics and pipeline relevance:
+  #   node_cpu_seconds_total{mode="iowait"}
+  #     → Disk I/O saturation from Redis AOF fsync + Mongo journal writes.
+  #       Spikes here during peak load indicate storage is the bottleneck.
+  #   node_memory_MemAvailable_bytes
+  #     → RAM headroom. Approaching 0 = Docker starts OOM-killing containers.
+  #   node_disk_io_time_seconds_total
+  #     → AOF write pressure. High values = Redis persistence causing latency.
+  #       Consider RDB-only if AOF is the sustained bottleneck.
+  #   node_network_receive_bytes_total / transmit_bytes_total
+  #     → Audio stream bandwidth. STT uploads (≤25 MB) and TTS downloads
+  #       produce measurable network traffic at scale (50 sessions × 25 MB = 1.25 GB).
+  #   node_filefd_allocated
+  #     → File descriptor exhaustion. At 50 sessions the Python app holds ~400
+  #       fds (sockets + audio files). Alert at 80% of the process ulimit.
+  #   node_load1 / node_load5 / node_load15
+  #     → System load averages. Sustained load > nCPU × 2 = queues forming.
+  #
+  # network_mode: host — required to see real interface names (eth0, lo) and
+  # correct CPU topology. Without this, only the container veth is visible.
+  #
+  # pid: host — required for the `processes` collector to enumerate host PIDs
+  # and report per-process CPU/memory stats.
+  #
+  # cap_add: SYS_TIME — required for the timex/ntp collector to read kernel
+  # clock state (clock drift monitoring for distributed tracing accuracy).
+  #
+  # Filesystem mount-points-exclude: skips Docker overlay, cgroup, proc, and
+  # sys pseudo-filesystems to prevent false disk-full alerts and cardinality
+  # explosion from per-overlay-layer metrics.
+  #
+  # node-exporter:
+  #   image: prom/node-exporter:v1.7.0
+  #   container_name: vp_node_exporter
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   pid: host
+  #   ports:
+  #     - "9100:9100"
+  #   volumes:
+  #     - /proc:/host/proc:ro
+  #     - /sys:/host/sys:ro
+  #     - /:/rootfs:ro,rslave
+  #   command:
+  #     - --path.procfs=/host/proc
+  #     - --path.sysfs=/host/sys
+  #     - --path.rootfs=/rootfs
+  #     - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/.+)($$|/)
+  #     - --collector.systemd
+  #     - --collector.processes
+  #   cap_add:
+  #     - SYS_TIME
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.15"
+  #         memory: 64M
+  #       reservations:
+  #         cpus: "0.02"
+  #         memory: 32M
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
+
+  # ── cAdvisor ───────────────────────────────────────────────────────────────
+  #
+  # Per-container resource metrics from the Docker daemon. Complements
+  # node-exporter (host totals) with per-service breakdowns — lets you
+  # identify which specific container is consuming resources during a spike.
+  #
+  # Key metrics and pipeline relevance:
+  #   container_cpu_usage_seconds_total{name="vp_redis"}
+  #     → Redis CPU cost of io-threads + activedefrag. High = cache is hot
+  #       or defrag is running aggressively.
+  #   container_memory_usage_bytes{name="vp_mongo"}
+  #     → MongoDB working-set size. Should stay under the 512M limit above.
+  #   container_fs_writes_bytes_total{name="vp_redis"}
+  #     → AOF write rate. Directly tracks LLM cache write volume.
+  #   container_network_receive_bytes_total{name="vp_otel"}
+  #     → Span ingest volume into the OTel Collector.
+  #   container_oom_events_total
+  #     → OOM kills. Any non-zero value = container hit its memory limit.
+  #       Increase the deploy.resources.limits.memory for the affected service.
+  #
+  # privileged: true — required to access /dev/kmsg and cgroup v2 data.
+  #
+  # --docker_only=true: skip non-Docker cgroup hierarchies (systemd slices,
+  # kernel threads) to reduce metric cardinality and CPU overhead.
+  #
+  # --disable_metrics list: skips metric families that either duplicate
+  # node-exporter data or produce extremely high cardinality:
+  #   advtcp       — advanced TCP stats (duplicate of node_netstat_*)
+  #   cpuset       — per-NUMA CPU binding (high cardinality, rarely useful)
+  #   hugetlb      — huge page stats (not used by any pipeline component)
+  #   memory_numa  — per-NUMA memory (duplicate of node_memory_*)
+  #   referenced_memory — working-set approximation (high cost, low value)
+  #   resctrl      — Intel RDT cache allocation (hardware feature, not used)
+  #   sched        — per-container scheduler stats (very high cardinality)
+  #   tcp          — per-connection TCP state table (extremely high cardinality)
+  #   udp          — UDP socket stats (pipeline uses only TCP)
+  #
+  # ⚠ WINDOWS: Commented out. The bind-mount of / as rootfs is not a shared
+  # or slave mount in the WSL2 kernel used by Docker Desktop, causing the error:
+  # "path / is mounted on / but it is not a shared or slave mount".
+  # To restore on Linux: uncomment the entire block below.
+  #
+  # cadvisor:
+  #   image: gcr.io/cadvisor/cadvisor:v0.49.1
+  #   container_name: vp_cadvisor
+  #   restart: unless-stopped
+  #   networks:
+  #     - metrics
+  #     - observability
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - /:/rootfs:ro
+  #     - /var/run:/var/run:ro
+  #     - /sys:/sys:ro
+  #     - /var/lib/docker/:/var/lib/docker:ro
+  #     - /dev/disk/:/dev/disk:ro
+  #   devices:
+  #     - /dev/kmsg
+  #   privileged: true
+  #   command:
+  #     - --housekeeping_interval=15s
+  #     - --docker_only=true
+  #     - --disable_metrics=advtcp,cpuset,hugetlb,memory_numa,referenced_memory,resctrl,sched,tcp,udp
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "0.25"
+  #         memory: 256M
+  #       reservations:
+  #         cpus: "0.05"
+  #         memory: 64M
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
+
+
+# ── Named volumes ──────────────────────────────────────────────────────────────
+#
+# All volumes are named (not bind-mounted) so data persists across
+# `docker compose down` / `docker compose up` cycles.
+# Data is only destroyed when you explicitly run `docker compose down -v`.
+#
+# To back up a volume:
+#   docker run --rm \
+#     -v voiceassistant_redis_data:/data \
+#     -v $(pwd):/backup \
+#     alpine tar czf /backup/redis_backup.tar.gz /data
+#
+# To inspect a volume:
+#   docker volume inspect voiceassistant_redis_data
+volumes:
+  redis_data:
+  mongo_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  loki_data:
+  # Promtail stores its log read position here to avoid re-shipping on restart.
+  # Delete this volume to force Promtail to reprocess all historical container logs:
+  #   docker volume rm voiceassistant_promtail_positions
+  promtail_positions:
+  audio_input:
+  audio_output:
+
+
+# ── Inline service configs ─────────────────────────────────────────────────────
+#
+# Tempo and Promtail configs are inlined here rather than bind-mounted from
+# infra/ because they are tightly coupled to the service definitions above
+# (ports, service names, volume paths). Keeping them co-located makes their
+# relationship to the service explicit and avoids split-brain edits.
+#
+# Redis, Prometheus, Loki, OTel, and Grafana configs are bind-mounted from
+# infra/ because they are more complex, more frequently tuned, and benefit
+# from being opened and edited independently of this file.
+configs:
+
+  # ── Tempo configuration ────────────────────────────────────────────────────
+  #
+  # distributor.receivers.otlp:
+  #   Accepts traces over gRPC (:4317) and HTTP (:4318). The OTel Collector
+  #   is configured to forward to gRPC on port 4317 (internal).
+  #
+  # ingester timings:
+  #   trace_idle_period=10s  — flush a trace block 10s after the last span.
+  #     Low value = fast trace availability; high value = better compression.
+  #     10s suits our ~2s pipeline traces.
+  #   max_block_bytes=5MB    — flush when block reaches this size regardless
+  #     of idle period; prevents unbounded memory growth during burst load.
+  #   max_block_duration=30m — flush after 30 minutes even if under 5 MB;
+  #     ensures durability within 30 min of a trace being ingested.
+  #
+  # compactor.block_retention=2160h:
+  #   90 days of trace retention, matching Prometheus retention so you can
+  #   correlate metrics and traces across the full history window.
+  #
+  # storage.trace.wal.encoding=snappy:
+  #   Snappy compression on the WAL reduces disk I/O by ~60% with negligible
+  #   CPU cost. Tempo can decompress on crash recovery.
+  #
+  # metrics_generator:
+  #   service_graphs processor — builds a directed call graph from span
+  #     parent/child relationships and emits tempo_service_graph_request_total
+  #     and tempo_service_graph_request_duration_seconds. Powers the Grafana
+  #     service map panel.
+  #
+  #   span_metrics processor — emits traces_spanmetrics_calls_total and
+  #     traces_spanmetrics_duration_seconds per span name. Powers
+  #     tracesToMetrics: click a slow span → P95 histogram for that span
+  #     filtered by session, model, qos_tier. histogram_buckets are sized to
+  #     cover the full STT (0.5–5s) + LLM (0.5–30s) + TTS (0.1–3s) range.
+  #
+  # overrides.max_bytes_per_trace=5MB:
+  #   Hard cap per trace. Prevents a runaway span producer from filling the
+  #   ingester with a single pathological trace.
+  tempo_config:
+    content: |
+      stream_over_http_enabled: true
+      server:
+        http_listen_port: 3200
+        grpc_listen_port: 9095
+        log_level: warn
+      distributor:
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+              http:
+                endpoint: 0.0.0.0:4318
+      ingester:
+        trace_idle_period: 10s
+        max_block_bytes: 5000000
+        max_block_duration: 30m
+      compactor:
+        compaction:
+          compaction_window: 4h
+          max_compaction_objects: 1000000
+          # 90 days — matches Prometheus retention for long-term correlation.
+          block_retention: 2160h
+      storage:
+        trace:
+          backend: local
+          local:
+            path: /var/tempo/blocks
+          wal:
+            path: /var/tempo/wal
+      # metrics_generator: generates Prometheus metrics from span data.
+      # Produces tempo_service_graph_* and traces_spanmetrics_* time series
+      # consumed by Grafana's service map and tracesToMetrics panels.
+      metrics_generator:
+        registry:
+          external_labels:
+            source: tempo
+            cluster: voice-pipeline
+          collection_interval: 15s
+          stale_duration: 5m
+        storage:
+          path: /var/tempo/generator/wal
+          remote_write_flush_deadline: 1m
+          remote_write:
+            - url: http://prometheus:9090/api/v1/write
+              send_exemplars: true
+        processor:
+          service_graphs:
+            max_items: 10000
+            wait: 10s
+            dimensions:
+              - ai.pipeline.stage
+              - ai.pipeline.qos_tier
+          span_metrics:
+            dimensions:
+              - ai.session.id
+              - ai.pipeline.stage
+              - ai.pipeline.qos_tier
+              - gen_ai.response.model
+              - ai.stt.language
+              - ai.tts.voice
+              - ai.cb.name
+            # Buckets cover the full STT+LLM+TTS latency range.
+            histogram_buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 45, 90]
+      overrides:
+        metrics_generator_processors: [service-graphs, span-metrics]
+        max_bytes_per_trace: 5000000
+
+  # ── Promtail configuration ─────────────────────────────────────────────────
+  #
+  # Scrapes all Docker container logs and ships them to Loki with structured
+  # labels. Key design decisions:
+  #
+  # docker_sd_configs: uses the Docker API (via socket) to auto-discover
+  #   containers. New containers are picked up within refresh_interval=10s
+  #   of starting — no config update needed when services are added.
+  #
+  # relabel_configs pipeline:
+  #   1. container  — full container name (e.g. vp_redis) for reference.
+  #   2. component  — strips "vp_" prefix → "redis", "otel", "grafana" etc.
+  #   3. env        — hardcoded "development"; change for other environments.
+  #   4. job        — "docker" identifies this scrape job in Loki.
+  #   5. service    — "voice-pipeline" for containers whose compose service
+  #      name matches "app|voice.*". This is the primary label that
+  #      datasources.yaml derivedFields use for log→trace correlation.
+  #      Infrastructure containers (redis, mongo, grafana) do NOT get this
+  #      label — keeps log searches focused on the pipeline.
+  #   6. __path__   — Docker json-file log path for each container.
+  #
+  # pipeline_stages:
+  #   Stage 1 (json): unwraps Docker envelope {"log":"...","stream":"...","time":"..."}.
+  #   Stage 2 (timestamp): uses Docker's timestamp as the Loki log timestamp
+  #     so log→trace time correlation is accurate even when Promtail lags.
+  #   Stage 3 (json): parses the structlog JSON body for correlation IDs.
+  #   Stage 4 (labels): promotes level and kind to Loki index labels.
+  #     trace_id and session_id are intentionally NOT promoted here — they are
+  #     high-cardinality (unique per request/session) and would cause Loki's
+  #     index to grow without bound. Query them with `| json | trace_id="<v>"`.
+  #   Stage 5 (output): sets the final log line to the inner structlog JSON,
+  #     discarding the Docker envelope wrapper.
+  #
+  # Scrapes all Docker container logs and ships them to Loki with the
+  # service/component labels that datasources.yaml derivedFields expect.
+  promtail_config:
+    content: |
+      server:
+        http_listen_port: 9080
+        grpc_listen_port: 0
+        log_level: warn
+
+      positions:
+        filename: /tmp/positions/positions.yaml
+
+      clients:
+        - url: http://loki:3100/loki/api/v1/push
+          batchwait: 1s
+          batchsize: 1048576
+          backoff_config:
+            min_period: 500ms
+            max_period: 5m
+            max_retries: 10
+          tenant_id: voice-pipeline
+
+      scrape_configs:
+        - job_name: docker
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock
+              refresh_interval: 10s
+
+          relabel_configs:
+            # Container name → label (e.g. /vp_redis → vp_redis).
+            - source_labels: [__meta_docker_container_name]
+              target_label: container
+              regex: /(.*)
+              replacement: $1
+
+            # Strip the vp_ prefix for a clean component label.
+            - source_labels: [__meta_docker_container_name]
+              target_label: component
+              regex: /vp_(.*)
+              replacement: $1
+
+            - target_label: env
+              replacement: development
+
+            - target_label: job
+              replacement: docker
+
+            # App containers get service=voice-pipeline for LogQL correlation.
+            - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+              target_label: service
+              regex: (app|voice.*)
+              replacement: voice-pipeline
+
+            - source_labels: [__meta_docker_container_id]
+              target_label: __path__
+              replacement: /var/lib/docker/containers/$1/$1-json.log
+
+          pipeline_stages:
+            # Docker json-file wraps log lines in {"log":"...","stream":"...","time":"..."}.
+            - json:
+                expressions:
+                  output: log
+                  stream: stream
+                  timestamp: time
+
+            - timestamp:
+                source: timestamp
+                format: RFC3339Nano
+
+            # Parse the structlog JSON payload for trace_id, session_id, level, kind.
+            - json:
+                expressions:
+                  trace_id: trace_id
+                  span_id: span_id
+                  session_id: session_id
+                  level: level
+                  kind: kind
+                source: output
+
+            # Promote low-cardinality fields to Loki index labels.
+            # trace_id and session_id stay in the log body — queried with | json.
+            - labels:
+                level:
+                kind:
+
+            - output:
+                source: output

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Audio files (important for your project)
+audio/
+*.wav
+*.mp3
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Temp
+temp_IN/
+temp_OUT/
+
+# Docker
+.docker_built
+
+# Transcripts (contains user data)
+transcripts/
+
+# Logs
+logs/

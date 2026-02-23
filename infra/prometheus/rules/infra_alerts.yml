@@ -1,0 +1,171 @@
+groups:
+
+  # ── Redis health ──────────────────────────────────────────────────────────
+  - name: redis_health
+    rules:
+
+      # Redis is in degraded mode — LRU fallback active, no persistence,
+      # no stampede protection. Every LLM request hits OpenAI.
+      # ai_redis_degraded_mode is a Gauge: 1 = degraded, 0 = healthy.
+      - alert: RedisDegraded
+        expr: ai_redis_degraded_mode == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis is down — LRU fallback active"
+          description: >
+            The app cannot reach Redis and is operating in degraded mode.
+            LLM cache is disabled, session locks are in-process only, and
+            stampede protection is off. LLM API costs will spike immediately.
+            Check vp_redis container: docker logs vp_redis
+
+      # Redis disconnect rate > 1/min sustained — flapping, not just one hiccup.
+      - alert: RedisFrequentDisconnects
+        expr: rate(ai_redis_disconnects_total[5m]) > 0.017
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis disconnecting {{ $value | humanize }} times/sec"
+          description: >
+            Redis is disconnecting more than once per minute over a 5-minute window.
+            The connection is unstable. Check Redis memory pressure, maxmemory
+            policy, and AOF rewrite activity (which can cause brief latency spikes).
+
+      # Redis recovered but still worth knowing — confirms outage is over.
+      - alert: RedisRecovered
+        expr: rate(ai_redis_recovered_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+        annotations:
+          summary: "Redis reconnected after outage"
+          description: >
+            The app has successfully reconnected to Redis. LLM cache and session
+            locks are active again. Monitor for repeated disconnect/recover cycles
+            which indicate underlying instability.
+
+
+  # ── Transcript pipeline ───────────────────────────────────────────────────
+  - name: transcript_health
+    rules:
+
+      # Any transcript drops means conversation turns are being silently lost.
+      - alert: TranscriptDrops
+        expr: rate(ai_transcript_drops_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Transcript entries being dropped — queue full"
+          description: >
+            The transcript writer queue is full and turns are being discarded.
+            This means conversation history will have gaps. Either the MongoDB
+            sink is too slow, or turn volume has spiked beyond queue capacity.
+            Check ai_mongo_event_drops_total and MongoDB write latency.
+
+
+  # ── MongoDB observability sink ────────────────────────────────────────────
+  - name: mongo_health
+    rules:
+
+      # Event drops mean structured events are lost — gaps in Grafana history.
+      - alert: MongoEventDrops
+        expr: rate(ai_mongo_event_drops_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoDB event queue full — events being dropped"
+          description: >
+            The MongoDB writer queue is full and structured events are being
+            discarded silently. This causes gaps in the observability event
+            history. Check vp_mongo container health and disk usage.
+
+      # MongoDB reconnection failures — writer is trying but can't get through.
+      - alert: MongoReconnectFailing
+        expr: rate(ai_mongo_reconnects_total{status="failure"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoDB reconnection attempts failing"
+          description: >
+            The observability event writer is unable to reconnect to MongoDB
+            after connection loss. Events are accumulating in the queue and
+            will eventually be dropped. Check vp_mongo container:
+            docker logs vp_mongo
+
+
+  # ── Observability self-health ─────────────────────────────────────────────
+  # These alert on the monitoring pipeline itself. Silent failures here mean
+  # you lose visibility into the app without knowing it.
+  - name: observability_self
+    rules:
+
+      # Prometheus can't scrape the app — all app metrics go dark.
+      - alert: AppMetricsDown
+        expr: up{job="voice_pipeline"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot reach the voice pipeline app"
+          description: >
+            The voice_pipeline scrape target is down. Either the app container
+            has crashed, the /metrics route is broken, or the observability
+            network is partitioned. Check docker ps for vp_app.
+
+      # OTel collector is unreachable — traces are not reaching Tempo.
+      - alert: OtelCollectorDown
+        expr: up{job="otel_collector"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTel collector is unreachable — traces not reaching Tempo"
+          description: >
+            Prometheus cannot scrape the OTel collector's self-metrics on port 8888.
+            Traces from the app are queuing in the SDK's BatchSpanProcessor and
+            will eventually be dropped. Check vp_otel: docker logs vp_otel
+
+      # Tempo is unreachable — trace storage is down.
+      - alert: TempoDown
+        expr: up{job="tempo"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tempo trace backend is unreachable"
+          description: >
+            Prometheus cannot reach Tempo on port 3200. New traces cannot be stored
+            and Grafana trace search will return no results.
+            Check vp_tempo: docker logs vp_tempo
+
+      # Loki is unreachable — logs are not being stored.
+      - alert: LokiDown
+        expr: up{job="loki"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loki log backend is unreachable"
+          description: >
+            Prometheus cannot reach Loki on port 3100. Container logs shipped by
+            Promtail are being queued and will eventually be lost.
+            Check vp_loki: docker logs vp_loki
+
+      # Prometheus scrape duration > 8s for the app — close to the 10s timeout.
+      # A slow /metrics endpoint usually means the app is overloaded.
+      - alert: SlowAppMetricsScrape
+        expr: scrape_duration_seconds{job="voice_pipeline"} > 8
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "App /metrics scrape taking {{ $value | humanizeDuration }}"
+          description: >
+            The /metrics endpoint is responding slowly (> 8s, within 2s of the
+            10s scrape_timeout). The app is likely under heavy CPU or I/O load.
+            A timeout would cause a gap in all app metric series.

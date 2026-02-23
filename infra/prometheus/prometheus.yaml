@@ -1,0 +1,327 @@
+# prometheus.yaml — Voice Pipeline
+#
+# Scrape configuration for every instrumented component in the stack.
+# Prometheus scrapes targets on a pull model: each job_name defines which
+# endpoints to poll, at what interval, and with what relabeling.
+#
+# How to apply a live config change without a full restart:
+#   curl -X POST http://localhost:9090/-/reload
+#   (requires --web.enable-lifecycle flag in the Prometheus process args)
+#
+# Quick reference — what is scraped and where:
+#   voice_pipeline          Container     port 8000  (FastAPI /metrics ASGI route)
+#   prometheus              Self          port 9090
+#   otel_collector          Container     port 8888  (otel service in docker-compose)
+#   loki                    Container     port 3100
+#   tempo                   Container     port 3200  (/metrics endpoint)
+#   grafana                 Container     port 3000
+#   redis                   Uncomment if redis-exporter sidecar is added
+#   node_exporter           Uncomment if host metrics are needed
+#
+# Metric naming conventions used by observability.py:
+#   ai_pipeline_*           pipeline-level counters, gauges, histograms
+#   ai_stt_*                STT (Whisper) metrics
+#   ai_llm_*                LLM (OpenAI) metrics
+#   ai_tts_*                TTS metrics
+#   ai_eval_*               evaluation engine metrics
+#   ai_session_*            session store metrics
+#   ai_memory_*             conversation memory metrics
+#   ai_sanitize_*           sanitizer metrics
+#   ai_circuit_breaker_*    circuit breaker state metrics
+#   ai_rate_limit_*         rate limiter metrics
+#   ai_bulkhead_*           bulkhead pool metrics
+#   ai_latency_budget_*     SLA latency budget metrics
+#   ai_controller_*         desktop PTT controller metrics
+#   ai_redis_*              Redis connectivity metrics
+#   ai_transcript_*         transcript queue metrics
+
+
+global:
+  # Default scrape frequency for all jobs. Overridden per-job below.
+  # 15s gives 4 data points per minute — sufficient for 1-minute rate() windows.
+  scrape_interval: 15s
+
+  # How often alerting rules are evaluated. Keep this equal to scrape_interval
+  # so alert state changes are detected within one scrape cycle.
+  evaluation_interval: 15s
+
+  # Timeout for a single scrape HTTP request. Must be < scrape_interval to
+  # prevent a slow target from blocking the scrape loop into the next cycle.
+  scrape_timeout: 10s
+
+  # External labels added to every time series scraped by this Prometheus
+  # instance. These propagate to Alertmanager and remote_write targets so
+  # you can identify the origin cluster in federated or multi-cluster setups.
+  external_labels:
+    cluster: voice-pipeline
+    env: development
+    # datacenter: us-east-1a      # uncomment for multi-DC deployments
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ALERTMANAGER INTEGRATION (uncomment when Alertmanager is added to the stack)
+# ─────────────────────────────────────────────────────────────────────────────
+# alerting:
+#   alert_relabel_configs:
+#     # Suppress the env=development label from all alerts sent to Alertmanager
+#     # so prod/dev don't fire the same routing rules.
+#     - action: labeldrop
+#       regex: env
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+#       scheme: http
+#       timeout: 5s
+#       api_version: v2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECORDING AND ALERT RULE FILES
+# recording_rules.yml pre-computes expensive PromQL expressions (e.g. cache hit
+# rate, p95 latency) so Grafana dashboards load fast even with 90 days of data.
+# pipeline_alerts.yml and infra_alerts.yml define Prometheus alerting rules
+# that write alerts to TSDB — visible in Grafana's alerting UI without needing
+# Alertmanager. Create these files when you have rules to add.
+# ─────────────────────────────────────────────────────────────────────────────
+rule_files:
+  - /etc/prometheus/rules/recording_rules.yml
+  - /etc/prometheus/rules/pipeline_alerts.yml
+  - /etc/prometheus/rules/infra_alerts.yml
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCRAPE CONFIGURATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+scrape_configs:
+
+  # ── Voice Pipeline Application ────────────────────────────────────────────
+  # main.py calls bootstrap(start_prometheus=False) — no standalone metrics
+  # server is started. Metrics are served as a normal FastAPI ASGI route at
+  # GET /metrics on port 8000 (the main Gunicorn port), which means a single
+  # port handles both the API and Prometheus scraping.
+  #
+  # app:8000 is reachable because both this Prometheus container and the app
+  # container share the `observability` Docker bridge network. No
+  # host.docker.internal or published port is needed for internal scraping.
+  #
+  # Metrics exposed by observability.py _Metrics class:
+  #   ai_pipeline_requests_total, ai_pipeline_latency_seconds, ai_pipeline_inflight,
+  #   ai_pipeline_stage_latency_seconds, ai_pipeline_stage_errors_total,
+  #   ai_pipeline_stage_retries_total, ai_pipeline_load_shed_total,
+  #   ai_pipeline_aborted_total, ai_pipeline_degraded_total, ai_pipeline_cancelled_total,
+  #   ai_stt_*, ai_llm_*, ai_tts_*, ai_eval_*, ai_session_*, ai_memory_*,
+  #   ai_sanitize_*, ai_circuit_breaker_*, ai_rate_limit_*, ai_bulkhead_*,
+  #   ai_latency_budget_*, ai_controller_*, ai_redis_*, ai_transcript_*
+  - job_name: voice_pipeline
+    scrape_interval: 10s
+    scrape_timeout: 8s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - app:8000
+        labels:
+          service: voice-pipeline
+          component: app
+          language: python
+    # Relabeling: drop high-cardinality labels that break Prometheus performance.
+    # The session_id label is in OTel spans but should never appear in Prometheus
+    # metric labels — there can be thousands of unique sessions.
+    metric_relabel_configs:
+      # Drop any metric label literally named session_id if somehow present.
+      - action: labeldrop
+        regex: session_id
+      # Keep only ai_* metrics from this job. Prometheus SDK exposes
+      # go_* and process_* metrics too — drop them here to reduce cardinality.
+      # Comment out this filter if you want Python runtime metrics.
+      - source_labels: [ __name__ ]
+        regex: '(go_.*|python_.*|process_.*)'
+        action: drop
+
+  # ── Prometheus Self-Monitoring ────────────────────────────────────────────
+  # Scrape Prometheus's own /metrics to track its health: query latency,
+  # WAL size, TSDB compaction, scrape duration, and remote_write backlog.
+  - job_name: prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets: [ 'localhost:9090' ]
+        labels:
+          service: prometheus
+          component: metrics-server
+
+  # ── OpenTelemetry Collector ────────────────────────────────────────────────
+  # The OTel collector exposes its own Prometheus metrics on port 8888.
+  # These include:
+  #   otelcol_receiver_accepted_spans_total    — spans received from the app
+  #   otelcol_exporter_sent_spans_total        — spans exported to Tempo
+  #   otelcol_exporter_send_failed_spans_total — export failures (alert on this)
+  #   otelcol_processor_batch_*                — batch processor metrics
+  #   otelcol_process_memory_rss               — collector process memory
+  #
+  # If OTEL_ENABLED=false in .env, this job still runs harmlessly — the
+  # collector is a separate process that may be running regardless.
+  - job_name: otel_collector
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: [ 'otel:8888' ]
+        labels:
+          service: otel-collector
+          component: tracing
+
+  # ── Loki ──────────────────────────────────────────────────────────────────
+  # Loki exposes internal metrics at /metrics on port 3100.
+  # Key metrics to monitor:
+  #   loki_ingester_streams_created_total  — new log streams (one per service)
+  #   loki_distributor_bytes_received_total — ingestion throughput
+  #   loki_query_range_request_duration_seconds — query latency
+  #   loki_ingester_chunk_size_bytes       — chunk size distribution
+  #   loki_ruler_evaluation_duration_seconds — alert rule evaluation
+  - job_name: loki
+    scrape_interval: 15s
+    static_configs:
+      - targets: [ 'loki:3100' ]
+        labels:
+          service: loki
+          component: log-aggregator
+
+  # ── Tempo ─────────────────────────────────────────────────────────────────
+  # Tempo exposes metrics at /metrics on port 3200 (HTTP API port).
+  # Key metrics for trace pipeline health:
+  #   tempo_distributor_spans_received_total     — spans arriving at distributor
+  #   tempo_ingester_traces_created_total        — new traces created
+  #   tempo_query_frontend_queries_total         — query frontend throughput
+  #   tempo_compactor_compaction_duration_seconds — background compaction latency
+  #   tempo_service_graph_request_total          — service graph edge metrics
+  #   tempo_service_graph_request_failed_total   — service graph error edges
+  #   tempo_service_graph_request_duration_seconds — service graph latency histograms
+  #     ^^ These three are what Grafana's service map and tracesToMetrics use.
+  - job_name: tempo
+    scrape_interval: 15s
+    static_configs:
+      - targets: [ 'tempo:3200' ]
+        labels:
+          service: tempo
+          component: tracing-backend
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  # Grafana exposes its own Prometheus metrics at /metrics (auth required by default).
+  # Key metrics:
+  #   grafana_stat_totals_dashboard      — number of dashboards loaded
+  #   grafana_datasource_request_total   — datasource proxy request count
+  #   grafana_alerting_result_total      — alerting evaluation results
+  #   grafana_page_response_status_total — frontend response codes
+  #
+  # Grafana requires a service account token or basic auth to scrape /metrics.
+  # Configure via GF_METRICS_ENABLED=true and GF_METRICS_BASIC_AUTH_USERNAME/PASSWORD
+  # in the Grafana container environment. Then uncomment basic_auth below.
+  - job_name: grafana
+    scrape_interval: 30s
+    static_configs:
+      - targets: [ 'grafana:3000' ]
+        labels:
+          service: grafana
+          component: visualization
+    # basic_auth:
+    #   username: prometheus_scraper
+    #   password: <grafana-service-account-password>
+
+  # ── Redis Exporter ────────────────────────────────────────────────────────
+  # The Redis server itself does not expose Prometheus metrics natively.
+  # oliver006/redis_exporter is the standard sidecar. It exposes metrics at :9121.
+  #
+  # Key metrics for the three pipeline workloads:
+  #   redis_memory_used_bytes                      — total used vs maxmemory
+  #   redis_memory_max_bytes                       — maxmemory setting
+  #   redis_evicted_keys_total                     — LLM cache eviction rate
+  #   redis_expired_keys_total                     — TTL expiry rate (sessions, locks)
+  #   redis_keyspace_hits_total / _misses_total    — LLM cache hit rate
+  #   redis_connected_clients                      — connection pool utilisation
+  #   redis_blocked_clients                        — clients waiting on BLPOP/BRPOP
+  #   redis_aof_rewrite_in_progress                — AOF rewrite currently running
+  #   redis_commands_total{cmd="get|set|setnx"}    — per-command throughput
+  - job_name: redis
+    scrape_interval: 10s
+    static_configs:
+      - targets: [ 'redis-exporter:9121' ]
+        labels:
+          service: redis
+          component: cache-store
+
+  # ── Node Exporter (Host Metrics) ──────────────────────────────────────────
+  # Exposes OS-level metrics: CPU, memory, disk I/O, network, file descriptors.
+  # Essential for correlating pipeline latency spikes with host resource pressure
+  # (e.g. CPU saturation during a background AOF rewrite causing Redis latency).
+  - job_name: node_exporter
+    scrape_interval: 15s
+    static_configs:
+      - targets: [ 'node-exporter:9100' ]   # service name on the `metrics` network
+        labels:
+          service: node-exporter
+          component: host-metrics
+
+  # ── cAdvisor (Container Metrics) ──────────────────────────────────────────
+  # Exposes per-container CPU, memory, and network metrics from the Docker daemon.
+  # Useful for finding which container is consuming resources under load.
+  - job_name: cadvisor
+    scrape_interval: 15s
+    static_configs:
+      - targets: [ 'cadvisor:8080' ]
+        labels:
+          service: cadvisor
+          component: container-metrics
+    # cAdvisor exposes many high-cardinality metrics. Drop the ones that are
+    # redundant with node-exporter to keep TSDB size manageable.
+    metric_relabel_configs:
+      - source_labels: [ __name__ ]
+        regex: 'container_(tasks_state|memory_failures_total)'
+        action: drop
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REMOTE WRITE (long-term storage)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Prometheus's local TSDB retains data for 15d by default. For longer retention
+# (90+ days matching Loki's loki-config.yaml retention_period), forward metrics
+# to a long-term backend like Thanos, Cortex, or Grafana Mimir.
+#
+# Example: Grafana Cloud remote_write
+# remote_write:
+#   - url: https://<your-prometheus-endpoint>/api/prom/push
+#     basic_auth:
+#       username: <grafana-cloud-user-id>
+#       password: <grafana-cloud-api-key>
+#     queue_config:
+#       # Tune the in-memory queue to absorb network hiccups without OOMing.
+#       capacity: 10000
+#       max_shards: 30
+#       min_shards: 1
+#       max_samples_per_send: 2000
+#       batch_send_deadline: 5s
+#       min_backoff: 30ms
+#       max_backoff: 5s
+#     write_relabel_configs:
+#       # Only forward ai_* metrics and standard infra metrics; drop Prometheus
+#       # self-scrape metrics from the long-term store to control cost.
+#       - source_labels: [__name__]
+#         regex: 'ai_.*|node_.*|container_.*'
+#         action: keep
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STORAGE
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These are CLI flags, not yaml keys — set them in the Prometheus startup command:
+#
+#   --storage.tsdb.path=/prometheus         storage directory
+#   --storage.tsdb.retention.time=15d       data retention window
+#   --storage.tsdb.retention.size=10GB      max disk usage (whichever comes first)
+#   --storage.tsdb.wal-compression=true     compress WAL to save disk space
+#   --web.enable-lifecycle                  enables POST /-/reload
+#   --web.enable-admin-api                  enables POST /-/tsdb/delete_series
+#   --query.timeout=2m                      max query execution time
+#   --query.max-concurrency=20              max simultaneous PromQL queries

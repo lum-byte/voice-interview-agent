@@ -1,0 +1,295 @@
+{
+  "info": {
+    "name": "Voice Assistant API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Full collection for the Voice Assistant API.\n\nDev: python -m app.endpoint.main\nProduction: gunicorn -c gunicorn.conf.py app.endpoint.main:app\n\nRun Register Session first — session_id saves automatically."
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "",
+      "type": "string",
+      "description": "Auto-populated after Register Session"
+    }
+  ],
+  "item": [
+    {
+      "name": "session",
+      "item": [
+        {
+          "name": "Register Session",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "var json = pm.response.json();",
+                  "if (json.session_id) {",
+                  "    pm.collectionVariables.set('session_id', json.session_id);",
+                  "    console.log('session_id saved:', json.session_id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/session/register",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "session",
+                "register"
+              ]
+            },
+            "description": "Registers a new session. Auto-saves session_id.\n\nGunicorn note: requires REDIS_ENABLED=true so session is visible across all workers."
+          }
+        },
+        {
+          "name": "Session Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/session/status",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "session",
+                "status"
+              ]
+            },
+            "description": "Returns status, turn count, IP change audit log, and changes remaining."
+          }
+        },
+        {
+          "name": "End Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/session/end",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "session",
+                "end"
+              ]
+            },
+            "description": "Terminates the session and releases the IP lock."
+          }
+        }
+      ]
+    },
+    {
+      "name": "pipeline",
+      "item": [
+        {
+          "name": "Ping (Validate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ping",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ping"
+              ]
+            },
+            "description": "Validates X-Session-ID without uploading audio.\n\nGunicorn note: hit several times to confirm session is found across different workers."
+          }
+        },
+        {
+          "name": "Voice Chat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "description": "Audio file (.wav, .mp3, .mp4, .m4a, .webm, .mpeg, .mpga) — max 25 MB"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/voice",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "voice"
+              ],
+              "query": [
+                {
+                  "key": "language",
+                  "value": "",
+                  "disabled": true
+                },
+                {
+                  "key": "tts_voice",
+                  "value": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Upload an audio file. Returns transcript, LLM response, cleaned response, and audio output path."
+          }
+        }
+      ]
+    },
+    {
+      "name": "control",
+      "item": [
+        {
+          "name": "Interrupt",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/interrupt",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "interrupt"
+              ]
+            },
+            "description": "Cancels the most recently dispatched pipeline for this session."
+          }
+        },
+        {
+          "name": "Cancel by Request ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Session-ID",
+                "value": "{{session_id}}"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/cancel/:request_id?reason=manual",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "cancel",
+                ":request_id"
+              ],
+              "variable": [
+                {
+                  "key": "request_id",
+                  "value": ""
+                }
+              ],
+              "query": [
+                {
+                  "key": "reason",
+                  "value": "manual"
+                }
+              ]
+            },
+            "description": "Cancel a specific in-flight pipeline by request_id."
+          }
+        }
+      ]
+    },
+    {
+      "name": "ops",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Aggregate health check across all three graph instances.\n\nGunicorn note: hit several times — each may hit a different worker, all should return healthy=true."
+          }
+        },
+        {
+          "name": "Root",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                ""
+              ]
+            },
+            "description": "Returns service name and graph version."
+          }
+        },
+        {
+          "name": "Clear Schema Cache",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/openapi-refresh",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "openapi-refresh"
+              ]
+            },
+            "description": "Clears cached OpenAPI schema.\n\nGunicorn note: only clears cache on the worker that handles this request. Restart all workers for a full refresh."
+          }
+        }
+      ]
+    }
+  ]
+}

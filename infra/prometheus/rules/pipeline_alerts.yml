@@ -1,0 +1,301 @@
+groups:
+
+  # ── Pipeline SLOs ─────────────────────────────────────────────────────────
+  - name: pipeline_slo
+    rules:
+
+      # Error rate > 10% for 2 minutes — something is actively broken.
+      - alert: PipelineHighErrorRate
+        expr: job:ai_pipeline_error_rate:rate2m > 0.10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pipeline error rate {{ $value | humanizePercentage }} on tier={{ $labels.tier }}"
+          description: >
+            More than 10% of pipeline requests are failing.
+            Check circuit breakers, OpenAI API status, and Gunicorn logs.
+            Current rate: {{ $value | humanizePercentage }}
+
+      # Error rate > 5% for 5 minutes — degraded but not yet critical.
+      - alert: PipelineElevatedErrorRate
+        expr: job:ai_pipeline_error_rate:rate2m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline error rate elevated at {{ $value | humanizePercentage }}"
+          description: >
+            Between 5–10% of pipeline requests are failing for > 5 minutes.
+            Investigate before this escalates.
+
+      # Load shedding > 20% means GRAPH_MAX_INFLIGHT is too low for demand.
+      - alert: PipelineHighLoadShed
+        expr: job:ai_pipeline_load_shed_rate:rate2m > 0.20
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline shedding {{ $value | humanizePercentage }} of requests on tier={{ $labels.tier }}"
+          description: >
+            The bulkhead is rejecting > 20% of requests. Either scale horizontally
+            or raise GRAPH_MAX_INFLIGHT if OpenAI quota allows.
+
+      # End-to-end P95 > 20s — users are waiting unacceptably long.
+      # Pipeline sum of default timeouts: STT 30s + LLM 45s + TTS 30s = 105s max.
+      # 20s P95 is a reasonable alerting threshold for voice UX.
+      - alert: PipelineHighLatency
+        expr: job:ai_pipeline_latency_seconds_p95:rate5m > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline P95 latency {{ $value | humanizeDuration }} on tier={{ $labels.tier }}"
+          description: >
+            End-to-end pipeline P95 has exceeded 20s for 5 minutes.
+            Check per-stage latency panels to identify which stage is slow.
+
+      # Abort rate > 5% — pipelines are dying mid-flight unexpectedly.
+      - alert: PipelineHighAbortRate
+        expr: sum(job:ai_pipeline_abort_rate:rate2m) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline abort rate {{ $value | humanizePercentage }}"
+          description: >
+            More than 5% of pipelines are aborting with non-recoverable faults.
+            Check reason={{ $labels.reason }} for the root cause.
+
+      # Degraded path > 25% — too many users getting apology responses.
+      - alert: PipelineHighDegradedRate
+        expr: sum(job:ai_pipeline_degraded_rate:rate2m) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of pipelines completing on fallback/apology path"
+          description: >
+            More than 25% of completed pipelines fell back to apology audio or text.
+            Stage={{ $labels.stage }} is the failing component.
+
+
+  # ── Per-stage alerts ──────────────────────────────────────────────────────
+  - name: stage_health
+    rules:
+
+      # STT error rate > 15%.
+      - alert: STTHighErrorRate
+        expr: job:ai_stt_error_rate:rate2m > 0.15
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "STT error rate {{ $value | humanizePercentage }}"
+          description: >
+            Whisper API is failing for > 15% of requests.
+            Check OpenAI API status and ai_stt_remote_fallback_total.
+
+      # STT P95 > 15s — exceeding the 30s timeout with enough headroom to matter.
+      - alert: STTHighLatency
+        expr: job:ai_stt_latency_seconds_p95:rate5m > 15
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "STT P95 latency {{ $value | humanizeDuration }}"
+          description: >
+            Whisper is taking > 15s at P95, leaving little headroom before the
+            30s STT timeout. Check audio file sizes and Whisper API latency.
+
+      # LLM error rate > 15%.
+      - alert: LLMHighErrorRate
+        expr: job:ai_llm_error_rate:rate2m > 0.15
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM error rate {{ $value | humanizePercentage }} on model={{ $labels.model }}"
+          description: >
+            The LLM node is failing > 15% of requests. Check if model={{ $labels.model }}
+            circuit breaker is open and whether the fallback model is healthy.
+
+      # LLM P95 > 25s — eating most of the 45s LLM timeout budget.
+      - alert: LLMHighLatency
+        expr: job:ai_llm_latency_seconds_p95:rate5m > 25
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM P95 latency {{ $value | humanizeDuration }} on model={{ $labels.model }}"
+          description: >
+            LLM generation is taking > 25s at P95 on model={{ $labels.model }}.
+            This is 55% of the LLM_TIMEOUT budget. Watch for timeout cascades.
+
+      # TTS error rate > 15%.
+      - alert: TTSHighErrorRate
+        expr: job:ai_tts_error_rate:rate2m > 0.15
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TTS error rate {{ $value | humanizePercentage }} on voice={{ $labels.voice }}"
+          description: >
+            TTS synthesis is failing > 15% of requests. Check OpenAI TTS API status.
+            Users are receiving apology audio — check ai_tts_apology_fallback_total.
+
+      # TTS apology rate > 20% — users are getting fallback audio too often.
+      - alert: TTSHighApologyRate
+        expr: job:ai_tts_apology_rate:rate5m > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTS apology fallback rate {{ $value | humanizePercentage }}"
+          description: >
+            More than 20% of TTS requests are returning pre-rendered apology audio.
+            TTS is consistently failing — investigate before users notice.
+
+      # LLM cache hit rate < 10% — cache is not helping; check Redis health.
+      - alert: LLMCacheLowHitRate
+        expr: sum(job:ai_llm_cache_hit_rate:rate5m) < 0.10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM cache hit rate {{ $value | humanizePercentage }}"
+          description: >
+            Cache hit rate has been below 10% for 15 minutes. Either Redis is down
+            (check ai_redis_degraded_mode) or traffic is highly diverse/unique.
+            High miss rate means every request hits the OpenAI API.
+
+      # LLM model fallback rate > 30% — primary model is mostly failing.
+      - alert: LLMHighFallbackRate
+        expr: sum(job:ai_llm_model_fallback_rate:rate5m) > 0.30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM falling back {{ $value | humanizePercentage }} of requests from {{ $labels.primary }} to {{ $labels.fallback }}"
+          description: >
+            The primary model's circuit breaker is open for > 30% of requests.
+            Primary={{ $labels.primary }} is unhealthy; check OpenAI status.
+
+
+  # ── Circuit breaker alerts ────────────────────────────────────────────────
+  - name: circuit_breakers
+    rules:
+
+      # Any circuit breaker is OPEN (state=2).
+      # ai_circuit_breaker_state labels: service. Values: 0=CLOSED 1=HALF_OPEN 2=OPEN
+      - alert: CircuitBreakerOpen
+        expr: ai_circuit_breaker_state == 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN on service={{ $labels.service }}"
+          description: >
+            The {{ $labels.service }} circuit breaker has been OPEN for > 1 minute.
+            All calls to this service are being rejected immediately.
+            Watch ai_circuit_breaker_half_open_total for recovery probes.
+
+      # Circuit breaker opening rate > 3/min — instability, not a one-off.
+      - alert: CircuitBreakerFlapping
+        expr: sum(rate(ai_circuit_breaker_opened_total[5m])) by (service) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker for {{ $labels.service }} opening repeatedly"
+          description: >
+            The {{ $labels.service }} breaker is opening more than 3 times per minute
+            over a 5-minute window. The upstream is unstable — not just transiently down.
+
+
+  # ── Rate limiter and bulkhead alerts ─────────────────────────────────────
+  - name: rate_limiting
+    rules:
+
+      # Rate limiter exhausted > 30% of the time on any service.
+      - alert: RateLimiterSaturated
+        expr: job:ai_rate_limit_exhaustion_rate:rate2m > 0.30
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limiter for {{ $labels.service }} rejecting {{ $value | humanizePercentage }} of requests"
+          description: >
+            More than 30% of callers to {{ $labels.service }} are being turned away
+            by the token-bucket rate limiter. Consider raising LLM_RATE_BURST or
+            LLM_MAX_CONCURRENT, or check for a retry storm.
+
+      # Bulkhead fully saturated > 20% of the time.
+      - alert: BulkheadSaturated
+        expr: job:ai_bulkhead_saturation_rate:rate2m > 0.20
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bulkhead {{ $labels.name }} at capacity {{ $value | humanizePercentage }} of requests"
+          description: >
+            The {{ $labels.name }} bulkhead pool is full for > 20% of request attempts.
+            Either the pool is too small (raise STT/LLM/TTS_MAX_CONCURRENT) or
+            upstream services are unusually slow.
+
+      # Latency budget breached — a stage is consistently blowing the SLA window.
+      - alert: LatencyBudgetBreached
+        expr: sum(job:ai_latency_budget_breach_rate:rate2m) by (stage) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stage {{ $labels.stage }} breaching SLA latency budget {{ $value | humanizePercentage }} of requests"
+          description: >
+            More than 5% of requests to stage={{ $labels.stage }} are being aborted
+            because the upstream stage consumed too much of the shared SLA budget.
+            The slowest stage upstream is GRAPH_{{ $labels.stage | upper }}_TIMEOUT.
+
+
+  # ── Session security alerts ───────────────────────────────────────────────
+  - name: session_security
+    rules:
+
+      # Session rejection rate > 20% — something is blocking legitimate users.
+      - alert: HighSessionRejectionRate
+        expr: job:ai_session_rejection_rate:rate5m > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session rejection rate {{ $value | humanizePercentage }}"
+          description: >
+            More than 20% of session creation attempts are being rejected.
+            Check reason={{ $labels.reason }}. Common causes: SESSION_MAX_IP_CHANGES
+            too low, Redis down (no session lock available), or abuse traffic.
+
+      # Prompt injection detected — any sustained rate is worth alerting.
+      - alert: PromptInjectionDetected
+        expr: job:ai_sanitize_injection_rate:rate5m > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prompt injection patterns detected at {{ $value | humanizePercentage }} of sanitize calls"
+          description: >
+            The sanitizer is detecting prompt injection patterns in > 1% of LLM
+            outputs. Could be jailbreak probing or a model misbehaving.
+            Check ai_sanitize_injection_total trend and session IDs in Loki.
+
+      # IP abuse — sessions being killed for IP churn > 5% of created sessions.
+      - alert: SessionIPAbuseDetected
+        expr: job:ai_session_ip_limit_rate:rate5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session IP limit hit for {{ $value | humanizePercentage }} of sessions"
+          description: >
+            More than 5% of sessions are being terminated for exceeding
+            SESSION_MAX_IP_CHANGES={{ $labels.limit }}. Could be NAT churn on
+            mobile or intentional session hijacking attempts.

@@ -1,0 +1,2684 @@
+{
+  "title": "AI Voice Pipeline \u2014 Observability",
+  "uid": "ai-voice-pipeline",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "tags": [
+    "ai",
+    "llm",
+    "stt",
+    "tts",
+    "voice",
+    "pipeline"
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "session_id",
+        "type": "textbox",
+        "label": "Session ID",
+        "current": {
+          "value": ""
+        },
+        "hide": 0
+      },
+      {
+        "name": "tier",
+        "type": "custom",
+        "label": "QoS Tier",
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": ""
+          },
+          {
+            "text": "REALTIME",
+            "value": "REALTIME"
+          },
+          {
+            "text": "STANDARD",
+            "value": "STANDARD"
+          },
+          {
+            "text": "BATCH",
+            "value": "BATCH"
+          }
+        ],
+        "current": {
+          "text": "All",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana"
+        },
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Overview",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 2,
+      "title": "Active Pipelines",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "ai_pipeline_inflight",
+          "legendFormat": "Active Pipelines"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Active Sessions",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 4,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "ai_session_active",
+          "legendFormat": "Active Sessions"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Pipeline P99 (s)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "Pipeline P99 (s)"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "Redis Degraded",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "ai_redis_degraded_mode",
+          "legendFormat": "Redis Degraded"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "CB Open (any)",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(ai_circuit_breaker_state == 2)",
+          "legendFormat": "CB Open (any)"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "title": "Eval Budget Exhaust",
+      "type": "stat",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 1,
+        "w": 4,
+        "h": 4
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(ai_eval_budget_exhausted_total[1h]))",
+          "legendFormat": "Eval Budget Exhaust"
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "red",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "title": "Pipeline",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 9,
+      "title": "Pipeline Requests/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_pipeline_requests_total{status=\"ok\"}[1m])) * 60",
+          "legendFormat": "ok",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_pipeline_requests_total{status=\"error\"}[1m])) * 60",
+          "legendFormat": "error",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_pipeline_requests_total{status=\"cache\"}[1m])) * 60",
+          "legendFormat": "cache",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 5,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "title": "Pipeline Latency Percentiles",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 6,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "title": "Stage Latency P95 (s)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 14,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"stt\"}[5m])) by (le))",
+          "legendFormat": "stt",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"llm\"}[5m])) by (le))",
+          "legendFormat": "llm",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"tts\"}[5m])) by (le))",
+          "legendFormat": "tts",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"sanitize\"}[5m])) by (le))",
+          "legendFormat": "sanitize",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 12,
+      "title": "Pipeline Errors by Stage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 14,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_pipeline_stage_errors_total[1m])) by (stage)",
+          "legendFormat": "{{stage}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 4,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 13,
+      "title": "Retries & Aborts",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 14,
+        "w": 4,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_pipeline_stage_retries_total[5m])) by (stage)",
+          "legendFormat": "retry:{{stage}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_pipeline_aborted_total[5m])) by (reason)",
+          "legendFormat": "abort:{{reason}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 14,
+      "title": "Load Shedding & Degraded",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_pipeline_load_shed_total[5m])) by (tier)",
+          "legendFormat": "shed:{{tier}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_pipeline_degraded_total[5m])) by (stage)",
+          "legendFormat": "degraded:{{stage}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_pipeline_cancelled_total[5m])) by (stage)",
+          "legendFormat": "cancelled:{{stage}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 15,
+      "title": "Inflight by QoS Tier",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 22,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "ai_pipeline_inflight",
+          "legendFormat": "{{tier}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 16,
+      "title": "STT \u2014 Speech-to-Text",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 17,
+      "title": "STT Requests/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 29,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_stt_requests_total[1m])) by (status) * 60",
+          "legendFormat": "{{status}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 3,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 18,
+      "title": "STT Latency Percentiles",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 29,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 19,
+      "title": "Language Confidence Distribution",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 29,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_language_confidence_bucket[10m])) by (le, language))",
+          "legendFormat": "{{language}} p50",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 0.8
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "title": "STT Edge Cases",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 36,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_stt_empty_audio_total[5m]))",
+          "legendFormat": "empty_audio",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_stt_low_confidence_total[5m]))",
+          "legendFormat": "low_confidence",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_stt_remote_fallback_total[5m]))",
+          "legendFormat": "remote_fallback",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_stt_path_rejected_total[5m]))",
+          "legendFormat": "path_rejected",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "Audio Duration Distribution (p50/p90)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 36,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 22,
+      "title": "LLM \u2014 Language Model",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 23,
+      "title": "LLM Requests/min by Status & Model",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_llm_requests_total[1m])) by (status, model) * 60",
+          "legendFormat": "{{status}}:{{model}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 4,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 24,
+      "title": "LLM Latency Percentiles",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 43,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p50 {{model}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "p95 {{model}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "title": "Token Consumption Rate (tokens/min)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 51,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_llm_tokens_total[1m])) by (model, kind) * 60",
+          "legendFormat": "{{model}}:{{kind}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 5,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 26,
+      "title": "Cache Hit Rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 51,
+        "w": 6,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_llm_cache_hits_total[5m])) / (sum(rate(ai_llm_cache_hits_total[5m])) + sum(rate(ai_llm_cache_misses_total[5m])))",
+          "legendFormat": "hit_rate",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.2
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "title": "LLM Fallback & Stampede",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 51,
+        "w": 6,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_llm_model_fallback_total[5m])) by (primary, fallback)",
+          "legendFormat": "fallback {{primary}}\u2192{{fallback}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_llm_cache_stampede_total[5m]))",
+          "legendFormat": "cache_stampede",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 28,
+      "title": "Prompt Token Distribution (p50/p90/p99)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 58,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "legendFormat": "p99",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 29,
+      "title": "History Depth at LLM Call",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 58,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "title": "TTS \u2014 Text-to-Speech",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 64,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 31,
+      "title": "TTS Requests/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_tts_requests_total[1m])) by (status, voice) * 60",
+          "legendFormat": "{{status}}:{{voice}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 3,
+            "stacking": {
+              "mode": "normal"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "title": "TTS Latency Percentiles",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 65,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+          "legendFormat": "p50 {{voice}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+          "legendFormat": "p90 {{voice}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 33,
+      "title": "TTS Edge Cases",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 65,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_tts_apology_fallback_total[5m]))",
+          "legendFormat": "apology_fallback",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_tts_chunk_errors_total[5m]))",
+          "legendFormat": "chunk_errors",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_tts_s3_uploads_total{status=\"error\"}[5m]))",
+          "legendFormat": "s3_errors",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_tts_file_cleanups_total[5m]))",
+          "legendFormat": "file_cleanups",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 34,
+      "title": "Evaluation Engine",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 72,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 35,
+      "title": "Eval Score Distribution",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 73,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.25, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "legendFormat": "p25",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "legendFormat": "median",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.75, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "legendFormat": "p75",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 36,
+      "title": "Eval Skips & Budget",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 73,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_eval_skipped_total[5m])) by (reason)",
+          "legendFormat": "skip:{{reason}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_eval_budget_exhausted_total[5m]))",
+          "legendFormat": "budget_exhausted",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_eval_model_fallback_total[5m]))",
+          "legendFormat": "model_fallback",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 37,
+      "title": "Session Management",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 80,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 38,
+      "title": "Active Sessions",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 81,
+        "w": 6,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "ai_session_active",
+          "legendFormat": "active",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 39,
+      "title": "Session Lifecycle Events/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 81,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_session_created_total[1m])) * 60",
+          "legendFormat": "created",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_session_ended_total[1m])) by (reason) * 60",
+          "legendFormat": "ended:{{reason}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_session_rejected_total[1m])) by (reason) * 60",
+          "legendFormat": "rejected:{{reason}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 2,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 40,
+      "title": "IP Security Events",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 81,
+        "w": 6,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_session_ip_changes_total[5m]))",
+          "legendFormat": "ip_changes",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_session_ip_limit_total[5m]))",
+          "legendFormat": "ip_limit_exceeded",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_session_lru_hits_total[5m]))",
+          "legendFormat": "lru_hits_degraded",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 41,
+      "title": "Session Duration Distribution",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 88,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 42,
+      "title": "Turns per Session Distribution",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 88,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 43,
+      "title": "Resilience \u2014 Circuit Breakers, Rate Limits, Bulkheads, Budget",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 94,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 44,
+      "title": "Circuit Breaker State (0=Closed 1=HalfOpen 2=Open)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 95,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "ai_circuit_breaker_state",
+          "legendFormat": "{{service}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 45,
+      "title": "CB Events/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 95,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_circuit_breaker_opened_total[1m])) by (service) * 60",
+          "legendFormat": "opened:{{service}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_circuit_breaker_rejected_total[1m])) by (service) * 60",
+          "legendFormat": "rejected:{{service}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_circuit_breaker_closed_total[1m])) by (service) * 60",
+          "legendFormat": "closed:{{service}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 46,
+      "title": "Rate Limiter Exhaustions/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 102,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_rate_limit_exhausted_total[1m])) by (service) * 60",
+          "legendFormat": "{{service}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 47,
+      "title": "Bulkhead Inflight & Saturation",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 102,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "ai_bulkhead_inflight",
+          "legendFormat": "inflight:{{name}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_bulkhead_saturated_total[5m])) by (name)",
+          "legendFormat": "saturated:{{name}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 48,
+      "title": "Latency Budget Breaches/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 102,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_latency_budget_breached_total[1m])) by (stage) * 60",
+          "legendFormat": "{{stage}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 49,
+      "title": "Sanitizer & Conversation Memory",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 108,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 50,
+      "title": "Sanitizer Events/min",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 109,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_sanitize_total[1m])) by (status) * 60",
+          "legendFormat": "{{status}}",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_sanitize_injection_total[1m])) * 60",
+          "legendFormat": "injection_detected",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_sanitize_truncated_total[1m])) * 60",
+          "legendFormat": "truncated",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 51,
+      "title": "Memory Compressions & LRU Fallbacks",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 109,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_memory_compressions_total[5m]))",
+          "legendFormat": "compressions",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_memory_lru_fallback_total[5m]))",
+          "legendFormat": "lru_fallbacks",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_memory_compression_ratio_bucket[30m])) by (le))",
+          "legendFormat": "ratio_p50",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 52,
+      "title": "Controller & Infrastructure",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 115,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 53,
+      "title": "PTT Activity",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 116,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_controller_ptt_presses_total[1m])) * 60",
+          "legendFormat": "presses/min",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_controller_interrupts_total[1m])) * 60",
+          "legendFormat": "interrupts/min",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_controller_empty_recordings_total[1m])) * 60",
+          "legendFormat": "empty/min",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 54,
+      "title": "Recording Duration Distribution",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 116,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(ai_controller_recording_duration_seconds_bucket[10m])) by (le))",
+          "legendFormat": "p50",
+          "interval": "30s"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum(rate(ai_controller_recording_duration_seconds_bucket[10m])) by (le))",
+          "legendFormat": "p90",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 55,
+      "title": "Redis Health",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 122,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "ai_redis_degraded_mode",
+          "legendFormat": "degraded",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_redis_disconnects_total[5m]))",
+          "legendFormat": "disconnects/5m",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_redis_recovered_total[5m]))",
+          "legendFormat": "recoveries/5m",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 56,
+      "title": "Transcript Queue",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 122,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(ai_transcript_turns_total[1m])) * 60",
+          "legendFormat": "turns/min",
+          "interval": "30s"
+        },
+        {
+          "expr": "sum(rate(ai_transcript_drops_total[5m]))",
+          "legendFormat": "queue_drops/5m",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 57,
+      "title": "OpenTelemetry Traces (Tempo)",
+      "type": "row",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 128,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "id": 58,
+      "title": "Service Dependency Graph",
+      "type": "nodeGraph",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 129,
+        "w": 12,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "serviceMap"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 59,
+      "title": "Error Traces \u2014 Voice Pipeline",
+      "type": "traces",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 129,
+        "w": 12,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"voice-pipeline\" && status=error} | select(ai.session.id, ai.pipeline.stage, ai.latency_ms)",
+          "limit": 20
+        }
+      ],
+      "options": {
+        "frameType": "trace"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 60,
+      "title": "Trace Request Rate by Service (from Tempo)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 139,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(tempo_service_graph_request_total{server=~\"ai.*\"}[1m])) by (server) * 60",
+          "legendFormat": "{{server}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": ""
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 61,
+      "title": "Trace Error Rate by Service (from Tempo)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 139,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(tempo_service_graph_request_failed_total{server=~\"ai.*\"}[5m])) by (server) / sum(rate(tempo_service_graph_request_total{server=~\"ai.*\"}[5m])) by (server)",
+          "legendFormat": "{{server}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 62,
+      "title": "Trace Duration P99 by Service (from Tempo)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 139,
+        "w": 8,
+        "h": 7
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(tempo_service_graph_request_duration_seconds_bucket{server=~\"ai.*\"}[5m])) by (le, server))",
+          "legendFormat": "p99 {{server}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 63,
+      "title": "Stage Span Duration P95 (OTel histogram)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 146,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(duration_milliseconds_bucket{span_name=~\"ai\\..*\"}[5m])) by (le, span_name))",
+          "legendFormat": "{{span_name}}",
+          "interval": "30s"
+        }
+      ],
+      "options": {},
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none"
+            },
+            "lineWidth": 2
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 64,
+      "title": "Trace Search by Session ID",
+      "type": "traces",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "description": "Search for all traces belonging to a specific session. Enter a session_id in the $session_id template variable above.",
+      "gridPos": {
+        "x": 12,
+        "y": 146,
+        "w": 12,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{span.ai.session.id=\"${session_id}\"}",
+          "limit": 50
+        }
+      ],
+      "options": {
+        "frameType": "trace"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ]
+}

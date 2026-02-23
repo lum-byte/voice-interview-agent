@@ -1,0 +1,41 @@
+apiVersion: 1
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: false
+    jsonData:
+      httpMethod: GET
+      serviceMap:
+        datasourceUid: prometheus
+      nodeGraph:
+        enabled: true
+      search:
+        hide: false
+      lokiSearch:
+        datasourceUid: loki
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        filterByTraceID: true
+        filterBySpanID: false
+        customQuery: true
+        query: '{service="voice-pipeline"} | json | trace_id="$${__span.traceId}"'
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: -1m
+        spanEndTimeShift: 1m
+        tags:
+          - key: ai.session.id
+            value: session_id
+          - key: ai.pipeline.stage
+            value: stage
+        queries:
+          - name: Pipeline latency
+            query: histogram_quantile(0.95, sum(rate(ai_pipeline_latency_seconds_bucket{$$__tags}[5m])) by (le))
+          - name: Stage errors
+            query: sum(rate(ai_pipeline_stage_errors_total{$$__tags}[5m])) by (stage)
