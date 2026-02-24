@@ -880,32 +880,47 @@ class EvaluationEngine:
     # ── public API ─────────────────────────────────────────────────────────────
 
     def schedule_turn(
-        self,
-        session_id: str,
-        question: str,
-        candidate_ans: str,
-        turn_index: int,
-        request_id: str | None = None,
+            self,
+            session_id: str,
+            question: str,
+            candidate_ans: str,
+            turn_index: int,
+            request_id: str | None = None,
     ) -> asyncio.Task:
         """
-        Schedule a turn evaluation off the critical path.
+        Schedule a single-turn evaluation off the critical path.
 
-        Returns the Task immediately — callers do not await it. The task
-        is held in a weakref set to prevent premature GC without keeping
-        a hard reference that would stall shutdown.
+        Spawns an asyncio.Task and returns immediately — the caller must NOT
+        await this. The task is held in a weakref set (_tasks) so it survives
+        long enough to complete without keeping a hard reference that would
+        block shutdown or prevent GC.
 
-        Calling convention from _node_llm (after append_turn):
-        ───────────────────────────────────────────────────────
-            question = session.turns[-2].assistant if len(session.turns) >= 2 else ""
+        The task runs _score_turn_safe(), which internally:
+          1. Checks the per-session token budget (Redis).
+          2. Checks the dedup sentinel (Redis SET NX) to prevent double-scoring
+             the same turn if this method is called twice for the same index.
+          3. Calls the scoring LLM (adaptive sampling may skip it).
+          4. Persists the TurnScore to Redis under eval:score:v1:{sid}:{turn_index}.
+
+        Calling convention — invoke from conversation_memory.route_committed_turn_to_audit()
+        immediately after qa_controller.commit_turn() returns a CommittedTurn:
+        ─────────────────────────────────────────────────────────────────────────
             evaluation_engine.schedule_turn(
-                session_id    = session_id,
-                question      = question,
-                candidate_ans = transcript,
-                turn_index    = len(session.turns) - 1,
-                request_id    = rid,
+                session_id    = committed.session_id,
+                question      = committed.question,       # the interviewer's question
+                candidate_ans = committed.candidate_answer,
+                turn_index    = committed.turn_index,
+                request_id    = request_id,
             )
+
+        NOTE: Do NOT call this from node_llm directly. All eval scheduling must
+        flow through conversation_memory (QAAuditBus) so the dead-letter queue,
+        domain-batch tracking, and transcript fan-out stay consistent.
         """
         rid = request_id or new_request_id()
+
+        # Create the scoring task. The name is structured for easy grep in logs
+        # and async debuggers: "eval:{session_id}:{turn_index}".
         task = asyncio.create_task(
             self._score_turn_safe(
                 session_id=session_id,
@@ -916,8 +931,97 @@ class EvaluationEngine:
             ),
             name=f"eval:{session_id}:{turn_index}",
         )
+
+        # Weak-reference the task so we can drain it on shutdown (via self._tasks)
+        # without holding a strong reference that would keep it alive past its
+        # natural completion. Tasks that finish remove themselves from the set
+        # via the done-callback registered in _score_turn_safe.
         self._tasks.add(task)
         return task
+
+    async def schedule_domain_eval(
+            self,
+            session_id: str,
+            domain: str,
+            eval_pairs: list[dict],
+            candidate_meta: dict, # noqa
+            request_id: str | None = None,
+    ) -> None:
+        """
+        Schedule evaluation for all Q/A pairs in a completed domain batch.
+
+        Called by conversation_memory._call_eval_engine() when a domain rotation
+        occurs (CommittedTurn.domain_rotated=True) or at session close via
+        finalize_session_eval(). This is the bridge that makes the QAAuditBus's
+        domain-batch dispatch actually reach the evaluation engine.
+
+        Each pair in eval_pairs is expected to have the shape:
+            {
+                "turn_index":     int,   # zero-based global turn counter
+                "question":       str,   # interviewer's question text
+                "answer":         str,   # candidate's answer text
+            }
+
+        Pairs that are too short (< EVAL_MIN_ANSWER_CHARS) are skipped silently —
+        the individual _score_turn_safe() call handles the gate, so no filtering
+        is needed here. Scheduling all pairs is safe and cheap.
+
+        candidate_meta is forwarded to the scoring prompt for context (level,
+        domain, name). It is not persisted here — the QADocument owns that.
+
+        This method does NOT await the scoring tasks. Each pair becomes an
+        independent fire-and-forget task via schedule_turn(). The domain batch
+        is therefore evaluated concurrently up to EVAL_MAX_CONCURRENT (the
+        bulkhead configured on the engine), not serially.
+
+        Idempotency: the Redis SET NX dedup sentinel inside _score_turn_safe()
+        ensures that if this method is called twice for the same (session, domain)
+        — e.g. due to a dead-letter retry in QAAuditBus — no turn is double-scored.
+        """
+        rid = request_id or new_request_id()
+
+        if not eval_pairs:
+            log.info(
+                "eval_domain_batch_empty",
+                session_id=session_id[:8],
+                domain=domain,
+                request_id=rid,
+            )
+            return
+
+        log.info(
+            "eval_domain_batch_scheduled",
+            session_id=session_id[:8],
+            domain=domain,
+            pair_count=len(eval_pairs),
+            request_id=rid,
+        )
+
+        for pair in eval_pairs:
+            turn_index = pair.get("turn_index", -1)
+            question = pair.get("question", "")
+            answer = pair.get("answer", "")
+
+            if turn_index < 0 or not question:
+                # Corrupted pair — log and skip rather than poisoning the task.
+                log.warning(
+                    "eval_domain_pair_malformed",
+                    session_id=session_id[:8],
+                    domain=domain,
+                    pair=pair,
+                )
+                continue
+
+            # schedule_turn() is fire-and-forget — do not await.
+            # Each task runs independently through the bulkhead, circuit breaker,
+            # and token-budget gate already wired inside _score_turn_safe().
+            self.schedule_turn(
+                session_id=session_id,
+                question=question,
+                candidate_ans=answer,
+                turn_index=turn_index,
+                request_id=f"{rid}:{turn_index}",  # unique rid per sub-task for tracing
+            )
 
     async def get_session_report(self, session_id: str) -> SessionReport:
         """

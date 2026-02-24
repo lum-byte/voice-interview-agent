@@ -422,6 +422,20 @@ class SessionData:
         """
         messages: list = [SystemMessage(content=system_prompt)]
         for turn in self.turns:
+            # Guard: skip turns where the assistant response is empty or
+            # whitespace-only.  These can arise when stream_messages raises
+            # ValueError *after* yielding whitespace tokens — the whitespace
+            # gets committed before the guard in voice_graph catches it.
+            # An AIMessage(content="") or AIMessage(content=" \n") causes
+            # modern GPT models to return empty streams on the next call,
+            # creating a cascading poisoning of the conversation history.
+            if not turn.assistant.strip():
+                log.warning(
+                    "to_langchain_messages_skipping_empty_assistant_turn",
+                    session_id=self.session_id[:8],
+                    user_preview=turn.user[:40],
+                )
+                continue
             messages.append(HumanMessage(content=turn.user))
             messages.append(AIMessage(content=turn.assistant))
         return messages
@@ -782,7 +796,7 @@ class SessionStore:
                             raise SessionLocked(_mask_ip(client_ip))
                     else:
                         # LRU fallback — sequential is safe under asyncio
-                        await self._lru.set(
+                        await self._lru.set( # noqa
                             old_lock_key, ""
                         )  # noqa # sentinel = deleted
                         await self._lru.set(old_meta_key, "")

@@ -170,7 +170,7 @@ class _NoOpSpan:
         return self
 
     def add_event(
-        self, name: str, attributes: dict | None = None
+        self, name: str, attributes: dict | None = None # noqa
     ) -> "_NoOpSpan":  # noqa
         return self
 
@@ -201,7 +201,7 @@ class _NoOpTracer:
 
     @contextlib.contextmanager
     def start_as_current_span(
-        self, name: str, **kwargs: object
+        self, name: str, **kwargs: object # noqa
     ) -> Iterator[_NoOpSpan]:  # noqa
         yield _NOOP_SPAN
 
@@ -812,6 +812,7 @@ class ServiceHealthState:
     error: str = ""
     checked_at: float = field(default_factory=time.monotonic)
 
+    extra: dict[str, Any] | None = None
 
 # ── circuit breaker ───────────────────────────────────────────────────────────
 
@@ -885,11 +886,15 @@ class CircuitBreaker:
         async with self._lock:
             self._failures += 1
             self._successes = 0
-            self._opened_at = time.monotonic()
             if (
                 self._state is CBState.HALF_OPEN
                 or self._failures >= self.failure_threshold
             ):
+                # Only reset the recovery timer on the transition TO open, not on
+                # every failure. The old code reset _opened_at unconditionally, which
+                # meant every failed half-open probe restarted the full recovery
+                # countdown — keeping the circuit open forever if probes kept failing.
+                self._opened_at = time.monotonic()
                 self._state = CBState.OPEN
                 self._failures = 0
                 try:

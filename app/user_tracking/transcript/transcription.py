@@ -36,7 +36,7 @@ Integration
 ───────────
   In voice_graph.py, after conversation_memory.commit():
 
-      from app.io.transcription import transcript_writer
+      from app.user_tracking.transcript.transcription import transcript_writer
 
       await transcript_writer.write_turn(
           session_id=state.get("session_id"),

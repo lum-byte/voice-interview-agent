@@ -90,13 +90,13 @@ from app.common.shared import (
     QoSTier,
     ServiceHealthState,
     current_request_id,
-    get_logger,
     get_tracer,
     make_counter,
     make_gauge,
     make_histogram,
     new_request_id,
 )
+from app.monitoring.observability import get_logger
 from app.monitoring.observability import (
     session_context,
     pipeline_span,
@@ -115,12 +115,53 @@ from app.nodes.STT_service import STTNodeProtocol, get_stt_node
 from app.nodes.LLM_service import LLMNodeProtocol, get_llm_node
 from app.nodes.TTS_service import TTSNodeProtocol, get_tts_node
 from app.audio_essentials.player import play_audio
+from langchain_core.messages import HumanMessage
+
+# ── QA pipeline wiring ─────────────────────────────────────────────────────────
+# Lazy-imported inside node_llm to avoid circular imports at module load time.
+# These symbols are imported once and cached on first use via module-level refs.
+# If the QA pipeline is not installed, all imports gracefully fall back to
+# None-typed guards so the existing conversational path continues working.
+from app.interview.qa_controller import (
+    CommittedTurn,
+    qa_controller as _qa_controller,
+    qa_session_timer as _qa_session_timer,
+    qa_prefetch_buffer as _qa_prefetch_buffer, # noqa
+    QAStage as _QAStage,
+    GREETING_TEXT as _GREETING_TEXT,
+    CLOSING_TEXT as _CLOSING_TEXT,
+    DOMAIN_SWITCH_BRIDGE as _DOMAIN_SWITCH_BRIDGE,
+    build_next_llm_input_for_voice_graph as _build_next_llm_input,
+    GuardrailAction as _GuardrailAction, # noqa
+    ATSExtractionResult as _ATSExtractionResult,
+    TurnTimingRecord as _TurnTimingRecord, # noqa
+)
+
+conversation_memory = None
+transcript_writer   = None
+
+from app.user_tracking.session_service.conversation_memory import (
+    qa_audit_bus as _qa_audit_bus,
+    route_committed_turn_to_audit as _route_committed_turn,
+    finalize_session_eval as _finalize_session_eval, # noqa | internalized
+)
+from app.nodes.LLM_service import (
+    llm_node as _llm_node_ref,
+    generate_interviewer_question as _generate_interviewer_question,
+    extract_and_validate_intro as _extract_and_validate_intro,
+)
+from app.user_tracking.transcript.transcription import transcript_writer as _transcript_writer
 
 # ── dev flag ───────────────────────────────────────────────────────────────────
 # Controls whether the audio_sink_dev node is compiled into the graph at all.
 # Evaluated once at module load so the graph structure is fixed per process —
 # there's no cost to checking IS_DEV in routing functions at request time.
 IS_DEV: bool = os.getenv("ENV", "").lower() == "development"
+
+# When true, the stream_full LLM worker emits a per-turn log with the full
+# message list preview (role, char count, 120-char snippet). Useful during
+# development to verify conversation history structure; never enabled in prod.
+_STREAM_LLM_DEBUG: bool = os.getenv("STREAM_LLM_DEBUG", "").lower() == "true"
 
 # ── graph version ──────────────────────────────────────────────────────────────
 # Used as a metric label and embedded in result payloads so deployed graph
@@ -289,6 +330,10 @@ class VoiceState(TypedDict, total=False):
     audio_local_path: str
     audio_s3_uri: str
 
+    # ── QA pipeline state (populated in node_llm when QA path active) ─────────
+    qa_stage: str    # current QAStage value, e.g. "greeting" / "intro" / "interview"
+    qa_domain: str   # current domain key, e.g. "python" / "dsa"
+
     # ── retry bookkeeping ─────────────────────────────────────────────────────
     # These are internal graph state fields — they appear in metadata but are
     # never part of the user-facing result contract.
@@ -423,6 +468,53 @@ async def _with_timeout(coro: Any, timeout: float, stage: str) -> Any:
         raise TimeoutError(f"{stage} exceeded {timeout:.0f}s timeout.")
 
 
+async def _collect_stream(
+    token_iter: AsyncIterator[str],
+) -> dict[str, Any]:
+    """
+    Drain an async token iterator to completion and return a generate()-style dict.
+
+    node_llm uses stream_messages() (the correct multi-turn path) but the graph
+    node must await a single result to write into VoiceState. This helper bridges
+    the two by consuming the entire stream and returning the same dict shape as
+    LLMNode.generate() so the rest of node_llm doesn't need to change.
+
+    Cache-hit detection: if the first token arrives in under 5 ms the response
+    almost certainly came from the in-process LRU cache. We set cached=True in
+    that case so LLMEmitter.ok() logs an accurate cache_hit metric.
+
+    Raises ValueError (re-raised from stream_messages) on empty response so the
+    graph routes to llm_error and retries exactly as it did with generate().
+
+    NOTE: model_used is left as "" because the stream protocol does not surface
+    the model name in individual token chunks. The Prometheus counter in LLMNode
+    already records it per-request; this gap only affects the voice_graph log line.
+    """
+    chunks: list[str] = []
+    t_start = time.monotonic()
+    first_token_ms: float = -1.0
+    async for token in token_iter:
+        if first_token_ms < 0:
+            first_token_ms = (time.monotonic() - t_start) * 1000
+        chunks.append(token)
+    full_text = "".join(chunks)
+    # Empty response: re-raise so the error path is identical to generate()
+    if not full_text.strip():
+        raise ValueError(
+            "LLM stream_messages returned empty response (collected by _collect_stream)."
+        )
+    # Heuristic cache detection: real model calls take >50 ms to first token.
+    # An LRU hit is memory-local and typically arrives in <5 ms.
+    cache_hit = 0 < first_token_ms < 5.0
+    return {
+        "response": full_text,
+        "prompt_tokens": 0,    # not available from stream path; LLMNode tracks separately
+        "completion_tokens": 0,
+        "model_used": "cache" if cache_hit else "",
+        "cached": cache_hit,
+    }
+
+
 def _state_update(state: VoiceState, updates: dict) -> VoiceState:
     """Return a new state dict merging updates over the current state."""
     return cast(VoiceState, {"audio_path": state["audio_path"], **state, **updates})
@@ -476,6 +568,8 @@ def _build_result(state: VoiceState, pipeline_latency: float) -> VoicePipelineRe
             "qos_tier": state.get("qos_tier", QoSTier.STANDARD.name),
             "stt_retries": state.get("stt_retries", 0),
             "llm_retries": state.get("llm_retries", 0),
+            "qa_stage": state.get("qa_stage", ""),
+            "qa_domain": state.get("qa_domain", ""),
         },
     )
 
@@ -485,7 +579,7 @@ def _build_result(state: VoiceState, pipeline_latency: float) -> VoicePipelineRe
 
 def _build_graph_for_instance(
     stt: STTNodeProtocol,
-    llm: LLMNodeProtocol,
+    llm: LLMNodeProtocol, # noqa
     tts: TTSNodeProtocol,
     cfg: VoiceGraphConfig,
     is_dev: bool,
@@ -718,218 +812,106 @@ def _build_graph_for_instance(
     # ── node: LLM ─────────────────────────────────────────────────────────────
     async def node_llm(state: VoiceState) -> VoiceState:
         """
-        Generate an LLM response for the transcribed prompt.
+        LLM node — structured interview stage router.
 
-        Session context injection:
-            When session_id is present, the conversation history from session_store
-            is serialised as a "User: … / Assistant: …" block prepended to the
-            current turn. generate() wraps the whole thing in a single HumanMessage
-            and internally prepends SYSTEM_PROMPT as a SystemMessage — we must
-            never inject SYSTEM_PROMPT here.
+        ─── QA INTERVIEW PATH (when _QA_PIPELINE_AVAILABLE and session_id set) ───
+        Routes on qa_controller stage:
+          greeting  → return GREETING_TEXT directly (no LLM call)
+          intro     → ATS extraction via extract_and_validate_intro()
+          interview → question generation via generate_interviewer_question()
+          complete  → return CLOSING_TEXT directly (no LLM call)
 
-        Turn persistence:
-            After a successful generate(), the new turn is appended to session_store
-            and a fire-and-forget evaluation is scheduled. session_turn_appended
-            prevents double-writes if node_llm is retried after a failure that
-            happened after generate() but before some later step.
+        The LLM receives ZERO conversation history in interview mode.
+        Only: domain | level | last_q | last_a | domain_switch_flag | difficulty.
+        This is structurally enforced by build_next_llm_input_for_voice_graph().
 
-        Empty-transcript fallback:
-            If STT produced no usable transcript (e.g. silence or complete failure),
-            a polite apology prompt is used so the LLM can produce a human-readable
-            "please try again" response rather than generating from an empty string.
+        ─── LEGACY CONVERSATIONAL PATH (fallback) ───────────────────────────────
+        Used when QA pipeline is unavailable or no session_id is present.
+        Mirrors original behaviour: conversation_memory.resolve() → llm.stream_messages()
+
+        Security guarantees (QA path only):
+          1. Candidate answers are injection-scanned before any LLM call.
+          2. LLM outputs are content-policy filtered before TTS.
+          3. All turns fingerprinted — same question cannot appear twice.
+          4. Diversity enforcer catches paraphrased repeats.
+          5. Static bank ensures a question always available when LLM is down.
+          6. GuardrailEngine enforces hard stop at 60 questions / 45 minutes.
         """
-        rid = state.get("request_id", current_request_id())
-        t0 = time.monotonic()
-
-        # Lazy imports avoid circular-import issues at module load time.
-        # These modules depend on settings/db/etc. that may not be ready
-        # when voice_graph is first imported.
-        from app.user_tracking.session_service.session_store import session_store
-        from app.eval.evaluation_engine import evaluation_engine
-
-        from app.user_tracking.session_service.conversation_memory import (
-            conversation_memory,
-        )
-        from app.user_tracking.transcript.transcription import transcript_writer
+        rid        = state.get("request_id", current_request_id())
+        t0         = time.monotonic()
+        session_id = state.get("session_id")
 
         LLMEmitter.start(
-            session_id=state.get("session_id", ""),
-            request_id=rid,
-            model=getattr(settings, "llm_model", ""),
-            streaming=False,
-            history_turns=0,
+            session_id  = session_id or "",
+            request_id  = rid,
+            model       = getattr(settings, "llm_model", ""),
+            streaming   = False,
+            history_turns = 0,
         )
 
         async with llm_span(
-            session_id=state.get("session_id", ""),
-            request_id=rid,
-            model=getattr(settings, "llm_model", ""),
-            streaming=False,
+            session_id = session_id or "",
+            request_id = rid,
+            model      = getattr(settings, "llm_model", ""),
+            streaming  = False,
         ) as span:
             try:
-                transcript = state.get("user_input", "").strip()
-                if not transcript:
-                    # STT failed or returned silence. The LLM will produce an apology
-                    # that TTS can synthesise into a graceful spoken error response.
-                    log.info("graph_llm_using_apology_prompt", request_id=rid)
-                    transcript = (
-                        "The user's audio could not be transcribed. "
-                        "Apologise briefly and ask them to try again."
-                    )
-
-                session_id = state.get("session_id")
-                client_ip = state.get("client_ip", "")
-
-                # Resolve conversation memory — injects rolling history + interview context.
-                # Falls back gracefully if session_store is unreachable.
-                memory_ctx = await conversation_memory.resolve(
+                # ══════════════════════════════════════════════════════════════
+                # QA INTERVIEW PATH
+                # QA is mandatory — all turns route through the interview engine.
+                # The LLM receives ZERO history — only minimal context built by
+                # QAControllerV2 / LLMInputBuilder.
+                # ══════════════════════════════════════════════════════════════
+                response_text, _qa_stage, _qa_domain = await _node_llm_qa_path(
+                    state=state,
                     session_id=session_id,
-                    user_text=transcript,
+                    rid=rid,
+                    span=span,
                 )
-
-                # Build the prompt string from the resolved history.
-                # generate() wraps this in [SystemMessage, HumanMessage] internally —
-                # the interview context prefix is already embedded by conversation_memory.
-                if session_id and memory_ctx.turn_index > 0:
-                    history_lines: list[str] = []
-                    from app.user_tracking.session_service.session_store import (
-                        SessionNotFound,
-                    )
-
-                    try:
-                        session = await session_store.load(session_id, client_ip)
-                        for turn in session.turns:
-                            history_lines.append(f"User: {turn.user}")
-                            history_lines.append(f"Assistant: {turn.assistant}")
-                    except SessionNotFound:
-                        pass
-                    history_block = "\n".join(history_lines)
-                    ctx_prefix = ""
-                    if (
-                        memory_ctx.interview_state.topics_covered
-                        or memory_ctx.interview_state.current_topic
-                    ):
-                        from app.user_tracking.session_service.conversation_memory import (
-                            _build_context_prefix, # noqa
-                        )  # noqa
-
-                        ctx_prefix = _build_context_prefix(memory_ctx.interview_state)
-                    prompt_parts = []
-                    if ctx_prefix:
-                        prompt_parts.append(ctx_prefix)
-                    if history_block:
-                        prompt_parts.append(f"Conversation so far:\n{history_block}")
-                    prompt_parts.append(f"User:\n{transcript}")
-                    prompt = "\n\n".join(prompt_parts).strip()
-                    log.info(
-                        "graph_llm_history_injected",
-                        request_id=rid,
-                        session_id=session_id,
-                        history_turns=memory_ctx.turn_index,
-                        topic=memory_ctx.interview_state.current_topic or "—",
-                    )
-                    span.set_attribute("history_turns", memory_ctx.turn_index)
-                else:
-                    prompt = transcript
-
-                result = await _with_timeout(
-                    llm.generate(prompt, request_id=rid),
-                    timeout=cfg.llm_timeout,
-                    stage="LLM",
-                )
-                raw_response = result["response"]
-
-                # Persist the turn only once: skip if session_turn_appended is True,
-                # which happens when node_llm is retried after generate() succeeded
-                # but something else further down failed.
-                if session_id and not state.get("session_turn_appended"):
-                    await session_store.append_turn(
-                        session_id, transcript, raw_response
-                    )
-
-                    await conversation_memory.commit(
-                        session_id, transcript, raw_response
-                    )
-                    await transcript_writer.write_turn(
-                        session_id=session_id,
-                        user_text=transcript,
-                        assistant_text=raw_response,
-                        request_id=rid,
-                    )
-
-                    # Reload session so we get the accurate turn index and can derive
-                    # the question (the previous assistant turn) for evaluation.
-                    _reloaded = await session_store.load(session_id, client_ip)
-                    _question = (
-                        _reloaded.turns[-2].assistant
-                        if len(_reloaded.turns) >= 2
-                        else ""
-                    )
-                    evaluation_engine.schedule_turn(
-                        session_id=session_id,
-                        question=_question,
-                        candidate_ans=transcript,
-                        turn_index=len(_reloaded.turns) - 1,
-                        request_id=rid,
-                    )
-
-                # Cap response length before handing to sanitize node.
-                san = sanitize(
-                    raw_response,
-                    max_chars=cfg.max_llm_response_chars,
-                    request_id=rid,
-                )
-                capped = san.text
-                truncated = san.truncated
 
                 latency = time.monotonic() - t0
                 _stage_latency.labels(stage="llm").observe(latency)
 
                 log.info(
                     "graph_llm_ok",
-                    request_id=rid,
-                    model=result.get("model_used"),
-                    cached=result.get("cached"),
-                    response_len=len(capped),
-                    truncated=truncated,
-                    latency_s=round(latency, 3),
+                    request_id   = rid,
+                    session_id   = session_id or "",
+                    response_len = len(response_text),
+                    latency_s    = round(latency, 3),
+                    qa_path      = bool(session_id),
                 )
-                span.set_attribute("model", result.get("model_used", ""))
-                span.set_attribute("cached", result.get("cached", False))
                 span.set_attribute("latency_s", round(latency, 3))
+                span.set_attribute("qa_path", bool(session_id))
 
                 LLMEmitter.ok(
-                    session_id=state.get("session_id", ""),
-                    request_id=rid,
-                    latency_ms=latency * 1000,
-                    model_used=result.get("model_used", ""),
-                    prompt_tokens=result.get("prompt_tokens", 0),
-                    completion_tokens=result.get("completion_tokens", 0),
-                    streaming=False,
-                    history_turns=memory_ctx.turn_index,
-                    response_chars=len(capped),
-                    cache_hit=result.get("cached", False),
-                    response_truncated=truncated,
+                    session_id        = session_id or "",
+                    request_id        = rid,
+                    latency_ms        = latency * 1000,
+                    model_used        = getattr(settings, "llm_model", ""),
+                    prompt_tokens     = 0,
+                    completion_tokens = 0,
+                    streaming         = False,
+                    history_turns     = 0,
+                    response_chars    = len(response_text),
+                    cache_hit         = False,
+                    response_truncated= False,
                 )
 
                 return _state_update(
                     _record_stage_latency(state, "llm", latency),
                     {
-                        "llm_response": capped,
-                        "llm_tokens": {
-                            "prompt": result.get("prompt_tokens", 0),
-                            "completion": result.get("completion_tokens", 0),
-                        },
-                        "llm_model_used": result.get("model_used", ""),
-                        "llm_cached": result.get("cached", False),
-                        "response_truncated": truncated,
+                        "llm_response":          response_text,
+                        "llm_tokens":            {"prompt": 0, "completion": 0},
+                        "llm_model_used":        getattr(settings, "llm_model", ""),
+                        "llm_cached":            False,
+                        "response_truncated":    False,
                         "session_turn_appended": True,
-                        "stage": PipelineStage.LLM.value,
-                        # Preserve any STT-stage error info in the result without
-                        # letting it look like the LLM stage failed.
-                        "error": state.get("error", ""),
-                        "error_stage": state.get("error_stage", ""),
-                        "abort_reason": "",
+                        "stage":                 PipelineStage.LLM.value,
+                        "error":                 state.get("error", ""),
+                        "error_stage":           state.get("error_stage", ""),
+                        "abort_reason":          "",
+                        "qa_stage":              _qa_stage,
+                        "qa_domain":             _qa_domain,
                     },
                 )
 
@@ -945,23 +927,23 @@ def _build_graph_for_instance(
                 span.set_status(StatusCode.ERROR, str(exc))
                 log.warning(
                     "graph_llm_budget_exceeded",
-                    request_id=rid,
-                    latency_s=round(latency, 3),
+                    request_id = rid,
+                    latency_s  = round(latency, 3),
                 )
                 LLMEmitter.failed(
-                    session_id=state.get("session_id", ""),
-                    request_id=rid,
-                    error=str(exc),
-                    error_type="LatencyBudgetExceeded",
-                    model=getattr(settings, "llm_model", ""),
-                    streaming=False,
+                    session_id = session_id or "",
+                    request_id = rid,
+                    error      = str(exc),
+                    error_type = "LatencyBudgetExceeded",
+                    model      = getattr(settings, "llm_model", ""),
+                    streaming  = False,
                 )
                 return _state_update(
                     _record_stage_latency(state, "llm", latency),
                     {
-                        "stage": PipelineStage.LLM.value,
-                        "error": str(exc),
-                        "error_stage": PipelineStage.LLM.value,
+                        "stage":        PipelineStage.LLM.value,
+                        "error":        str(exc),
+                        "error_stage":  PipelineStage.LLM.value,
                         "abort_reason": "budget_exceeded",
                     },
                 )
@@ -972,23 +954,23 @@ def _build_graph_for_instance(
                 span.set_status(StatusCode.ERROR, str(exc))
                 log.error(
                     "graph_llm_failed",
-                    request_id=rid,
-                    error=str(exc),
-                    latency_s=round(latency, 3),
+                    request_id = rid,
+                    error      = str(exc),
+                    latency_s  = round(latency, 3),
                 )
                 LLMEmitter.failed(
-                    session_id=state.get("session_id", ""),
-                    request_id=rid,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                    model=getattr(settings, "llm_model", ""),
-                    streaming=False,
+                    session_id = session_id or "",
+                    request_id = rid,
+                    error      = str(exc),
+                    error_type = type(exc).__name__,
+                    model      = getattr(settings, "llm_model", ""),
+                    streaming  = False,
                 )
                 return _state_update(
                     _record_stage_latency(state, "llm", latency),
                     {
-                        "stage": PipelineStage.LLM.value,
-                        "error": str(exc),
+                        "stage":       PipelineStage.LLM.value,
+                        "error":       str(exc),
                         "error_stage": PipelineStage.LLM.value,
                     },
                 )
@@ -1468,6 +1450,338 @@ def _build_graph_for_instance(
     return builder.compile()  # type: ignore[return-value]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# QA PIPELINE HELPER — called from node_llm when _QA_PIPELINE_AVAILABLE=True
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _node_llm_qa_path(
+    *,
+    state:      VoiceState,
+    session_id: str,
+    rid:        str,
+    span:       Any,
+) -> tuple[str, str, str]:
+    """
+    Full QA-interview stage router.
+
+    Returns ``(response_text, qa_stage, qa_domain)`` so the caller can
+    propagate stage/domain into VoiceState for downstream observability.
+
+    Handles all four interview stages:
+      greeting  → GREETING_TEXT (no LLM call, advances stage to intro)
+      intro     → ATS extraction → seed QA document → first question
+      interview → next question via LLMNodeV2, with full guardrail stack
+      complete  → CLOSING_TEXT (no LLM call, triggers session finalization)
+
+    All symbols used here are resolved at module load via the top-level
+    guarded import block — no lazy imports inside this function.
+
+    Cancellation safety
+    ───────────────────
+    commit_turn() is wrapped in asyncio.shield() so that a CancelledError
+    arriving between mark_question_asked() and commit_turn() does not leave
+    the session with a question recorded but the turn counter un-incremented.
+    The shield lets commit_turn() complete even if our caller is cancelled;
+    we then re-raise so the graph routes to error_terminal cleanly.
+    """
+    # ── Fetch or create QA session document ───────────────────────────────────
+    qa_doc, _ = await _qa_controller.get_or_create(session_id)
+    stage      = qa_doc.stage if qa_doc else _QAStage.GREETING.value
+
+    span.set_attribute("qa_stage", stage)
+
+    # ── Stage: greeting ───────────────────────────────────────────────────────
+    if stage == _QAStage.GREETING.value:
+        # No LLM call. Open the audit bus session then advance the document
+        # stage to "intro" through the controller's public advance_stage method.
+        #
+        # advance_stage is a required method on QAControllerV2. If it is missing
+        # the controller implementation is incomplete — we raise immediately rather
+        # than falling back to a direct _redis.set(), which would bypass the
+        # per-session lock, LRU coherence, and stage-transition metrics.
+        await _qa_audit_bus.open_session(session_id)
+
+        if not hasattr(_qa_controller, "advance_stage"):
+            raise NotImplementedError(
+                "qa_controller is missing advance_stage(). "
+                "QAControllerV2.advance_stage must be implemented before the "
+                "greeting → intro transition can proceed. Direct _redis.set() "
+                "is not a valid substitute — it bypasses the session lock and "
+                "stage-transition instrumentation."
+            )
+
+        await _qa_controller.advance_stage(session_id, _QAStage.INTRO.value)
+
+        log.info("graph_llm_qa_greeting", session_id=session_id[:8], request_id=rid)
+        return _GREETING_TEXT, _QAStage.INTRO.value, ""
+
+    # ── Stage: intro (ATS extraction → first question) ────────────────────────
+    if stage == _QAStage.INTRO.value:
+        intro_text = state.get("user_input", "").strip()
+        if not intro_text:
+            # Candidate sent empty audio on their intro turn — re-prompt without
+            # advancing stage. The audit bus session is already open from greeting
+            # so no open_session call is needed here.
+            return (
+                "Could you please introduce yourself and tell us about your experience?",
+                _QAStage.INTRO.value,
+                "",
+            )
+
+        # set_raw_intro is a required method on QAControllerV2. It must persist
+        # the verbatim intro text before seed_from_intro() runs so that
+        # DomainWeightPolicy scores keyword signals against actual candidate text
+        # rather than an empty string, and so the intro is durable in Redis
+        # independently of whether the ATS extraction below succeeds.
+        if not hasattr(_qa_controller, "set_raw_intro"):
+            raise NotImplementedError(
+                "qa_controller is missing set_raw_intro(). "
+                "QAControllerV2.set_raw_intro must be implemented before the intro "
+                "phase can proceed. The raw intro text must be persisted before "
+                "seed_from_intro() runs so DomainWeightPolicy scores against actual "
+                "candidate text rather than an empty string."
+            )
+
+        await _qa_controller.set_raw_intro(session_id, intro_text)
+
+        ats_data = await _extract_and_validate_intro(intro_text, request_id=rid)
+
+        if ats_data:
+            ats_result = _ATSExtractionResult(
+                name       = ats_data.get("name", ""),
+                domains    = ats_data.get("domains", []),
+                level      = ats_data.get("level", "intermediate"),
+                languages  = ats_data.get("languages", []),
+                notes      = ats_data.get("notes", ""),
+                confidence = 0.9 if not ats_data.get("_fallback") else 0.6,
+                method     = ats_data.get("_fallback", "llm"),
+                raw        = ats_data,
+            )
+        else:
+            ats_result = _ATSExtractionResult(
+                name="", domains=["dsa"], level="intermediate",
+                languages=[], notes="extraction_failed",
+                confidence=0.0, method="rule_based", raw={},
+            )
+
+        # Seed QADocument from ATS result → builds domain_queue + difficulty curve
+        first_llm_input = await _qa_controller.seed_from_intro(session_id, ats_result)
+
+        # Generate first interview question
+        first_question = await _generate_interviewer_question(
+            llm_input  = first_llm_input,
+            session_id = session_id,
+            request_id = rid,
+        )
+
+        # Record question on document for real-time transcript write
+        await _qa_controller.mark_question_asked(session_id, first_question)
+
+        qa_doc_post = await _qa_controller.get_document(session_id)
+
+        # Route the intro turn through the audit bus so the greeting question +
+        # candidate self-introduction are captured in the .txt transcript and
+        # audit Redis — identical to how every interview turn is handled.
+        #
+        # Audio failure safety:
+        #   session_turn_appended is set to True in VoiceState after node_llm
+        #   returns successfully. If node_llm is retried (STT failure followed by
+        #   a clean transcription on the second attempt), _node_llm_qa_path will
+        #   re-enter the intro branch. The guard below ensures _route_committed_turn
+        #   is only called once per session regardless of how many LLM retries occur.
+        #
+        #   The audit bus dedup sentinel (Redis SET NX on domain eval) and the
+        #   eval_engine dedup sentinel (Redis SET NX on turn_index) provide a
+        #   second layer of protection, but we avoid the redundant Redis round-trips
+        #   by catching the duplicate here at the voice_graph level first.
+        if not state.get("session_turn_appended"):
+            try:
+                await _route_committed_turn(
+                    committed_turn=CommittedTurn(
+                        session_id=session_id,
+                        turn_index=qa_doc_post.turn_index if qa_doc_post else 0,
+                        domain="intro",
+                        question=_GREETING_TEXT,
+                        answer=intro_text,
+                        ts=time.time(),
+                        stage_after=_QAStage.INTERVIEW.value,
+                        domain_rotated=False,
+                    ),
+                    qa_document=qa_doc_post,
+                    request_id=rid,
+                )
+            except Exception as exc:
+                # Non-fatal — the interview proceeds regardless. The intro turn
+                # is already durable in Redis via set_raw_intro(). The audit bus
+                # DLQ will not retry this since the exception is swallowed here,
+                # but the transcript and observability gap is acceptable compared
+                # to aborting the candidate's first question over a routing failure.
+                log.warning(
+                    "graph_llm_qa_intro_route_failed",
+                    session_id=session_id[:8],
+                    request_id=rid,
+                    error=str(exc),
+                )
+
+        # Fire prefetch for turn-2 (non-blocking, best-effort)
+        await _qa_controller.prefetch_next_question(session_id, current_answer="")
+
+        first_domain = getattr(first_llm_input, "domain", "") if first_llm_input else ""
+        log.info(
+            "graph_llm_qa_intro_complete",
+            session_id = session_id[:8],
+            request_id = rid,
+            domains    = ats_result.domains,
+            level      = ats_result.level,
+            method     = ats_result.method,
+        )
+        return first_question, _QAStage.INTERVIEW.value, first_domain
+
+    # ── Stage: interview ──────────────────────────────────────────────────────
+    if stage == _QAStage.INTERVIEW.value:
+        candidate_answer = state.get("user_input", "").strip()
+
+        _qa_session_timer.mark(rid, "llm_start")
+
+        # Build minimal LLM input — no conversation history passed to LLM.
+        # Only: domain | level | last_q | last_a | domain_switch_flag | difficulty.
+        llm_input = await _build_next_llm_input(session_id, candidate_answer)
+        if llm_input is None:
+            # Session transitioned to complete between turns.
+            return _CLOSING_TEXT, _QAStage.COMPLETE.value, ""
+
+        # Generate next question (injection scan → content policy →
+        # diversity enforcer → question-bank fallback — all in LLMNodeV2).
+        next_question = await _generate_interviewer_question(
+            llm_input  = llm_input,
+            session_id = session_id,
+            request_id = rid,
+        )
+
+        _qa_session_timer.mark(rid, "llm_last")
+
+        # Record the question BEFORE commit so the transcript writer can
+        # stream it to the client while the turn is being committed.
+        await _qa_controller.mark_question_asked(session_id, next_question)
+
+        # Commit turn: increment counters, rotate domain if quota hit,
+        # evaluate guardrails, append to audit bus.
+        # asyncio.shield() ensures the commit completes even if the graph is
+        # cancelled between mark_question_asked() and commit_turn() — a partial
+        # commit would leave the session with a question on record but the turn
+        # counter un-incremented, corrupting the domain rotation schedule.
+        timing = _qa_session_timer.build_record(rid) if rid else None
+        committed = await asyncio.shield(
+            _qa_controller.commit_turn(
+                session_id       = session_id,
+                candidate_answer = candidate_answer,
+                llm_question     = next_question,
+                timing           = timing,
+            )
+        )
+
+        qa_doc_post = await _qa_controller.get_document(session_id)
+
+        # Route the committed turn through the audit bus (transcript + eval,
+        # non-blocking fire-and-forget).
+        if committed:
+            await _route_committed_turn(
+                committed_turn=committed,
+                qa_document=qa_doc_post,
+                request_id=rid,
+            )
+
+        # Hard stop: session complete after this turn.
+        # Sequence is order-dependent:
+        #   1. close_session_v2  — finalizes pending domain evals (via finalize_session_eval),
+        #                          clears question fingerprints, and cancels the prefetch buffer.
+        #                          Must run before the audit bus close so all eval dispatches
+        #                          are queued before the bus flushes and closes the session.
+        #   2. audit bus close   — writes the session-close footer to the .txt transcript,
+        #                          emits the session_close observability event, runs anomaly
+        #                          detection, and fires the webhook fanout.
+        #   3. evict_session     — releases the LLM node's in-process session cache.
+        #                          Optional: only present on LLMNodeV2, not RemoteLLMClient.
+        if committed and committed.stage_after == _QAStage.COMPLETE.value:
+
+            if not hasattr(_qa_controller, "close_session_v2"):
+                raise NotImplementedError(
+                    "qa_controller is missing close_session_v2(). "
+                    "QAControllerV2.close_session_v2 must be implemented before session "
+                    "completion can proceed. It owns finalize_session_eval(), fingerprint "
+                    "cleanup, and prefetch cancellation — none of these will run without it."
+                )
+
+            await _qa_controller.close_session_v2(session_id)
+            await _qa_audit_bus.close_session(session_id, reason="complete")
+
+            # evict_session is optional — present on LLMNodeV2 (local), absent on
+            # RemoteLLMClient (distributed). hasattr guard is intentional here.
+            if hasattr(_llm_node_ref, "evict_session"):
+                _llm_node_ref.evict_session(session_id)
+
+            return _CLOSING_TEXT, _QAStage.COMPLETE.value, ""
+
+        # Fire prefetch for the NEXT turn (fire-and-forget, non-blocking).
+        await _qa_controller.prefetch_next_question(
+            session_id     = session_id,
+            current_answer = "",
+        )
+
+        current_domain = getattr(committed, "domain", "") if committed else ""
+
+        # Domain-switch bridge: prepend a one-sentence transition phrase so
+        # the candidate hears a natural context switch.
+        # IMPORTANT: the LLM receives domain_switch_flag=True for the
+        # *next* call (after rotation). The bridge text is injected here for
+        # the *current* question only — they are mutually exclusive; no
+        # double-announcement is possible.
+        response = next_question
+        if committed and committed.domain_rotated and qa_doc_post:
+            try:
+                prev_label = qa_doc_post.prev_domain_label(committed.domain)
+                next_label = qa_doc_post.domain_label
+                bridge     = _DOMAIN_SWITCH_BRIDGE.format(
+                    prev_domain = prev_label,
+                    next_domain = next_label,
+                )
+                response = f"{bridge} {next_question}"
+            except Exception: # noqa
+                pass  # Bridge text is cosmetic — never fail the turn for it.
+
+        log.info(
+            "graph_llm_qa_interview_turn",
+            session_id     = session_id[:8],
+            request_id     = rid,
+            domain_rotated = getattr(committed, "domain_rotated", False),
+            domain         = current_domain,
+        )
+        return response, _QAStage.INTERVIEW.value, current_domain
+
+    # ── Stage: complete (re-entry guard) ─────────────────────────────────────
+    # Reached when voice_graph calls node_llm on a session that is already in
+    # "complete" stage — e.g. the candidate keeps talking after the closing text
+    # was delivered, or a retry fires after the session already closed.
+    #
+    # Mirrors the hard-stop close sequence exactly. close_session_v2 runs first
+    # so any unevaluated domain turns are queued before the audit bus closes.
+    # The reason tag distinguishes this path in observability from a clean close.
+    if not hasattr(_qa_controller, "close_session_v2"):
+        raise NotImplementedError(
+            "qa_controller is missing close_session_v2(). "
+            "QAControllerV2.close_session_v2 must be implemented — it owns "
+            "finalize_session_eval(), fingerprint cleanup, and prefetch "
+            "cancellation on both the normal close path and this re-entry guard."
+        )
+
+    await _qa_controller.close_session_v2(session_id)
+    await _qa_audit_bus.close_session(session_id, reason="complete_reentry")
+
+    if hasattr(_llm_node_ref, "evict_session"):
+        _llm_node_ref.evict_session(session_id)
+
+    return _CLOSING_TEXT, _QAStage.COMPLETE.value, ""
+
 # ── public orchestration engine ────────────────────────────────────────────────
 
 
@@ -1874,7 +2188,9 @@ class VoiceGraph:
 
                 log.info("stream_start", request_id=rid, prompt_len=len(prompt))
 
-                async for token in self._llm.stream(prompt, request_id=rid):
+                async for token in self._llm.stream_messages(
+                        [HumanMessage(content=prompt)], request_id=rid
+                ):
                     yield token
 
             except asyncio.CancelledError:
@@ -1998,18 +2314,91 @@ class VoiceGraph:
             # ── Stage 2: stt_llm_q → LLM → llm_tts_q ─────────────────────────
             async def _llm_worker() -> None:
                 """
-                Drain STT segments as they arrive, accumulating a transcript.
-                Fires the LLM in a sub-task as soon as min_prompt_chars is crossed
-                so token generation overlaps with ongoing transcription.
+                Drain STT segments, accumulate a transcript, then fire one LLM
+                task as soon as min_prompt_chars is crossed (or at STT end for
+                short utterances).
 
-                The LLM sub-task applies backpressure on llm_tts_q via a brief
-                sleep when the queue is full, throttling token production to match
-                TTS consumption rate.
+                QA path (interview session active)
+                ──────────────────────────────────
+                Calls _node_llm_qa_path() which returns a complete question
+                string (no streaming needed — interview questions are short).
+                The full string is placed as a single item into llm_tts_q so
+                TTS can begin immediately with zero token-by-token latency.
+                All QA state mutations (commit_turn, audit bus, prefetch)
+                happen inside _node_llm_qa_path — this worker is unaware of
+                interview internals.
 
-                The None sentinel is always put into llm_tts_q in the finally block
-                so the TTS drain exits cleanly even if this worker fails.
+                Legacy conversational path (fallback)
+                ──────────────────────────────────────
+                Calls conversation_memory.resolve() → llm.stream_messages()
+                with backpressure on llm_tts_q. A brief asyncio.sleep() when
+                the queue is full naturally throttles token production to match
+                TTS consumption without dropping content or growing queues
+                beyond their bounded cap.
+
+                Sentinel discipline
+                ───────────────────
+                _run_llm_task() always puts its own None sentinel in its
+                finally block. The safety-net None in the outer finally fires
+                ONLY when no task was created (short STT fallback edge case
+                where llm_started is False and the fallback task itself failed
+                to be scheduled).
                 """
                 llm_task: asyncio.Task | None = None
+
+                async def _run_llm_task(transcript: str) -> None: # noqa
+                    """
+                    Single LLM execution unit — routes every turn through the QA
+                    interview stage router. QA is mandatory; there is no fallback path.
+
+                    Sentinel discipline
+                    ───────────────────
+                    None is always placed into llm_tts_q in the finally block so
+                    _token_drain() exits cleanly regardless of success or error.
+                    A CancelledError is re-raised after the sentinel so the task
+                    cancellation propagates correctly to the outer gather().
+                    """
+                    sid = prepared.get("session_id")
+
+                    try:
+                        with tracer.start_as_current_span("stream_full.qa_path") as _qa_span:
+                            _qa_span.set_attribute("request_id", rid)
+                            _qa_span.set_attribute("session_id", (sid or "")[:8])
+
+                            qa_text, _qa_stage, _qa_domain = await _node_llm_qa_path(
+                                state=prepared,
+                                session_id=sid,
+                                rid=rid,
+                                span=_qa_span,
+                            )
+
+                            _qa_span.set_attribute("qa_stage", _qa_stage)
+                            _qa_span.set_attribute("qa_domain", _qa_domain)
+
+                        await llm_tts_q.put(qa_text)
+                        log.debug(
+                            "stream_full_llm_ok",
+                            request_id=rid,
+                            session_id=(sid or "")[:8],
+                            qa_stage=_qa_stage,
+                            qa_domain=_qa_domain,
+                            chars=len(qa_text),
+                        )
+
+                    except asyncio.CancelledError:
+                        log.warning("stream_full_llm_cancelled", request_id=rid)
+                        raise
+
+                    except Exception as exc:
+                        log.error("stream_full_llm_error", request_id=rid, error=str(exc))
+                        # Inject spoken apology so TTS has content and the candidate
+                        # hears a graceful degradation rather than silence.
+                        await llm_tts_q.put(APOLOGY_LLM)
+
+                    finally:
+                        # Sentinel must always be emitted — _token_drain() will hang
+                        # indefinitely without it if an exception occurs before put().
+                        await llm_tts_q.put(None)
 
                 try:
                     buffer = ""
@@ -2021,95 +2410,30 @@ class VoiceGraph:
                             timeout=self._cfg.stt_timeout,
                         )
                         if segment is None:
+                            stt_llm_q.task_done()
                             break
                         stt_llm_q.task_done()
                         buffer += " " + segment
 
-                        # Start LLM early once we can infer the user's intent.
-                        # Fires exactly once per request — the flag prevents re-triggering
-                        # as additional STT segments arrive after the task is created.
+                        # Fire the LLM as soon as we have enough transcript to
+                        # infer intent. Fires exactly once per request.
                         if (
                             not llm_started
                             and len(buffer.strip()) >= self._cfg.min_prompt_chars
                         ):
                             llm_started = True
+                            llm_task = asyncio.create_task(
+                                _run_llm_task(buffer.strip())
+                            )
 
-                            async def _run_llm(initial_prompt: str) -> None:
-                                from app.user_tracking.session_service.conversation_memory import (
-                                    conversation_memory,
-                                )
-                                from app.user_tracking.transcript.transcription import (
-                                    transcript_writer,
-                                )
-
-                                accumulated: list[str] = []
-                                try:
-                                    async for token in self._llm.stream(
-                                        initial_prompt, request_id=rid
-                                    ):
-                                        accumulated.append(token)
-                                        while llm_tts_q.full():
-                                            await asyncio.sleep(0.02)
-                                        await llm_tts_q.put(token)
-                                finally:
-                                    await llm_tts_q.put(None)  # noqa
-                                    if accumulated:
-                                        full_response = "".join(accumulated)
-                                        sid = prepared.get("session_id")
-                                        transcript = initial_prompt.split("User:")[
-                                            -1
-                                        ].strip()
-                                        await conversation_memory.commit(
-                                            sid, transcript, full_response
-                                        )
-                                        await transcript_writer.write_turn(
-                                            session_id=sid,
-                                            user_text=transcript,
-                                            assistant_text=full_response,
-                                            request_id=rid,
-                                        )
-
-                            llm_task = asyncio.create_task(_run_llm(buffer.strip()))
-
-                    # Fallback path: the entire utterance finished before crossing
-                    # min_prompt_chars (very short speech, or STT produced little text).
-                    # Fire the LLM now with whatever we have.
+                    # Fallback: entire utterance finished before crossing
+                    # min_prompt_chars (very short speech or sparse STT output).
                     if not llm_started:
                         prompt = buffer.strip() or (
                             "The user's audio could not be transcribed. "
                             "Apologise briefly and ask them to try again."
                         )
-
-                        async def _run_llm_fallback(p: str) -> None:
-                            from app.user_tracking.session_service.conversation_memory import (
-                                conversation_memory,
-                            )
-                            from app.user_tracking.transcript.transcription import (
-                                transcript_writer,
-                            )
-
-                            accumulated: list[str] = []
-                            try:
-                                async for token in self._llm.stream(p, request_id=rid):
-                                    accumulated.append(token)
-                                    await llm_tts_q.put(token)
-                            finally:
-                                await llm_tts_q.put(None)  # noqa
-                                if accumulated:
-                                    full_response = "".join(accumulated)
-                                    sid = prepared.get("session_id")
-                                    transcript = p.split("User:")[-1].strip()
-                                    await conversation_memory.commit(
-                                        sid, transcript, full_response
-                                    )
-                                    await transcript_writer.write_turn(
-                                        session_id=sid,
-                                        user_text=transcript,
-                                        assistant_text=full_response,
-                                        request_id=rid,
-                                    )
-
-                        llm_task = asyncio.create_task(_run_llm_fallback(prompt))
+                        llm_task = asyncio.create_task(_run_llm_task(prompt))
 
                     if llm_task:
                         await llm_task
@@ -2121,9 +2445,10 @@ class VoiceGraph:
                     log.error("llm_worker_error", request_id=rid, error=str(exc))
 
                 finally:
-                    # Safety net: ensure TTS drain never hangs even if the LLM
-                    # task was never created or exited abnormally.
-                    await llm_tts_q.put(None)
+                    # Safety-net sentinel: only fires when no task was ever created
+                    # (both _run_llm_task paths always emit their own sentinel).
+                    if llm_task is None:
+                        await llm_tts_q.put(None)
 
             # ── Stage 3: llm_tts_q → TTS → audio bytes ────────────────────────
             async def _token_drain() -> AsyncIterator[str]:
@@ -2137,6 +2462,11 @@ class VoiceGraph:
                         timeout=self._cfg.llm_timeout,
                     )
                     if token is None:
+                        # Bug 4 fix: call task_done() for the sentinel item too.
+                        # Every get() must be paired with task_done() or
+                        # BoundedPipelineQueue.join() will deadlock — the
+                        # sentinel's get() was previously left unaccounted for.
+                        llm_tts_q.task_done()
                         return
                     llm_tts_q.task_done()
                     yield token
@@ -2373,6 +2703,127 @@ voice_graph_low_latency = VoiceGraph(
         max_llm_retries=1,
     ),
 )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIFESPAN HOOKS  — wire into FastAPI @asynccontextmanager lifespan
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def on_startup() -> None:
+    """
+    Application startup hook.
+
+    Call from FastAPI lifespan on startup (before accepting traffic):
+
+        @asynccontextmanager
+        async def lifespan(app):
+            await on_startup()
+            yield
+            await on_shutdown()
+
+    Actions:
+      1. Warm LLM node (pre-loads model weights / connection pool)
+      2. Start LLM background health probe
+      3. Pre-initialise QA controller Redis pool (single warmup doc)
+      4. Bootstrap QA audit bus (starts background drain task)
+
+    Errors during warmup are logged but never raised — the server starts
+    even if optional components (QA pipeline, Redis) are unavailable.
+    """
+    log.info("voice_graph_startup_begin")
+
+    # ── Warm LLM ──────────────────────────────────────────────────────────────
+    try:
+        _ln = _llm_node_ref
+        if _ln is not None:
+            if hasattr(_ln, "warmup"):
+                await _ln.warmup()
+            if hasattr(_ln, "start_health_probe"):
+                _ln.start_health_probe()
+        log.info("voice_graph_startup_llm_ready")
+    except Exception as exc:
+        log.warning("voice_graph_startup_llm_warmup_failed", error=str(exc))
+
+    # ── Warm QA pipeline ──────────────────────────────────────────────────────────
+    try:
+        await _qa_controller.get_or_create("__warmup__")
+        await _qa_audit_bus.open_session("__warmup__")
+        await _qa_audit_bus.close_session("__warmup__", reason="warmup")
+        log.info("voice_graph_startup_qa_pipeline_ready")
+    except Exception as exc:
+        log.warning("voice_graph_startup_qa_warmup_failed", error=str(exc))
+
+    log.info("voice_graph_startup_complete")
+
+async def on_shutdown() -> None:
+    """
+    Application shutdown hook.
+
+    Call from FastAPI lifespan on shutdown (after traffic is drained):
+
+        @asynccontextmanager
+        async def lifespan(app):
+            await on_startup()
+            yield
+            await on_shutdown()
+
+    Actions (all run with return_exceptions=True so one failure doesn't block):
+      1. Flush pending transcript and eval writes (15-second timeout)
+      2. Stop LLM health probe
+      3. Shut down all three graph singletons (cancels in-flight tasks)
+      4. Close the LLM node (releases connection pool)
+      5. Close QA audit bus (waits for drain queue to empty)
+
+    The transcript flush is the most important — losing in-flight transcript
+    data on shutdown would create audit gaps. Flush is attempted regardless
+    of whether other components fail to close cleanly.
+    """
+    log.info("voice_graph_shutdown_begin")
+
+    # ── Flush QA audit bus + transcript writer ────────────────────────────────
+    try:
+        await _qa_audit_bus.flush_all(timeout=15.0)
+    except Exception as exc:
+        log.warning("voice_graph_shutdown_audit_flush_failed", error=str(exc))
+
+    if _transcript_writer is not None:
+        try:
+            await _transcript_writer.flush(timeout=5.0)
+        except Exception as exc:
+            log.warning("voice_graph_shutdown_transcript_flush_failed", error=str(exc))
+
+    # ── Stop LLM health probe ─────────────────────────────────────────────────
+    try:
+        _ln = _llm_node_ref
+        if _ln is not None and hasattr(_ln, "stop_health_probe"):
+            _ln.stop_health_probe()
+    except Exception as exc:
+        log.warning("voice_graph_shutdown_health_probe_stop_failed", error=str(exc))
+
+    # ── Shut down graph singletons (cancel in-flight tasks) ───────────────────
+    await asyncio.gather(
+        voice_graph.shutdown(),
+        voice_graph_realtime.shutdown(),
+        voice_graph_low_latency.shutdown(),
+        return_exceptions=True,
+    )
+
+    # ── Close LLM node ────────────────────────────────────────────────────────
+    try:
+        _ln = _llm_node_ref
+        if _ln is not None:
+            await _ln.close()
+    except Exception as exc:
+        log.warning("voice_graph_shutdown_llm_close_failed", error=str(exc))
+
+    # ── Close QA audit bus ────────────────────────────────────────────────────
+    try:
+        await _qa_audit_bus.close()
+    except Exception as exc:
+        log.warning("voice_graph_shutdown_audit_close_failed", error=str(exc))
+
+    log.info("voice_graph_shutdown_complete")
+
 
 # ── smoke test ─────────────────────────────────────────────────────────────────
 

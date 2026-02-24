@@ -1,66 +1,109 @@
 """
-LLM node — OpenAI chat via LangChain, Redis cache in front.
+LLM_service.py — Multi-mode LLM node for the structured interview pipeline.
 
-Base version features:
-  - Connects to locally running Ollama server
-  - Uses configurable model (default: llama3.1:8b)
-  - Startup connection check to verify model availability
-  - Synchronous request-response generation (no streaming)
-  - Basic latency measurement via decorator
-  - Simple structured logging for connection + timing
-  - Graceful failure handling with fallback message
-  - 60s request timeout protection
+OPERATIONAL MODES:
+──────────────────
+  InterviewerMode   — Question engine. Accepts LLMInterviewInput from
+                      qa_controller. Receives ONLY:
+                        domain | level | last_q | last_a | domain_switch_flag
+                      Outputs exactly one question with a brief acknowledgment.
+                      Enforced by mode-level prompt guards and response validators.
 
-Extra layers on top of the base version:
-  - circuit breaker so one bad OpenAI outage doesn't queue everything up
-  - Redis SETNX lock to stop cache stampedes under load
-  - fallback model if the primary is rate-limited or down
-  - streaming via astream() for low-latency voice UX
-  - token-bucket rate limiter so we don't accidentally blow the API quota
-  - full OTel spans + Prometheus counters/histograms
-  - structured JSON logging with request_id and token counts
-  - asyncio.Semaphore cap so the process doesn't spin up unlimited goroutines
+  ATSMode           — Intro extractor. Accepts raw intro transcript.
+                      Returns strictly validated JSON only.
+                      Separate chain with json_object response_format.
 
-Distributed-service additions:
-  - RemoteLLMClient: satisfies the same LLMNodeProtocol as the local node
-    over plain HTTPS (httpx). VoiceGraph only imports the protocol — it
-    switches between local and remote via an env-driven factory function
-    (get_llm_node()) without any graph-level code changes.
-  - Versioned cache keys: the cache key now encodes the model name,
-    temperature, and a sha256 of the system prompt so config changes
-    automatically bust stale cache entries.
-  - Dual circuit breakers: stream and batch paths have separate breakers.
-    A slow streaming endpoint can degrade without tripping the batch breaker
-    that serves synchronous /run requests.
-  - InMemoryLRU fallback: if Redis is unreachable we serve from an in-process
-    LRU and enter DegradedMode, which automatically reduces concurrency to
-    avoid flooding the model APIs during the outage window.
-  - LatencyBudget enforcement: check() at entry aborts immediately if the
-    per-request SLA is already exceeded before we even start work.
-  - Health endpoint data: health() returns a ServiceHealthState that
-    VoiceGraph can use for routing decisions.
-  - stream_with_metadata(): wraps stream() and emits a final metadata dict
-    after the last token — useful for WebSocket handlers.
+  EvalMode          — Reserved for evaluation_engine.py internal use only.
+                      Not callable from voice_graph.
+
+MODE ROUTING:
+─────────────
+  voice_graph.node_llm determines the current stage from qa_controller and
+  routes to the correct mode:
+    stage=="greeting"  → returns GREETING_TEXT directly (no LLM call)
+    stage=="intro"     → ATSMode.extract(intro_text)
+    stage=="interview" → InterviewerMode.stream_question(llm_input)
+    stage=="complete"  → returns CLOSING_TEXT directly (no LLM call)
+
+GUARDRAILS:
+───────────
+  1. InterviewerMode enforces a strict 80-word response cap via
+     _ResponseValidator. Responses exceeding this are truncated to the
+     first sentence that ends with "?". If no valid question is found,
+     the turn is flagged and a safe fallback question is generated.
+
+  2. ATSMode uses json_object response_format at the API level.
+     The response is validated against the expected schema before returning.
+     Invalid responses trigger rule-based fallback via qa_controller.
+
+  3. Neither InterviewerMode nor ATSMode has access to session history,
+     full QA state, or evaluation signals. These are structurally excluded
+     from the message lists they receive.
+
+  4. All modes operate through the same resilience stack:
+     Redis + LRU dual-layer cache, circuit breakers, rate limiting,
+     bulkhead concurrency control, token counting, OTel tracing,
+     Prometheus metrics, stampede protection.
+
+  5. The SYSTEM_PROMPT constant from the previous version is REMOVED.
+     Each mode carries its own prompt, imported from qa_controller.
+
+ARCHITECTURE:
+─────────────
+  LLMNode
+    ├── InterviewerMode   (stream_question → AsyncIterator[str])
+    ├── ATSMode           (extract → str  [JSON])
+    └── _SharedInfra      (cache, circuit, rate, bulkhead, tracing)
+
+  LLMNodeV2(LLMNode)
+    ├── PromptInjectionDetector
+    ├── ContentPolicyFilter
+    ├── QuestionDiversityEnforcer
+    ├── StaticQuestionBank
+    ├── StreamingWordGuard
+    ├── EvalModeLLM
+    └── BatchATSProcessor
+
+  RemoteLLMClient         (satisfies LLMNodeProtocol for distributed mode)
+    ├── stream_question
+    └── extract_ats
+
+  get_llm_node()          Factory — returns RemoteLLMClient or LLMNodeV2.
 """
 
 from __future__ import annotations
 
-import asyncio  # noqa
-import hashlib
+import asyncio
+import hashlib  # noqa
+import json
+import math
 import os
+import random
+import re
 import time
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import AsyncIterator
-from typing import Any, Protocol, runtime_checkable
-from pydantic import SecretStr
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field, replace as dc_replace  # noqa
+from enum import Enum
+from typing import Any, ClassVar, Protocol, cast, runtime_checkable
 
 import httpx
 import redis.asyncio as aioredis
+from dotenv import load_dotenv
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.outputs import LLMResult
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.outputs import LLMResult
 from langchain_openai import ChatOpenAI
 from opentelemetry.trace import StatusCode
+from pydantic import SecretStr  # noqa
+
+try:
+    from pydantic import BaseModel, ValidationError, field_validator # noqa
+    _PYDANTIC_AVAILABLE = True
+except ImportError:
+    _PYDANTIC_AVAILABLE = False
 
 from app.common.shared import (
     CircuitBreaker,
@@ -84,1016 +127,2571 @@ from app.common.shared import (
     make_versioned_cache_key,
     new_request_id,
 )
-
-from dotenv import load_dotenv
+from app.interview.qa_controller import (
+    LLMInterviewInput,
+    INTERVIEWER_SYSTEM_PROMPT,  # noqa
+    DOMAIN_SWITCH_SYSTEM_PROMPT,  # noqa
+    ATS_SYSTEM_PROMPT,
+    ATS_USER_TEMPLATE,
+    DOMAIN_REGISTRY,  # noqa
+)
 
 load_dotenv()
 
-log = get_logger(__name__)
+log    = get_logger(__name__)
 tracer = get_tracer(__name__)
-meter = get_meter(__name__)
+meter  = get_meter(__name__)
 
-# ── config ────────────────────────────────────────────────────────────────────
+
+# ── config ─────────────────────────────────────────────────────────────────────
 
 OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
 
-PRIMARY_MODEL: str = os.getenv("LLM_MODEL", "gpt-5-mini")
-FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "gpt-5-nano")
-TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+# Question engine model — fast and instruction-following
+PRIMARY_MODEL:  str = os.getenv("LLM_MODEL",          "gpt-4o-mini")
+FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "gpt-3.5-turbo")
 
-REDIS_URL: str | None = os.getenv("REDIS_URL")
-REDIS_MAX_CONN: int = int(os.getenv("REDIS_MAX_CONN", "200"))
+# ATS extraction model — json_object mode required
+ATS_MODEL:    str = os.getenv("ATS_MODEL",          "gpt-4o-mini")
+ATS_FALLBACK: str = os.getenv("ATS_FALLBACK_MODEL", "gpt-3.5-turbo")
 
-CACHE_TTL: int = int(os.getenv("LLM_CACHE_TTL", "3600"))
-CACHE_PREFIX: str = "llm:v3:"  # bump when cache structure changes
-STAMPEDE_LOCK_TTL: int = 30
-STAMPEDE_POLL_INTERVAL: float = 0.4
-STAMPEDE_POLL_LIMIT: int = 75
+# Eval model — wider token budget, higher temperature, internal only
+EVAL_MODEL:       str   = os.getenv("LLM_EVAL_MODEL",        "gpt-4o")
+EVAL_TEMPERATURE: float = float(os.getenv("LLM_EVAL_TEMPERATURE", "0.2"))
+EVAL_MAX_TOKENS:  int   = int(os.getenv("LLM_EVAL_MAX_TOKENS",  "1500"))
 
-RATE_PER_SEC: float = float(os.getenv("LLM_RATE_PER_SEC", "20.0"))
-RATE_BURST: float = float(os.getenv("LLM_RATE_BURST", "40.0"))
-LRU_SIZE: int = int(os.getenv("LLM_LRU_SIZE", "512"))
+# Temperature: very low for interviewer (deterministic), slightly higher for ATS
+INTERVIEWER_TEMPERATURE: float = float(os.getenv("LLM_INTERVIEWER_TEMPERATURE", "0.3"))
+ATS_TEMPERATURE:         float = float(os.getenv("LLM_ATS_TEMPERATURE",         "0.1"))
 
-STREAM_CACHE_MIN_CHARS: int = int(os.getenv("LLM_STREAM_CACHE_MIN_CHARS", "10"))
+# Max tokens per mode — interviewer is tightly capped
+INTERVIEWER_MAX_TOKENS: int = int(os.getenv("LLM_INTERVIEWER_MAX_TOKENS", "120"))
+ATS_MAX_TOKENS:         int = int(os.getenv("LLM_ATS_MAX_TOKENS",         "350"))
 
-# Remote service config (used by RemoteLLMClient)
-LLM_SERVICE_URL: str = os.getenv("LLM_SERVICE_URL", "")
-LLM_SERVICE_API_KEY: str = os.getenv("LLM_SERVICE_API_KEY", "")
+# Redis
+REDIS_URL:      str | None = os.getenv("REDIS_URL")
+REDIS_MAX_CONN: int        = int(os.getenv("REDIS_MAX_CONN", "200"))
+CACHE_TTL:      int        = int(os.getenv("LLM_CACHE_TTL", "1800"))   # 30 min
+CACHE_PREFIX                = "llm_v5:"   # bump on schema changes
+
+# Stampede protection
+STAMPEDE_LOCK_TTL:      int   = 25
+STAMPEDE_POLL_INTERVAL: float = 0.35
+STAMPEDE_POLL_LIMIT:    int   = 60
+
+# Rate limiting (per mode)
+INTERVIEWER_RATE:  float = float(os.getenv("LLM_INTERVIEWER_RATE",  "15.0"))
+INTERVIEWER_BURST: float = float(os.getenv("LLM_INTERVIEWER_BURST", "30.0"))
+ATS_RATE:          float = float(os.getenv("LLM_ATS_RATE",          "5.0"))
+ATS_BURST:         float = float(os.getenv("LLM_ATS_BURST",         "10.0"))
+
+LRU_SIZE:         int = int(os.getenv("LLM_LRU_SIZE",         "512"))
+STREAM_CACHE_MIN: int = int(os.getenv("LLM_STREAM_CACHE_MIN", "10"))
+
+# Remote service config
+LLM_SERVICE_URL:     str   = os.getenv("LLM_SERVICE_URL",     "")
+LLM_SERVICE_API_KEY: str   = os.getenv("LLM_SERVICE_API_KEY", "")
 LLM_SERVICE_TIMEOUT: float = float(os.getenv("LLM_SERVICE_TIMEOUT", "60.0"))
 
-SYSTEM_PROMPT = """
-You are a technical interviewer conducting real interview-style conversations.
+# Response validation
+MAX_RESPONSE_WORDS: int = int(os.getenv("LLM_MAX_RESPONSE_WORDS", "80"))
+MIN_RESPONSE_WORDS: int = int(os.getenv("LLM_MIN_RESPONSE_WORDS", "8"))
 
-Behavior:
-- Ask structured, professional questions.
-- Do NOT give full solutions immediately.
-- Ask follow-up questions.
-- Give hints before answers.
-- Evaluate responses like an interviewer.
-- Keep replies concise for voice output.
+# Session token budget
+SESSION_TOKEN_BUDGET: int = int(os.getenv("SESSION_TOKEN_BUDGET", "25000"))
 
-Interview domains:
-- Coding / DSA
-- System design
-- Behavioral
-- CS fundamentals
+# Diversity enforcer
+DIVERSITY_THRESHOLD:   float = float(os.getenv("LLM_DIVERSITY_THRESHOLD",   "0.65"))
+MAX_DIVERSITY_RETRIES: int   = int(os.getenv("LLM_MAX_DIVERSITY_RETRIES",   "3"))
+DIVERSITY_NGRAM_N:     int   = int(os.getenv("LLM_DIVERSITY_NGRAM_N",       "3"))
+DIVERSITY_WINDOW:      int   = int(os.getenv("LLM_DIVERSITY_WINDOW",        "5"))
 
-Rules:
-- Avoid long essays.
-- Speak in short, clear steps.
-- Prioritize reasoning over final answers.
-- Challenge shallow responses.
-"""
+# Feature flags
+INJECTION_BLOCK:      bool = os.getenv("LLM_INJECTION_BLOCK",      "true").lower() == "true"
+CONTENT_POLICY_BLOCK: bool = os.getenv("LLM_CONTENT_POLICY_BLOCK", "true").lower() == "true"
+BANK_FALLBACK_ENABLED: bool = os.getenv("LLM_BANK_FALLBACK_ENABLED", "true").lower() == "true"
 
-# Stable hash of the system prompt included in cache keys so that
-# editing SYSTEM_PROMPT automatically busts all cached responses.
-_SYSTEM_PROMPT_HASH: str = hashlib.sha256(SYSTEM_PROMPT.encode()).hexdigest()[:16]
+# Batch ATS
+BATCH_ATS_CONCURRENCY: int   = int(os.getenv("LLM_BATCH_ATS_CONCURRENCY", "5"))
+BATCH_ATS_TIMEOUT:     float = float(os.getenv("LLM_BATCH_ATS_TIMEOUT_S", "30.0"))
 
-# ── Prometheus metrics ────────────────────────────────────────────────────────
 
-_req_total = make_counter(
-    "llm_requests_total", "Total LLM requests", ["model", "status", "mode"]
-)
-_cache_hits = make_counter("llm_cache_hits_total", "Cache hits", ["source"])
+# ── operational mode enum ──────────────────────────────────────────────────────
+
+class LLMMode(str, Enum):
+    INTERVIEWER = "interviewer"
+    ATS         = "ats"
+    EVAL        = "eval"   # eval_engine.py only — never call from voice_graph
+
+
+# ── Prometheus metrics ─────────────────────────────────────────────────────────
+
+_req_total     = make_counter("llm_requests_total",            "Total LLM requests",             ["model", "status", "mode"])
+_cache_hits    = make_counter("llm_cache_hits_total",          "Cache hits",                     ["source"])
+_lru_hits      = make_counter("llm_lru_hits_total",            "LRU hits")
+_budget_exc    = make_counter("llm_budget_exceeded_total",     "Budget exceeded")
+_validator_fix = make_counter("llm_response_validated_total",  "Validator corrections",          ["action"])
+_fallback_used = make_counter("llm_fallback_used_total",       "Primary→fallback switches",      ["mode"])
+_injection_blocks  = make_counter("llm_injection_blocks_total",    "Prompt injection blocks")
+_policy_blocks     = make_counter("llm_policy_blocks_total",       "Content policy blocks",       ["rule"])
+_diversity_retries = make_counter("llm_diversity_retries_total",   "Diversity retry attempts",    ["result"])
+_bank_fallbacks    = make_counter("llm_bank_fallbacks_total",      "Static bank fallback uses",   ["domain", "level"])
+_ats_schema_fails  = make_counter("llm_ats_schema_failures_total", "ATS JSON schema fails")
+_eval_calls        = make_counter("llm_eval_calls_total",          "Eval mode LLM calls",         ["status"])
+_batch_ats_calls   = make_counter("llm_batch_ats_calls_total",     "Batch ATS processing calls",  ["status"])
+_stream_word_cuts  = make_counter("llm_stream_word_cuts_total",    "Streaming word-count cutoffs")
+
 _latency = make_histogram(
-    "llm_response_latency_seconds",
-    "End-to-end LLM response latency",
-    ["model"],
-    buckets=(0.5, 1, 2, 3, 5, 8, 12, 20, 30),
+    "llm_latency_seconds", "LLM call latency", ["model", "mode"],
+    buckets=(0.3, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0),
 )
 _ttft = make_histogram(
-    "llm_time_to_first_token_seconds",
-    "Latency from stream() call to first yielded token",
-    ["model"],
+    "llm_time_to_first_token_seconds", "Time to first token", ["model"],
     buckets=(0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0),
 )
-_tokens_used = make_histogram(
-    "llm_tokens_used",
-    "Token counts per request",
-    ["model", "kind"],
-    buckets=(50, 100, 200, 500, 1000, 2000, 4000),
+_tokens = make_histogram(
+    "llm_tokens_used", "Token counts", ["model", "kind"],
+    buckets=(20, 50, 100, 200, 400, 800, 1500),
 )
-_circuit_open = make_gauge(
-    "llm_circuit_breaker_open", "1 when breaker is OPEN", ["model", "path"]
+_diversity_similarity = make_histogram(
+    "llm_question_similarity_score", "N-gram cosine similarity vs recent questions",
+    buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
 )
-_active = make_gauge("llm_active_requests", "Requests currently in flight", ["mode"])
-_budget_exceeded = make_counter(
-    "llm_latency_budget_exceeded_total",
-    "Requests aborted because the SLA budget was already blown",
+_eval_latency = make_histogram(
+    "llm_eval_latency_seconds", "Eval mode LLM call latency",
+    buckets=(0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0),
 )
-_lru_hits = make_counter("llm_lru_hits_total", "In-memory LRU cache hits")
+_batch_ats_throughput = make_histogram(
+    "llm_batch_ats_throughput_per_minute", "Batch ATS processing throughput",
+    buckets=(1, 2, 5, 10, 20, 50),
+)
+
+_active  = make_gauge("llm_active_requests",      "In-flight requests",    ["mode"])
+_cb_open = make_gauge("llm_circuit_breaker_open", "Circuit breaker state", ["model", "path"])
 
 
-# ── LLMNodeProtocol ───────────────────────────────────────────────────────────
+# ── response validator ─────────────────────────────────────────────────────────
 
-
-@runtime_checkable
-class LLMNodeProtocol(Protocol):
+class _ResponseValidator:
     """
-    The contract that both LLMNode (local) and RemoteLLMClient (distributed)
-    must satisfy. VoiceGraph only ever depends on this protocol — never on
-    the concrete implementations below.
+    Enforces the interviewer response contract:
+      - Must contain exactly one question (ends with ?)
+      - Must be under MAX_RESPONSE_WORDS words
+      - Must be over MIN_RESPONSE_WORDS words (not empty/trivial)
+      - Must not contain multiple question marks (multiple questions)
+      - Must not contain bullets, numbered lists, or headers
 
-    Any class that implements generate() and stream() with these exact
-    signatures automatically satisfies the protocol (structural subtyping).
+    On violation, attempts to repair by extracting the first valid sentence.
+    If repair fails, raises ValueError so the caller can fall back gracefully.
     """
 
-    async def generate(
-        self, prompt: str, request_id: str | None = None
-    ) -> dict[str, Any]: ...
+    _BULLET_PATTERN   = re.compile(r"^[\s]*[-•*]\s",  re.MULTILINE)
+    _NUMBERED_PATTERN = re.compile(r"^[\s]*\d+[.)]\s", re.MULTILINE)
+    _HEADER_PATTERN   = re.compile(r"^#{1,6}\s",       re.MULTILINE)
+    _MULTI_Q_PATTERN  = re.compile(r"\?.*\?",          re.DOTALL)
 
-    def stream(
-        self, prompt: str, request_id: str | None = None
-    ) -> AsyncIterator[str]: ...
+    def validate_and_repair(self, response: str, mode: LLMMode) -> str:
+        if mode != LLMMode.INTERVIEWER:
+            return response
 
-    async def health(self) -> ServiceHealthState: ...
+        text = response.strip()
 
-    async def close(self) -> None: ...
+        if not text:
+            _validator_fix.labels(action="empty_reject").inc()
+            raise ValueError("LLM returned empty interviewer response")
+
+        text = self._strip_markdown(text)
+
+        words = text.split()
+        if len(words) < MIN_RESPONSE_WORDS:
+            _validator_fix.labels(action="too_short").inc()
+            raise ValueError(f"Response too short ({len(words)} words): {text[:60]}")
+
+        if self._MULTI_Q_PATTERN.search(text):
+            text = self._extract_last_question(text)
+            _validator_fix.labels(action="multi_q_trimmed").inc()
+
+        words = text.split()
+        if len(words) > MAX_RESPONSE_WORDS:
+            text = self._truncate_to_question(text)
+            _validator_fix.labels(action="truncated").inc()
+
+        if not text.rstrip().endswith("?"):
+            _validator_fix.labels(action="no_question_mark").inc()
+            sentences = re.split(r"(?<=[.!?])\s+", text)
+            questions = [s for s in sentences if s.strip().endswith("?")]
+            if questions:
+                text = " ".join(sentences[:sentences.index(questions[-1]) + 1])
+            else:
+                raise ValueError(f"Response contains no question: {text[:80]}")
+
+        return text.strip()
+
+    def _strip_markdown(self, text: str) -> str:
+        text = self._BULLET_PATTERN.sub("", text)
+        text = self._NUMBERED_PATTERN.sub("", text)
+        text = self._HEADER_PATTERN.sub("", text)
+        text = re.sub(r"\*{1,3}(.*?)\*{1,3}", r"\1", text)
+        text = re.sub(r"`[^`]+`", "", text)
+        return text.strip()
+
+    def _extract_last_question(self, text: str) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        questions = [i for i, s in enumerate(sentences) if s.strip().endswith("?")]
+        if questions:
+            keep_indices = {0, questions[-1]}
+            return " ".join(sentences[i] for i in sorted(keep_indices) if i < len(sentences))
+        return text
+
+    def _truncate_to_question(self, text: str) -> str:
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        result    = []
+        for s in sentences:
+            result.append(s)
+            if s.strip().endswith("?"):
+                break
+        return " ".join(result)
 
 
-# ── token counting callback ───────────────────────────────────────────────────
-
+# ── token counter callback ─────────────────────────────────────────────────────
 
 class _TokenCounter(AsyncCallbackHandler):
-    """
-    Hooked into LangChain so we get prompt/completion counts even when
-    streaming, where the full text isn't available until the end.
-    """
-
     def __init__(self, model: str) -> None:
-        self._model = model
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
+        self._model           = model
+        self.prompt_tokens:     int = 0
+        self.completion_tokens: int = 0
 
     async def on_llm_end(self, response: LLMResult, **_: Any) -> None:
         usage = (response.llm_output or {}).get("token_usage", {})
-        self.prompt_tokens = usage.get("prompt_tokens", 0)
+        self.prompt_tokens     = usage.get("prompt_tokens",     0)
         self.completion_tokens = usage.get("completion_tokens", 0)
-        _tokens_used.labels(model=self._model, kind="prompt").observe(
-            self.prompt_tokens
-        )
-        _tokens_used.labels(model=self._model, kind="completion").observe(
-            self.completion_tokens
-        )
+        _tokens.labels(model=self._model, kind="prompt").observe(self.prompt_tokens)
+        _tokens.labels(model=self._model, kind="completion").observe(self.completion_tokens)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── cache key helpers ──────────────────────────────────────────────────────────
 
-
-def _cache_key(prompt: str, model: str, temperature: float) -> str:
-    return make_versioned_cache_key(
-        CACHE_PREFIX, prompt, model, temperature, _SYSTEM_PROMPT_HASH
+def _interviewer_cache_key(messages: list, model: str) -> str:
+    serialised = "|".join(
+        f"{type(m).__name__}:{getattr(m, 'content', '')}" for m in messages
     )
+    return make_versioned_cache_key(CACHE_PREFIX + "iv:", serialised, model, INTERVIEWER_TEMPERATURE, "")
+
+
+def _ats_cache_key(intro_text: str, model: str) -> str:
+    return make_versioned_cache_key(CACHE_PREFIX + "ats:", intro_text, model, ATS_TEMPERATURE, "")
 
 
 def _lock_key(cache_key: str) -> str:
     return f"lock:{cache_key}"
 
 
-# ── local LLM node ────────────────────────────────────────────────────────────
+# ── shared Redis infrastructure ────────────────────────────────────────────────
 
-
-class LLMNode:
+class _SharedRedis:
     """
-    LangGraph-compatible async LLM node (local / in-process implementation).
-
-    State contract
-    ──────────────
-    reads:  state["user_input"]       (str)
-    writes: state["llm_response"]     (str)
-            state["llm_tokens"]       (dict: prompt / completion counts)
-            state["llm_model_used"]   (str)
-            state["llm_cached"]       (bool)
-            state["request_id"]       (str)
-
-    Distributed usage
-    ─────────────────
-    Use get_llm_node() instead of instantiating directly. The factory
-    returns a RemoteLLMClient when LLM_SERVICE_URL is configured, or this
-    class otherwise. VoiceGraph imports only the factory — it never knows
-    which implementation it's using.
+    Shared Redis + LRU cache infrastructure used by all modes.
+    One instance per LLMNode — modes do not have independent connections.
     """
 
-    def __init__(
-        self,
-        primary_model: str = PRIMARY_MODEL,
-        fallback_model: str = FALLBACK_MODEL,
-        temperature: float = TEMPERATURE,
-        redis_url: str = REDIS_URL,
-        cache_ttl: int = CACHE_TTL,
-        rate_per_sec: float = RATE_PER_SEC,
-        rate_burst: float = RATE_BURST,
-    ) -> None:
-        self._primary = primary_model
-        self._fallback = fallback_model
-        self._temperature = temperature
+    def __init__(self, redis_url: str | None, lru_size: int, cache_ttl: int) -> None:
         self._redis_url = redis_url
         self._cache_ttl = cache_ttl
+        self._redis:    aioredis.Redis | None = None
+        self._lru       = InMemoryLRU(max_size=lru_size)
+        self._breaker   = CircuitBreaker(name="llm_redis", failure_threshold=4, recovery_timeout=15.0)
 
-        self._redis: aioredis.Redis | None = None
-        self._lru = InMemoryLRU(max_size=LRU_SIZE)
-        self._chains: dict[str, Any] = {}
-        self._rate_limiter = RateLimiter(rate_per_sec, rate_burst)
-
-        # separate breakers per model AND per operation type (stream vs batch)
-        # so a slow streaming endpoint never trips the batch breaker
-        self._breakers: dict[str, CircuitBreaker] = {
-            f"{primary_model}.batch": CircuitBreaker(name=f"llm:{primary_model}:batch"),
-            f"{primary_model}.stream": CircuitBreaker(
-                name=f"llm:{primary_model}:stream"
-            ),
-            f"{fallback_model}.batch": CircuitBreaker(
-                name=f"llm:{fallback_model}:batch"
-            ),
-            f"{fallback_model}.stream": CircuitBreaker(
-                name=f"llm:{fallback_model}:stream"
-            ),
-        }
-
-        self._inflight_batch = 0
-        self._inflight_stream = 0
-
-    # ── internal setup ────────────────────────────────────────────────────────
-
-    async def _get_redis(self) -> aioredis.Redis | None:
+    async def _conn(self) -> aioredis.Redis | None:
         if not self._redis_url:
             return None
-
         if self._redis is None:
             self._redis = await aioredis.from_url(
                 self._redis_url,
-                encoding="utf-8",
-                decode_responses=True,
-                max_connections=REDIS_MAX_CONN,
-                socket_connect_timeout=0.1,  # fail fast
-                socket_timeout=0.1,
+                encoding               = "utf-8",
+                decode_responses       = True,
+                max_connections        = REDIS_MAX_CONN,
+                socket_connect_timeout = 0.1,
+                socket_timeout         = 0.1,
             )
         return self._redis
 
-    def _get_chain(self, model: str, streaming: bool = False):
-        # Keyed by model + mode so batch and stream never share a ChatOpenAI
-        # instance. A single chain with streaming=True used for ainvoke() (batch
-        # path) causes LangChain to route through its streaming aggregation
-        # internally, which silently returns "" when the model response is empty
-        # or the response format isn't handled — zero tokens, no exception raised.
-        key = f"{model}:{'stream' if streaming else 'batch'}"
-        if key not in self._chains:
-            llm = ChatOpenAI(
-                model=model,
-                api_key=SecretStr(OPENAI_API_KEY),
-                temperature=self._temperature,
-                max_retries=0,
-                timeout=60,
-                max_tokens=200,
-                streaming=streaming,
-            )
-            self._chains[key] = llm | StrOutputParser()
-        return self._chains[key]
+    async def cache_get(self, key: str) -> str | None:
+        if not degraded_mode.active:
+            try:
+                r = await self._conn()
+                if r:
+                    val = await self._breaker.call(r.get, key)
+                    if val is not None:
+                        _cache_hits.labels(source="redis").inc()
+                        return val
+                await degraded_mode.exit("redis_ok_llm")
+            except Exception as exc:
+                log.warning("llm_redis_read_failed", error=str(exc))
+                await degraded_mode.enter(f"llm_redis_error: {exc}")
 
-    # ── cache (Redis + LRU fallback) ──────────────────────────────────────────
-    # Redis is the primary cache. On any Redis error we fall back to the
-    # in-process LRU and enter DegradedMode which reduces concurrency.
-
-    async def _cache_get(self, key: str) -> str | None:
-        # try Redis first
-        try:
-            r = await self._get_redis()
-            if r:
-                val = await r.get(key)
-                if val is not None:
-                    return val
-            # Redis was reachable but missed — exit degraded mode if active
-            if degraded_mode.active:
-                await degraded_mode.exit("redis_reachable")
-        except Exception as exc:
-            log.warning("cache_read_failed_using_lru", error=str(exc))
-            await degraded_mode.enter(f"redis_error: {exc}")
-
-        # LRU fallback
         val = await self._lru.get(key)
         if val is not None:
             _lru_hits.inc()
         return val
 
-    async def _cache_set(self, key: str, value: str) -> None:
-        # always write to LRU so it stays warm even if Redis works
+    async def cache_set(self, key: str, value: str) -> None:
         await self._lru.set(key, value)
         try:
-            r = await self._get_redis()
+            r = await self._conn()
             if r:
                 if self._cache_ttl > 0:
-                    await r.setex(key, self._cache_ttl, value)
+                    await self._breaker.call(r.setex, key, self._cache_ttl, value)
                 else:
-                    await r.set(key, value)
+                    await self._breaker.call(r.set, key, value)
         except Exception as exc:
-            log.warning("cache_write_skipped", error=str(exc))
+            log.warning("llm_cache_write_skipped", error=str(exc))
 
-    # ── stampede protection ───────────────────────────────────────────────────
-    # When hundreds of requests all miss the cache at the same instant,
-    # only the one that wins the SETNX lock actually hits the model.
-    # Everyone else waits and reads from cache once it's populated.
-
-    async def _acquire_lock(self, lock_key: str) -> bool:
+    async def acquire_lock(self, lock_key: str) -> bool:
         try:
-            r = await self._get_redis()
-            return bool(await r.set(lock_key, "1", nx=True, ex=STAMPEDE_LOCK_TTL))
-        except Exception:  # noqa
-            # Redis down: fail-open BUT in degraded mode we allow only one
-            # concurrent compute to reduce model pressure
-            if degraded_mode.active:
-                return False  # force everything to poll and serialize
+            r = await self._conn()
+            if r is None:
+                return True
+            return bool(await self._breaker.call(r.set, lock_key, "1", nx=True, ex=STAMPEDE_LOCK_TTL))
+        except Exception:
             return True
 
-    async def _release_lock(self, lock_key: str) -> None:
+    async def release_lock(self, lock_key: str) -> None:
         try:
-            r = await self._get_redis()
-            await r.delete(lock_key)
-        except Exception:  # noqa
+            r = await self._conn()
+            if r:
+                await self._breaker.call(r.delete, lock_key)
+        except Exception:
             pass
 
-    async def _poll_for_cached(self, key: str) -> str | None:
+    async def poll_for_cached(self, key: str) -> str | None:
         for _ in range(STAMPEDE_POLL_LIMIT):
             await asyncio.sleep(STAMPEDE_POLL_INTERVAL)
-            val = await self._cache_get(key)
+            val = await self.cache_get(key)
             if val is not None:
                 return val
         return None
 
-    # ── model calls ───────────────────────────────────────────────────────────
-
-    async def _invoke(
-        self, model: str, messages: list, path: str = "batch"
-    ) -> tuple[str, int, int]:
-        counter = _TokenCounter(model)
-        chain = self._get_chain(model, streaming=False)  # batch: streaming=False so ainvoke() uses the standard non-streaming path and token counts are reliable
-        breaker_key = f"{model}.{path}"
-        breaker = self._breakers[breaker_key]
-        _circuit_open.labels(model=model, path=path).set(
-            1 if breaker.state == "OPEN" else 0
-        )
-
-        async def _call() -> str:
-            return await chain.ainvoke(messages, config={"callbacks": [counter]})
-
-        text: str = await breaker.call(
-            backoff_retry, _call, attempts=3, base_delay=1.0, exceptions=(Exception,)
-        )
-        return text, counter.prompt_tokens, counter.completion_tokens
-
-    async def _stream_model(self, model: str, messages: list) -> AsyncIterator[str]:
-        """
-        Yield tokens from model; wraps iterator acquisition in the stream
-        circuit breaker so repeated failures trip it independently of batch.
-        """
-        chain = self._get_chain(model, streaming=True)  # stream: dedicated chain with streaming=True
-        breaker = self._breakers[f"{model}.stream"]
-        _circuit_open.labels(model=model, path="stream").set(
-            1 if breaker.state == "OPEN" else 0
-        )
-
-        async def _open() -> AsyncIterator[str]:
-            return chain.astream(messages)
-
-        iterator: AsyncIterator[str] = await breaker.call(_open)
-
-        try:
-            async for chunk in iterator:
-                yield chunk
-        finally:
-            # Ensure underlying async iterator is closed on cancellation
-            # This prevents leaking the HTTP stream or continuing token generation
-            if hasattr(iterator, "aclose"):
-                try:
-                    await iterator.aclose()
-                except Exception:  # noqa
-                    pass
-
-    # ── public generate ───────────────────────────────────────────────────────
-
-    async def generate(
-        self, prompt: str, request_id: str | None = None
-    ) -> dict[str, Any]:
-        """
-        Main entry point.
-
-        Flow: budget check → rate-limit → bulkhead → cache check →
-              stampede lock → primary model → fallback → cache write.
-        """
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt must not be empty.")
-
-        rid = request_id or new_request_id()
-        key = _cache_key(prompt, self._primary, self._temperature)
-        lk = _lock_key(key)
-
-        # ── SLA budget check ──────────────────────────────────────────────────
-        budget = LatencyBudget.current()
-        if budget:
+    async def close(self) -> None:
+        if self._redis:
             try:
-                budget.check(stage="llm.generate")
-            except LatencyBudgetExceeded:
-                _budget_exceeded.inc()
-                log.warning("llm_budget_exceeded_at_entry", request_id=rid)
-                raise
+                await self._redis.aclose()
+            except Exception:
+                pass
+            self._redis = None
 
-        with tracer.start_as_current_span("llm.generate") as span:
-            span.set_attribute("request_id", rid)
-            span.set_attribute("prompt_length", len(prompt))
 
-            await self._rate_limiter.acquire()
+# ── LangChain chain factory ────────────────────────────────────────────────────
 
-            async with bulkheads.acquire("llm.batch"):
-                _active.labels(mode="batch").inc()
-                self._inflight_batch += 1
-                t0 = time.monotonic()
+class _ChainFactory:
+    """
+    Builds and caches LangChain ChatOpenAI chains per (model, mode, streaming).
+    Separates interviewer and ATS chains so their settings never bleed together.
+    """
 
-                try:
-                    cached_val = await self._cache_get(key)
-                    if cached_val is not None:
-                        _cache_hits.labels(source="redis").inc()
-                        _req_total.labels(
-                            model="cache", status="hit", mode="batch"
-                        ).inc()
-                        span.set_attribute("cache_hit", True)
-                        return {
-                            "response": cached_val,
-                            "prompt_tokens": 0,
-                            "completion_tokens": 0,
-                            "model_used": "cache",
-                            "cached": True,
-                        }
+    def __init__(self) -> None:
+        self._chains: dict[str, Any] = {}
 
-                    span.set_attribute("cache_hit", False)
+    def get(self, model: str, mode: LLMMode, streaming: bool = False) -> Any:
+        key = f"{model}:{mode.value}:{'s' if streaming else 'b'}"
+        if key not in self._chains:
+            self._chains[key] = self._build(model, mode, streaming)
+        return self._chains[key]
 
-                    got_lock = await self._acquire_lock(lk)
-                    if not got_lock:
-                        log.info("stampede_wait", request_id=rid)
-                        polled = await self._poll_for_cached(key)
-                        if polled is not None:
-                            _cache_hits.labels(source="stampede_wait").inc()
-                            return {
-                                "response": polled,
-                                "prompt_tokens": 0,
-                                "completion_tokens": 0,
-                                "model_used": "cache",
-                                "cached": True,
-                            }
-                        got_lock = True
+    def _build(self, model: str, mode: LLMMode, streaming: bool) -> Any:
+        common = dict(
+            model       = model,
+            api_key     = OPENAI_API_KEY,
+            max_retries = 0,
+            timeout     = 60,
+        )
+        if mode == LLMMode.INTERVIEWER:
+            llm = ChatOpenAI(
+                **common,
+                temperature = INTERVIEWER_TEMPERATURE,
+                max_tokens  = INTERVIEWER_MAX_TOKENS,
+                streaming   = streaming,
+            )
+        elif mode == LLMMode.ATS:
+            llm = ChatOpenAI(
+                **common,
+                temperature  = ATS_TEMPERATURE,
+                max_tokens   = ATS_MAX_TOKENS,
+                streaming    = False,   # ATS never streams
+                model_kwargs = {"response_format": {"type": "json_object"}},
+            )
+        elif mode == LLMMode.EVAL:
+            llm = ChatOpenAI(
+                **common,
+                temperature = EVAL_TEMPERATURE,
+                max_tokens  = EVAL_MAX_TOKENS,
+                streaming   = streaming,
+            )
+        else:
+            raise ValueError(f"Unknown LLMMode: {mode}") # noqa static checker
 
-                    messages = [
-                        SystemMessage(content=SYSTEM_PROMPT),
-                        HumanMessage(content=prompt),
-                    ]
+        return llm | StrOutputParser()
 
-                    model_used = self._primary
-                    pt = ct = 0  # noqa
 
-                    try:
-                        text, pt, ct = await self._invoke(self._primary, messages)
-                    except (CircuitBreakerOpen, Exception) as primary_err:
-                        log.warning(
-                            "primary_failed_using_fallback",
-                            request_id=rid,
-                            error=str(primary_err),
-                        )
-                        try:
-                            text, pt, ct = await self._invoke( # noqa
-                                self._fallback, messages, path="batch"
-                            )  # noqa
-                            model_used = self._fallback
-                        except Exception as fallback_err:
-                            _req_total.labels(
-                                model=model_used, status="error", mode="batch"
-                            ).inc()
-                            span.set_status(StatusCode.ERROR, str(fallback_err))
-                            raise RuntimeError(
-                                f"Both models failed. Primary: {primary_err}. Fallback: {fallback_err}"
-                            ) from fallback_err
-                    finally:
-                        if got_lock:
-                            await self._release_lock(lk)
+# ── LLMNodeProtocol ───────────────────────────────────────────────────────────
 
-                    # Guard: an empty response must raise so the retry/error path
-                    # in VoiceGraph handles it cleanly instead of passing "" to
-                    # sanitize/TTS and serving the user a pre-baked apology.
-                    if not text or not text.strip():
-                        _req_total.labels(
-                            model=model_used, status="error", mode="batch"
-                        ).inc()
-                        raise ValueError(
-                            f"LLM returned an empty response "
-                            f"(model={model_used}, prompt_tokens={pt}, completion_tokens={ct}). "
-                            f"Check model name, API key, and quota."
-                        )
+@runtime_checkable
+class LLMNodeProtocol(Protocol):
+    """
+    Structural protocol satisfied by LLMNode (local) and RemoteLLMClient.
+    voice_graph.py and qa_controller depend ONLY on this protocol.
+    """
 
-                    await self._cache_set(key, text)
+    def stream_question(
+        self,
+        llm_input:  LLMInterviewInput,
+        request_id: str | None = None,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Stream the next interview question tokens."""
+        ...
 
-                    latency = time.monotonic() - t0
-                    _req_total.labels(model=model_used, status="ok", mode="batch").inc()
-                    _latency.labels(model=model_used).observe(latency)
-                    span.set_attribute("model", model_used)
-                    span.set_attribute("latency_s", round(latency, 3))
+    async def extract_ats(
+        self,
+        intro_text:  str,
+        request_id:  str | None = None,
+    ) -> str:
+        """Run ATS extraction on intro_text. Returns raw JSON string."""
+        ...
 
-                    log.info(
-                        "llm_ok",
-                        request_id=rid,
-                        model=model_used,
-                        latency_s=round(latency, 3),
-                        prompt_tokens=pt,
-                        completion_tokens=ct,
-                    )
+    def stream_messages(
+        self,
+        messages:   list,
+        request_id: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Raw message list streaming. ONLY for evaluation_engine internal use.
+        Must NOT be called from voice_graph.node_llm for interview turns.
+        """
+        ...
 
-                    return {
-                        "response": text,
-                        "prompt_tokens": pt,
-                        "completion_tokens": ct,
-                        "model_used": model_used,
-                        "cached": False,
-                    }
+    async def health(self) -> ServiceHealthState: ...
+    async def close(self)  -> None: ...
 
-                finally:
-                    _active.labels(mode="batch").dec()
-                    self._inflight_batch -= 1
+    def evict_session(self, session_id: str) -> None: ...
 
-    # ── streaming ─────────────────────────────────────────────────────────────
 
-    async def stream(
-        self, prompt: str, request_id: str | None = None
+# ── session token budget ───────────────────────────────────────────────────────
+
+@dataclass
+class SessionTokenBudget:
+    """
+    Tracks token usage per session across LLM calls.
+    Advisory for interview turns (warn only). Enforced for eval turns.
+    """
+    session_id:        str
+    max_total_tokens:  int   = SESSION_TOKEN_BUDGET
+    prompt_tokens:     int   = 0
+    completion_tokens: int   = 0
+    warn_threshold:    float = 0.8
+
+    class TokenBudgetExhausted(RuntimeError):
+        pass
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_total_tokens - self.total_tokens)
+
+    @property
+    def usage_pct(self) -> float:
+        return self.total_tokens / max(self.max_total_tokens, 1)
+
+    def add(self, prompt: int, completion: int) -> None:
+        self.prompt_tokens     += prompt
+        self.completion_tokens += completion
+
+    def check_warn(self, session_id: str) -> None:
+        if self.usage_pct >= self.warn_threshold:
+            log.warning(
+                "session_token_budget_warn",
+                session_id = session_id[:8],
+                used       = self.total_tokens,
+                remaining  = self.remaining,
+                pct        = round(self.usage_pct * 100, 1),
+            )
+
+    def check_enforce(self, session_id: str) -> None:
+        if self.remaining == 0:
+            raise SessionTokenBudget.TokenBudgetExhausted(
+                f"Session {session_id[:8]} has exhausted its token budget "
+                f"({self.total_tokens}/{self.max_total_tokens})"
+            )
+
+
+class _SessionBudgetStore:
+    """In-process store for per-session token budgets. LRU-evicted."""
+
+    def __init__(self, max_sessions: int = 256) -> None:
+        self._store: OrderedDict[str, SessionTokenBudget] = OrderedDict()
+        self._max   = max_sessions
+
+    def get_or_create(self, session_id: str) -> SessionTokenBudget:
+        if session_id not in self._store:
+            if len(self._store) >= self._max:
+                self._store.popitem(last=False)
+            self._store[session_id] = SessionTokenBudget(session_id=session_id)
+        self._store.move_to_end(session_id)
+        return self._store[session_id]
+
+    def record(self, session_id: str, prompt: int, completion: int) -> None:
+        budget = self.get_or_create(session_id)
+        budget.add(prompt, completion)
+        budget.check_warn(session_id)
+
+
+# ── voice sanitizer ────────────────────────────────────────────────────────────
+
+class _VoiceSanitizer:
+    """
+    Post-processes LLM text for TTS consumption.
+    Called AFTER _ResponseValidator.validate_and_repair().
+    """
+
+    _TTS_EXPANSIONS: dict[str, str] = {
+        r"\bAPI\b":        "A P I",
+        r"\bAPIs\b":       "A P I s",
+        r"\bSQL\b":        "S Q L",
+        r"\bORM\b":        "O R M",
+        r"\bJVM\b":        "J V M",
+        r"\bGC\b":         "G C",
+        r"\bO\(n\)\b":     "O of n",
+        r"\bO\(1\)\b":     "O of one",
+        r"\bO\(log n\)\b": "O log n",
+        r"\bO\(n²\)\b":    "O of n squared",
+        r"\bSTL\b":        "S T L",
+        r"\bDSA\b":        "D S A",
+        r"\bLRU\b":        "L R U",
+        r"\bCPU\b":        "C P U",
+        r"\bI/O\b":        "I O",
+        r"\bHTTP\b":       "H T T P",
+        r"\bHTTPS\b":      "H T T P S",
+        r"\bREST\b":       "R E S T",
+        r"\bJSON\b":       "J S O N",
+        r"\bXML\b":        "X M L",
+        r"\bOOP\b":        "O O P",
+    }
+
+    _STRIP_PATTERNS: list[tuple[str, str]] = [
+        (r"`{1,3}[^`]*`{1,3}",        ""),        # backtick code spans
+        (r"\*{1,3}([^*]+)\*{1,3}",    r"\1"),     # bold/italic → plain
+        (r"_{1,3}([^_]+)_{1,3}",      r"\1"),     # underscore emphasis → plain
+        (r"\.{3,}",                   "..."),     # collapse excessive ellipsis
+        (r"-{2,}",                    "—"),       # double dash → em dash
+        (r"~{2}([^~]+)~{2}",          r"\1"),     # ~~strikethrough~~ → plain
+        (r"\[([^\]]+)\]\([^\)]+\)",   r"\1"),     # [link text](url) → link text
+        (r"https?://\S+",             ""),        # strip bare URLs
+        (r"^\s*#{1,6}\s+",            ""),        # strip markdown headers
+    ]
+
+    def sanitize(self, text: str) -> str:
+        result = text
+        for pattern, replacement in self._STRIP_PATTERNS:
+            result = re.sub(pattern, replacement, result, flags=re.MULTILINE)
+        for pattern, expansion in self._TTS_EXPANSIONS.items():
+            result = re.sub(pattern, expansion, result)
+        result = re.sub(r"  +", " ", result)
+        result = re.sub(r"\n{2,}", "\n", result)
+        return result.strip()
+
+
+# ── fallback question bank (simple) ───────────────────────────────────────────
+
+class _FallbackQuestionBank:
+    """
+    Pre-written fallback questions used when the LLM response fails validation
+    AND repair also fails. Ensures the interview never stalls.
+    """
+
+    _BANK: dict[str, dict[str, list[str]]] = {
+        "python": {
+            "beginner":     [
+                "Got it. What is the difference between a list and a tuple in Python?",
+                "Understood. How does Python manage memory for variables?",
+                "Okay. What does the 'self' keyword mean inside a Python class?",
+                "Noted. What is the difference between '==' and 'is' in Python?",
+            ],
+            "intermediate": [
+                "Got it. What is a Python generator and how does it differ from a regular function?",
+                "Understood. How does the GIL affect multithreaded Python programs?",
+                "Okay. Explain Python's descriptor protocol and give an example use case.",
+                "Noted. What is the difference between deepcopy and shallow copy in Python?",
+            ],
+            "advanced": [
+                "Got it. How does Python's memory allocator handle small object pooling?",
+                "Understood. Explain metaclasses in Python and when you'd use one.",
+                "Okay. What is the C3 linearization algorithm and how does Python use it for MRO?",
+            ],
+        },
+        "java": {
+            "beginner":     [
+                "Got it. What is the difference between an interface and an abstract class in Java?",
+                "Understood. How does Java handle memory management?",
+                "Okay. What is the difference between '==' and '.equals()' in Java?",
+            ],
+            "intermediate": [
+                "Got it. How does the Java memory model define happens-before relationships?",
+                "Understood. What is the difference between HashMap and ConcurrentHashMap?",
+                "Okay. Explain how Java's try-with-resources statement works at the bytecode level.",
+            ],
+            "advanced": [
+                "Got it. How does the G1 garbage collector differ from the CMS collector in Java?",
+                "Understood. Explain how Java class loading works and what the bootstrap classloader does.",
+                "Okay. What is JIT compilation and how does tiered compilation work in the JVM?",
+            ],
+        },
+        "dsa": {
+            "beginner":     [
+                "Got it. What is the time complexity of binary search and why?",
+                "Understood. Explain the difference between a stack and a queue.",
+                "Okay. What is a linked list and how does it differ from an array?",
+            ],
+            "intermediate": [
+                "Got it. How does a hash table resolve collisions using chaining versus open addressing?",
+                "Understood. What is the difference between BFS and DFS, and when would you use each?",
+                "Okay. Explain the concept of dynamic programming with a simple example.",
+            ],
+            "advanced": [
+                "Got it. How does a segment tree support range queries and point updates?",
+                "Understood. Explain the amortized complexity of a splay tree's operations.",
+                "Okay. What is the difference between Dijkstra's algorithm and A* search?",
+            ],
+        },
+        "system_design": {
+            "beginner":     [
+                "Got it. What is the difference between horizontal and vertical scaling?",
+                "Understood. What is a load balancer and why would you use one?",
+                "Okay. What is the CAP theorem and what does it mean for distributed systems?",
+            ],
+            "intermediate": [
+                "Got it. How would you design a rate limiter for a REST API at scale?",
+                "Understood. What is eventual consistency and when would you accept it?",
+                "Okay. Explain the difference between optimistic and pessimistic locking in databases.",
+            ],
+            "advanced": [
+                "Got it. How would you design a globally distributed key-value store with low write latency?",
+                "Understood. Explain how consistent hashing reduces remapping during node additions.",
+                "Okay. What is the two-phase commit protocol and what are its failure modes?",
+            ],
+        },
+        "databases": {
+            "beginner":     [
+                "Got it. What is the difference between a primary key and a foreign key?",
+                "Understood. What does ACID stand for in database transactions?",
+                "Okay. What is an index and why would you add one to a database table?",
+            ],
+            "intermediate": [
+                "Got it. How does a B-tree index work and why is it preferred over a hash index for range queries?",
+                "Understood. What is the difference between INNER JOIN and LEFT JOIN?",
+                "Okay. Explain what a database transaction isolation level does and name two common levels.",
+            ],
+            "advanced": [
+                "Got it. How does MVCC implement read consistency without locking in PostgreSQL?",
+                "Understood. What is write-ahead logging and how does it support crash recovery?",
+                "Okay. Explain the difference between row-store and column-store database architectures.",
+            ],
+        },
+    }
+
+    _DEFAULT: dict[str, list[str]] = {
+        "beginner":     ["Got it. Can you explain a technical concept from your introduction that you feel most confident about?"],
+        "intermediate": ["Understood. Can you walk me through the most complex technical problem you have solved recently?"],
+        "advanced":     ["Noted. Can you describe a production incident you diagnosed and how you traced the root cause?"],
+    }
+
+    def get(self, domain: str, level: str) -> str:
+        domain_bank = self._BANK.get(domain, self._DEFAULT)
+        level_pool  = domain_bank.get(level) or domain_bank.get("intermediate") or list(self._DEFAULT.values())[0]
+        return random.choice(level_pool)
+
+
+# ── health probe ───────────────────────────────────────────────────────────────
+
+class _LLMHealthProbe:
+    """Periodic background health probe. Updates liveness gauge."""
+
+    PROBE_INTERVAL_S: int = int(os.getenv("LLM_HEALTH_PROBE_INTERVAL", "60"))
+
+    def __init__(self, node: "LLMNode") -> None:
+        self._node    = node
+        self._task:   asyncio.Task | None = None
+        self._last_ok: float | None       = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.ensure_future(self._run())
+            log.info("llm_health_probe_started", interval_s=self.PROBE_INTERVAL_S)
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+
+    async def _run(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(self.PROBE_INTERVAL_S)
+                health        = await self._node.health()
+                self._last_ok = time.time() if health.healthy else None
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                log.warning("llm_health_probe_error", error=str(exc))
+
+    @property
+    def last_ok(self) -> float | None:
+        return self._last_ok
+
+    @property
+    def stale(self) -> bool:
+        if self._last_ok is None:
+            return True
+        return (time.time() - self._last_ok) > (self.PROBE_INTERVAL_S * 2)
+
+
+# ── warmup ─────────────────────────────────────────────────────────────────────
+
+class _LLMWarmup:
+    """Sends a cheap probe call to each model on startup to eliminate cold-start latency."""
+
+    @staticmethod
+    async def warm(node: "LLMNode") -> None:
+        probe_messages = [
+            SystemMessage(content="You are a terse assistant."),
+            HumanMessage(content="Reply with exactly: ready"),
+        ]
+        models_to_warm = list({node._primary, node._fallback, node._ats_model})
+        for model in models_to_warm:
+            t0 = time.monotonic()
+            try:
+                chain   = node._chains.get(model, LLMMode.INTERVIEWER, streaming=False)
+                result: str = await asyncio.wait_for(chain.ainvoke(probe_messages), timeout=8.0)
+                latency = time.monotonic() - t0
+                _latency.labels(model=model, mode="warmup").observe(latency)
+                log.info("llm_warmup_ok", model=model, latency=round(latency, 3), reply=result.strip()[:20])
+            except asyncio.TimeoutError:
+                log.warning("llm_warmup_timeout", model=model)
+            except Exception as exc:
+                log.warning("llm_warmup_failed", model=model, error=str(exc))
+
+
+# ── LLMNode ────────────────────────────────────────────────────────────────────
+
+class LLMNode:
+    """
+    Production LLM node implementing LLMNodeProtocol.
+
+    Three operational modes, each with independent configuration:
+      InterviewerMode  — stream_question()  — low temp, tight token cap, validated
+      ATSMode          — extract_ats()      — json_object, batch, schema-validated
+      EvalMode         — stream_messages()  — used only by evaluation_engine
+
+    Shared infrastructure:
+      Redis + LRU dual-layer cache, stampede protection, per-model/per-mode
+      circuit breakers, token-bucket rate limiters, bulkhead semaphores,
+      OTel spans, Prometheus metrics.
+
+    Built-in post-processing:
+      _VoiceSanitizer          — cleans output for TTS
+      _FallbackQuestionBank    — used when validator repair fails
+      _SessionBudgetStore      — advisory token budget per session
+      _LLMHealthProbe          — background liveness probe
+    """
+
+    def __init__(
+        self,
+        primary_model:  str        = PRIMARY_MODEL,
+        fallback_model: str        = FALLBACK_MODEL,
+        ats_model:      str        = ATS_MODEL,
+        ats_fallback:   str        = ATS_FALLBACK,
+        redis_url:      str | None = REDIS_URL,
+        cache_ttl:      int        = CACHE_TTL,
+    ) -> None:
+        self._primary      = primary_model
+        self._fallback     = fallback_model
+        self._ats_model    = ats_model
+        self._ats_fallback = ats_fallback
+
+        self._redis         = _SharedRedis(redis_url, LRU_SIZE, cache_ttl)
+        self._chains        = _ChainFactory()
+        self._validator     = _ResponseValidator()
+        self._sanitizer     = _VoiceSanitizer()
+        self._fallback_bank = _FallbackQuestionBank()
+        self._budget_store  = _SessionBudgetStore()
+        self._health_probe  = _LLMHealthProbe(self)
+
+        self._rate_iv  = RateLimiter(INTERVIEWER_RATE,  INTERVIEWER_BURST)
+        self._rate_ats = RateLimiter(ATS_RATE,          ATS_BURST)
+
+        self._breakers: dict[str, CircuitBreaker] = {
+            f"{primary_model}.interviewer.stream":  CircuitBreaker(name=f"llm:{primary_model}:iv:stream"),
+            f"{primary_model}.interviewer.batch":   CircuitBreaker(name=f"llm:{primary_model}:iv:batch"),
+            f"{fallback_model}.interviewer.stream": CircuitBreaker(name=f"llm:{fallback_model}:iv:stream"),
+            f"{fallback_model}.interviewer.batch":  CircuitBreaker(name=f"llm:{fallback_model}:iv:batch"),
+            f"{ats_model}.ats.batch":               CircuitBreaker(name=f"llm:{ats_model}:ats:batch"),
+            f"{ats_fallback}.ats.batch":            CircuitBreaker(name=f"llm:{ats_fallback}:ats:batch"),
+            f"{primary_model}.eval.stream":         CircuitBreaker(name=f"llm:{primary_model}:eval:stream"),
+            f"{fallback_model}.eval.stream":        CircuitBreaker(name=f"llm:{fallback_model}:eval:stream"),
+        }
+
+        self._inflight: dict[str, int] = {"interviewer": 0, "ats": 0, "eval": 0}
+
+    # ── breaker helper ─────────────────────────────────────────────────────────
+
+    def _breaker(self, model: str, mode: LLMMode, path: str = "stream") -> CircuitBreaker:
+        key = f"{model}.{mode.value}.{path}"
+        if key not in self._breakers:
+            self._breakers[key] = CircuitBreaker(name=f"llm:{model}:{mode.value}:{path}")
+        cb = self._breakers[key]
+        _cb_open.labels(model=model, path=f"{mode.value}.{path}").set(1 if cb.state == "OPEN" else 0)
+        return cb
+
+    # ── stream question (InterviewerMode) ──────────────────────────────────────
+
+    async def stream_question(
+        self,
+        llm_input:  LLMInterviewInput,
+        request_id: str | None = None,
+        session_id: str | None = None,
     ) -> AsyncIterator[str]:
         """
-        Yield tokens as they arrive — separate stream breaker from generate().
+        INTERVIEWER MODE. The ONLY entry point for interview-turn LLM calls
+        from voice_graph.node_llm.
 
-        Flow: budget check → rate-limit → stream bulkhead → cache hit yields
-              immediately → stampede poll → primary stream → fallback stream
-              → cache write on exhaustion.
+        Flow:
+          budget advisory → rate limit → bulkhead → cache → stampede lock →
+          primary stream → fallback → accumulate → validate → sanitize →
+          fallback bank if needed → cache write → yield final string
         """
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt must not be empty.")
+        if not llm_input or not llm_input.messages:
+            raise ValueError("stream_question: LLMInterviewInput.messages is empty")
 
-        rid = request_id or new_request_id()
-        key = _cache_key(prompt, self._primary, self._temperature)
-        lk = _lock_key(key)
+        rid      = request_id or new_request_id()
+        messages = llm_input.messages
+
+        self._validate_messages(messages, llm_input, rid, session_id)
+
+        key      = _interviewer_cache_key(messages, self._primary)
+        lk       = _lock_key(key)
+
+        # ── prompt injection guard (candidate answer) ──
+        if INJECTION_BLOCK and llm_input.last_answer:
+            detector = PromptInjectionDetector()
+            clean_answer, detected = detector.scan(llm_input.last_answer)
+
+            if detected:
+                log.warning(
+                    "llm_injection_risk",
+                    session_id=session_id[:8] if session_id else None,
+                    domain=llm_input.domain,
+                    level=llm_input.level,
+                )
+
+                # Replace candidate answer with sanitized version
+                llm_input = dc_replace(llm_input, last_answer=clean_answer)
+
+                # OPTIONAL: hard fail → fallback question
+                if BANK_FALLBACK_ENABLED and clean_answer.startswith("[redacted"):
+                    fallback = self._fallback_bank.get(llm_input.domain, llm_input.level)
+                    yield self._sanitizer.sanitize(fallback)
+                    return
+
+        # Advisory budget check
+        if session_id:
+            self._budget_store.get_or_create(session_id).check_warn(session_id)
 
         budget = LatencyBudget.current()
         if budget:
             try:
-                budget.check(stage="llm.stream")
+                budget.check(stage="llm.interviewer")
             except LatencyBudgetExceeded:
-                _budget_exceeded.inc()
+                _budget_exc.inc()
+                log.warning("llm_iv_budget_exceeded", request_id=rid)
                 raise
 
-        with tracer.start_as_current_span("llm.stream") as span:
-            span.set_attribute("request_id", rid)
-            span.set_attribute("prompt_length", len(prompt))
+        with tracer.start_as_current_span("llm.stream_question") as span:
+            span.set_attribute("request_id",      rid)
+            span.set_attribute("domain",          llm_input.domain)
+            span.set_attribute("level",           llm_input.level)
+            span.set_attribute("domain_switched", llm_input.domain_switched)
 
-            await self._rate_limiter.acquire()
+            await self._rate_iv.acquire()
 
-            async with bulkheads.acquire("llm.stream"):
-                _active.labels(mode="stream").inc()
-                self._inflight_stream += 1
-                t0 = time.monotonic()
+            async with bulkheads.acquire("llm.interviewer"):
+                _active.labels(mode="interviewer").inc()
+                self._inflight["interviewer"] += 1
+                t0          = time.monotonic()
                 accumulated: list[str] = []
-                model_used = self._primary
-                got_lock = False
+                model_used  = self._primary
+                got_lock    = False
 
                 try:
-                    cached_val = await self._cache_get(key)
-                    if cached_val is not None:
-                        _cache_hits.labels(source="redis_stream").inc()
-                        _req_total.labels(
-                            model="cache", status="hit", mode="stream"
-                        ).inc()
-                        _ttft.labels(model="cache").observe(0.0)
+                    # Cache check
+                    cached = await self._redis.cache_get(key)
+                    if cached:
+                        _cache_hits.labels(source="iv_stream").inc()
+                        _req_total.labels(model="cache", status="hit", mode="interviewer").inc()
                         span.set_attribute("cache_hit", True)
-                        yield cached_val
+                        yield cached
                         return
 
                     span.set_attribute("cache_hit", False)
 
-                    got_lock = await self._acquire_lock(lk)
+                    got_lock = await self._redis.acquire_lock(lk)
                     if not got_lock:
-                        polled = await self._poll_for_cached(key)
-                        if polled is not None:
-                            _cache_hits.labels(source="stampede_wait_stream").inc()
-                            _ttft.labels(model="cache").observe(time.monotonic() - t0)
+                        polled = await self._redis.poll_for_cached(key)
+                        if polled:
+                            _cache_hits.labels(source="iv_stampede").inc()
                             yield polled
                             return
                         got_lock = True
 
-                    messages = [
-                        SystemMessage(content=SYSTEM_PROMPT),
-                        HumanMessage(content=prompt),
-                    ]
-
-                    first_token = True
+                    # Primary stream
+                    first_token    = True
                     primary_failed = False
                     primary_err: Exception | None = None
 
                     try:
-                        async for chunk in self._stream_model( # noqa
-                            self._primary, messages
-                        ):  # noqa
-
-                            # Enforce SLA before emitting token
+                        async for chunk in self._stream_model(self._primary, messages, LLMMode.INTERVIEWER):
                             if budget:
-                                budget.check(stage="llm.stream.before_yield")
-
+                                budget.check(stage="llm.interviewer.stream")
                             if first_token:
-                                _ttft.labels(model=self._primary).observe(
-                                    time.monotonic() - t0
-                                )
+                                _ttft.labels(model=self._primary).observe(time.monotonic() - t0)
                                 first_token = False
-
                             accumulated.append(chunk)
-                            yield chunk
-
                     except (CircuitBreakerOpen, Exception) as exc:
                         primary_failed = True
+                        primary_err    = exc
+                        _fallback_used.labels(mode="interviewer").inc()
+                        log.warning("llm_iv_primary_failed_fallback", request_id=rid, error=str(exc))
+
+                    # Fallback stream
+                    if primary_failed:
+                        accumulated.clear()
+                        model_used = self._fallback
+                        try:
+                            async for chunk in self._stream_model(self._fallback, messages, LLMMode.INTERVIEWER):
+                                if budget:
+                                    budget.check(stage="llm.iv.fallback")
+                                if first_token:
+                                    _ttft.labels(model=self._fallback).observe(time.monotonic() - t0)
+                                    first_token = False
+                                accumulated.append(chunk)
+                        except Exception as fallback_err:
+                            _req_total.labels(model=model_used, status="error", mode="interviewer").inc()
+                            span.set_status(StatusCode.ERROR, str(fallback_err))
+                            raise RuntimeError(
+                                f"Both interviewer models failed. "
+                                f"Primary: {primary_err}. Fallback: {fallback_err}"
+                            ) from fallback_err
+
+                    full_text = "".join(accumulated)
+
+                    if not full_text.strip():
+                        fallback_text = self._fallback_bank.get(llm_input.domain, llm_input.level)
+                        sanitized     = self._sanitizer.sanitize(fallback_text)
+                        _validator_fix.labels(action="fallback_empty_stream").inc()
+                        yield sanitized
+                        return
+
+                    # Validate and sanitize
+                    try:
+                        validated = self._validator.validate_and_repair(full_text, LLMMode.INTERVIEWER)
+                    except ValueError as ve:
+                        log.warning("llm_iv_validation_failed", error=str(ve), request_id=rid)
+                        validated = self._fallback_bank.get(llm_input.domain, llm_input.level)
+                        _validator_fix.labels(action="fallback_post_validate").inc()
+
+                    sanitized = self._sanitizer.sanitize(validated)
+
+                    if len(sanitized) >= STREAM_CACHE_MIN:
+                        await self._redis.cache_set(key, sanitized)
+
+                    # Approximate token budget tracking
+                    if session_id:
+                        approx_prompt     = sum(len(getattr(m, "content", "")) // 4 for m in messages)
+                        approx_completion = len(sanitized) // 4
+                        self._budget_store.record(session_id, approx_prompt, approx_completion)
+
+                    latency = time.monotonic() - t0
+                    _req_total.labels(model=model_used, status="ok", mode="interviewer").inc()
+                    _latency.labels(model=model_used, mode="interviewer").observe(latency)
+                    span.set_attribute("model",   model_used)
+                    span.set_attribute("chars",   len(sanitized))
+                    span.set_attribute("latency", round(latency, 3))
+                    log.info(
+                        "llm_iv_ok",
+                        request_id = rid,
+                        model      = model_used,
+                        domain     = llm_input.domain,
+                        level      = llm_input.level,
+                        chars      = len(sanitized),
+                        latency_s  = round(latency, 3),
+                    )
+
+                    yield sanitized
+
+                except LatencyBudgetExceeded:
+                    _budget_exc.inc()
+                    log.warning("llm_iv_budget_mid_stream", request_id=rid)
+                    raise
+                except asyncio.CancelledError:
+                    log.warning("llm_iv_cancelled", request_id=rid)
+                    raise
+                finally:
+                    if got_lock:
+                        await self._redis.release_lock(lk)
+                    _active.labels(mode="interviewer").dec()
+                    self._inflight["interviewer"] -= 1
+
+    def _validate_messages(
+            self,
+            messages: list,
+            llm_input: LLMInterviewInput,
+            request_id: str,
+            session_id: str | None,
+    ) -> None:
+        """
+        Validate message list before passing to LLM.
+        Raises ValueError if messages are malformed.
+
+        Checks:
+          1. List is non-empty
+          2. Has at least SystemMessage + HumanMessage
+          3. All messages have non-empty content
+          4. Message types are valid (SystemMessage, HumanMessage, etc.)
+        """
+        # Check 1: Non-empty list
+        if not messages or len(messages) == 0:
+            raise ValueError(
+                f"stream_question: messages list is empty (domain={llm_input.domain})"
+            )
+
+        # Check 2: Minimum required messages (System + User)
+        if len(messages) < 2:
+            log.error(
+                "llm_invalid_messages_min",
+                request_id=request_id,
+                session_id=session_id[:8] if session_id else "unknown",
+                domain=llm_input.domain,
+                message_count=len(messages),
+            )
+            raise ValueError(
+                f"stream_question: need at least 2 messages (System + User), got {len(messages)}"
+            )
+
+        # Check 3: All messages have content
+        for idx, msg in enumerate(messages):
+            # Handle both dict-like and object-like messages
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+
+            if content is None or not str(content).strip():
+                log.error(
+                    "llm_empty_message_content",
+                    request_id=request_id,
+                    session_id=session_id[:8] if session_id else "unknown",
+                    domain=llm_input.domain,
+                    message_index=idx,
+                    message_type=type(msg).__name__,
+                )
+                raise ValueError(
+                    f"stream_question: message[{idx}] has empty content "
+                    f"(type={type(msg).__name__})"
+                )
+
+        # Check 4: First message should be SystemMessage
+        first_msg_type = type(messages[0]).__name__
+        if first_msg_type != "SystemMessage":
+            log.warning(
+                "llm_first_message_not_system",
+                request_id=request_id,
+                session_id=session_id[:8] if session_id else "unknown",
+                domain=llm_input.domain,
+                first_message_type=first_msg_type,
+            )
+            # Don't raise — just warn. Some models may handle this.
+
+        log.debug(
+            "llm_messages_valid",
+            request_id=request_id,
+            session_id=session_id[:8] if session_id else "unknown",
+            domain=llm_input.domain,
+            message_count=len(messages),
+            first_type=first_msg_type,
+        )
+
+    # ── extract ATS (ATSMode) ──────────────────────────────────────────────────
+
+    async def extract_ats(
+        self,
+        intro_text:  str,
+        request_id:  str | None = None,
+    ) -> str:
+        """
+        ATS MODE. Batch mode with json_object output.
+        Returns raw JSON string — schema validation done by qa_controller.
+        """
+        if not intro_text or not intro_text.strip():
+            raise ValueError("extract_ats: intro_text is empty")
+
+        rid      = request_id or new_request_id()
+        key      = _ats_cache_key(intro_text, self._ats_model)
+        lk       = _lock_key(key)
+        messages = [
+            SystemMessage(content=ATS_SYSTEM_PROMPT),
+            HumanMessage(content=ATS_USER_TEMPLATE.format(intro_text=intro_text.strip())),
+        ]
+
+        with tracer.start_as_current_span("llm.extract_ats") as span:
+            span.set_attribute("request_id",  rid)
+            span.set_attribute("intro_chars", len(intro_text))
+
+            await self._rate_ats.acquire()
+
+            async with bulkheads.acquire("llm.ats"):
+                _active.labels(mode="ats").inc()
+                self._inflight["ats"] += 1
+                t0       = time.monotonic()
+                got_lock = False
+
+                try:
+                    cached = await self._redis.cache_get(key)
+                    if cached:
+                        _cache_hits.labels(source="ats_batch").inc()
+                        _req_total.labels(model="cache", status="hit", mode="ats").inc()
+                        span.set_attribute("cache_hit", True)
+                        return cached
+
+                    span.set_attribute("cache_hit", False)
+
+                    got_lock = await self._redis.acquire_lock(lk)
+                    if not got_lock:
+                        polled = await self._redis.poll_for_cached(key)
+                        if polled:
+                            _cache_hits.labels(source="ats_stampede").inc()
+                            return polled
+                        got_lock = True
+
+                    model_used  = self._ats_model
+                    primary_err: Exception | None = None
+                    text        = ""
+
+                    try:
+                        text = await self._batch_model(self._ats_model, messages, LLMMode.ATS, rid)
+                    except (CircuitBreakerOpen, Exception) as exc:
                         primary_err = exc
-                        log.warning(
-                            "stream_primary_failed_using_fallback",
-                            request_id=rid,
-                            error=str(exc),
-                            chars_streamed=sum(len(c) for c in accumulated),
-                        )
+                        _fallback_used.labels(mode="ats").inc()
+                        log.warning("llm_ats_primary_failed_fallback", request_id=rid, error=str(exc))
+                        try:
+                            text       = await self._batch_model(self._ats_fallback, messages, LLMMode.ATS, rid)
+                            model_used = self._ats_fallback
+                        except Exception as fe:
+                            raise RuntimeError(
+                                f"Both ATS models failed. Primary: {primary_err}. Fallback: {fe}"
+                            ) from fe
+
+                    if not text or not text.strip():
+                        raise ValueError(f"ATS model returned empty response (model={model_used})")
+
+                    try:
+                        json.loads(text.strip())
+                    except json.JSONDecodeError:
+                        log.warning("llm_ats_invalid_json", request_id=rid, raw_len=len(text))
+
+                    await self._redis.cache_set(key, text)
+
+                    latency = time.monotonic() - t0
+                    _req_total.labels(model=model_used, status="ok", mode="ats").inc()
+                    _latency.labels(model=model_used, mode="ats").observe(latency)
+                    span.set_attribute("model",   model_used)
+                    span.set_attribute("latency", round(latency, 3))
+                    log.info("llm_ats_ok", request_id=rid, model=model_used, json_chars=len(text), latency_s=round(latency, 3))
+                    return text
+
+                except asyncio.CancelledError:
+                    log.warning("llm_ats_cancelled", request_id=rid)
+                    raise
+                except Exception as exc:
+                    _req_total.labels(model=self._ats_model, status="error", mode="ats").inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    log.error("llm_ats_failed", request_id=rid, error=str(exc))
+                    raise
+                finally:
+                    if got_lock:
+                        await self._redis.release_lock(lk)
+                    _active.labels(mode="ats").dec()
+                    self._inflight["ats"] -= 1
+
+    # ── stream messages (eval + compat) ───────────────────────────────────────
+
+    async def stream_messages(
+        self,
+        messages:   list,
+        request_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Raw message list streaming for evaluation_engine.py and legacy paths.
+        MUST NOT be called from voice_graph.node_llm for interview turns.
+        """
+        if not messages:
+            raise ValueError("stream_messages: messages list is empty")
+
+        rid        = request_id or new_request_id()
+        serialised = "|".join(f"{type(m).__name__}:{getattr(m, 'content', '')}" for m in messages)
+        key        = make_versioned_cache_key(CACHE_PREFIX + "ev:", serialised, self._primary, 0.1, "")
+        lk         = _lock_key(key)
+
+        budget = LatencyBudget.current()
+        if budget:
+            try:
+                budget.check(stage="llm.eval.stream_messages")
+            except LatencyBudgetExceeded:
+                _budget_exc.inc()
+                raise
+
+        with tracer.start_as_current_span("llm.stream_messages_eval") as span:
+            span.set_attribute("request_id",    rid)
+            span.set_attribute("message_count", len(messages))
+
+            await self._rate_iv.acquire()
+
+            async with bulkheads.acquire("llm.eval"):
+                _active.labels(mode="eval").inc()
+                self._inflight["eval"] += 1
+                t0          = time.monotonic()
+                accumulated: list[str] = []
+                model_used  = self._primary
+                got_lock    = False
+
+                try:
+                    cached = await self._redis.cache_get(key)
+                    if cached:
+                        _cache_hits.labels(source="eval_stream").inc()
+                        span.set_attribute("cache_hit", True)
+                        yield cached
+                        return
+
+                    span.set_attribute("cache_hit", False)
+
+                    got_lock = await self._redis.acquire_lock(lk)
+                    if not got_lock:
+                        polled = await self._redis.poll_for_cached(key)
+                        if polled:
+                            yield polled
+                            return
+                        got_lock = True
+
+                    first_token    = True
+                    primary_failed = False
+                    primary_err: Exception | None = None
+
+                    try:
+                        async for chunk in self._stream_model(self._primary, messages, LLMMode.EVAL):
+                            if budget:
+                                budget.check(stage="llm.eval.before_yield")
+                            if first_token:
+                                _ttft.labels(model=self._primary).observe(time.monotonic() - t0)
+                                first_token = False
+                            accumulated.append(chunk)
+                            yield chunk
+                    except (CircuitBreakerOpen, Exception) as exc:
+                        primary_failed = True
+                        primary_err    = exc
+                        log.warning("llm_eval_primary_failed", request_id=rid, error=str(exc))
 
                     if primary_failed:
                         accumulated.clear()
                         model_used = self._fallback
                         try:
-                            async for chunk in self._stream_model( # noqa
-                                self._fallback, messages
-                            ):  # noqa
-
-                                # Enforce SLA before emitting token
+                            async for chunk in self._stream_model(self._fallback, messages, LLMMode.EVAL):
                                 if budget:
-                                    budget.check(stage="llm.stream.before_yield")
-
+                                    budget.check(stage="llm.eval.fallback")
                                 if first_token:
-                                    _ttft.labels(model=self._fallback).observe(
-                                        time.monotonic() - t0
-                                    )
+                                    _ttft.labels(model=self._fallback).observe(time.monotonic() - t0)
                                     first_token = False
-
                                 accumulated.append(chunk)
                                 yield chunk
-
-                        except Exception as fallback_err:
-                            _req_total.labels(
-                                model=model_used, status="error", mode="stream"
-                            ).inc()
-                            span.set_status(StatusCode.ERROR, str(fallback_err))
+                        except Exception as fe:
+                            _req_total.labels(model=model_used, status="error", mode="eval").inc()
                             raise RuntimeError(
-                                f"Both stream models failed. Primary: {primary_err}. Fallback: {fallback_err}"
-                            ) from fallback_err
+                                f"Both eval models failed. Primary: {primary_err}. Fallback: {fe}"
+                            ) from fe
 
                     full_text = "".join(accumulated)
+                    if not full_text.strip():
+                        raise ValueError(f"Eval LLM returned empty (model={model_used})")
+
+                    if len(full_text) >= STREAM_CACHE_MIN:
+                        await self._redis.cache_set(key, full_text)
+
                     latency = time.monotonic() - t0
-
-                    if len(full_text) >= STREAM_CACHE_MIN_CHARS:
-                        await self._cache_set(key, full_text)
-
-                    _req_total.labels(
-                        model=model_used, status="ok", mode="stream"
-                    ).inc()
-                    _latency.labels(model=model_used).observe(latency)
-                    span.set_attribute("model", model_used)
-                    span.set_attribute("latency_s", round(latency, 3))
-
-                    log.info(
-                        "stream_ok",
-                        request_id=rid,
-                        model=model_used,
-                        latency_s=round(latency, 3),
-                        chars=len(full_text),
-                    )
+                    _req_total.labels(model=model_used, status="ok", mode="eval").inc()
+                    _latency.labels(model=model_used, mode="eval").observe(latency)
+                    span.set_attribute("latency", round(latency, 3))
 
                 except LatencyBudgetExceeded:
-                    _budget_exceeded.inc()
-                    log.warning(
-                        "stream_budget_exceeded",
-                        request_id=rid,
-                        chars_streamed=sum(len(c) for c in accumulated),
-                    )
+                    _budget_exc.inc()
                     raise
-
                 except asyncio.CancelledError:
-                    log.warning(
-                        "stream_cancelled",
-                        request_id=rid,
-                        chars_streamed=sum(len(c) for c in accumulated),
-                    )
                     raise
-
                 finally:
                     if got_lock:
-                        await self._release_lock(lk)
-                    _active.labels(mode="stream").dec()
-                    self._inflight_stream -= 1
+                        await self._redis.release_lock(lk)
+                    _active.labels(mode="eval").dec()
+                    self._inflight["eval"] -= 1
 
-    # ── stream with metadata ──────────────────────────────────────────────────
+    # ── internal model call helpers ────────────────────────────────────────────
 
-    async def stream_with_metadata(
-        self, prompt: str, request_id: str | None = None
-    ) -> AsyncIterator[str | dict[str, Any]]:
-        """
-        Yield str tokens followed by a single final metadata dict.
-        Detect metadata with isinstance(item, dict).
-        """
-        rid = request_id or new_request_id()
-        t0 = time.monotonic()
-        chars = 0
-        first_token_t: float | None = None
+    async def _stream_model(
+        self,
+        model:    str,
+        messages: list,
+        mode:     LLMMode,
+    ) -> AsyncIterator[str]:
+        """Yield tokens via LangChain astream(). Applies per-model/per-mode circuit breaker."""
+        chain   = self._chains.get(model, mode, streaming=True)
+        breaker = self._breaker(model, mode, "stream")
 
-        async for token in self.stream(prompt, request_id=rid):
-            if first_token_t is None:
-                first_token_t = time.monotonic()
-            chars += len(token)
-            yield token
+        async def _open() -> AsyncIterator[str]:
+            return chain.astream(messages)
 
-        yield {
-            "type": "metadata",
-            "request_id": rid,
-            "ttft_s": round((first_token_t - t0) if first_token_t else 0.0, 3),
-            "total_s": round(time.monotonic() - t0, 3),
-            "chars": chars,
-        }
+        iterator: AsyncIterator[str] = await breaker.call(_open)
+        try:
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            if hasattr(iterator, "aclose"):
+                try:
+                    await iterator.aclose()
+                except Exception:
+                    pass
 
-    # ── health ────────────────────────────────────────────────────────────────
+    async def _batch_model(
+        self,
+        model:      str,
+        messages:   list,
+        mode:       LLMMode,
+        request_id: str,
+    ) -> str:
+        """Batch (non-streaming) model call. Used ONLY by ATSMode."""
+        counter = _TokenCounter(model)
+        chain   = self._chains.get(model, mode, streaming=False)
+        breaker = self._breaker(model, mode, "batch")
+
+        async def _call() -> str:
+            return await chain.ainvoke(messages, config={"callbacks": [counter]})
+
+        return await breaker.call(backoff_retry, _call, attempts=2, base_delay=0.8, exceptions=(Exception,))
+
+    # ── warmup / probe / lifecycle ─────────────────────────────────────────────
+
+    async def warmup(self) -> None:
+        """Warm all configured models on application startup."""
+        await _LLMWarmup.warm(self)
+
+    def start_health_probe(self) -> None:
+        """Start background health probe loop. Call from lifespan startup."""
+        self._health_probe.start()
+
+    def stop_health_probe(self) -> None:
+        """Stop background health probe loop. Call from lifespan shutdown."""
+        self._health_probe.stop()
 
     async def health(self) -> ServiceHealthState:
-        batch_breaker = self._breakers.get(f"{self._primary}.batch")
+        iv_breaker = self._breakers.get(f"{self._primary}.interviewer.stream")
+        cb_state   = iv_breaker.state if iv_breaker else "UNKNOWN"
+        redis_ok   = False
+        try:
+            r = await self._redis._conn()
+            if r:
+                await r.ping()
+                redis_ok = True
+        except Exception:
+            pass
+
         return ServiceHealthState(
-            service="llm.local",
-            healthy=batch_breaker.state != "OPEN" if batch_breaker else True,
-            circuit_state=batch_breaker.state if batch_breaker else "CLOSED",
-            inflight=self._inflight_batch + self._inflight_stream,
-            degraded=degraded_mode.active,
+            service       = "llm.local",
+            healthy       = cb_state != "OPEN",
+            circuit_state = cb_state,
+            inflight      = sum(self._inflight.values()),
+            degraded      = degraded_mode.active,
+            extra         = {
+                "primary_model":     self._primary,
+                "fallback_model":    self._fallback,
+                "ats_model":         self._ats_model,
+                "redis_ok":          redis_ok,
+                "inflight_by_mode":  dict(self._inflight),
+                "health_probe_stale": self._health_probe.stale,
+                "health_probe_last":  self._health_probe.last_ok,
+            },
         )
 
-    # ── LangGraph node ────────────────────────────────────────────────────────
+    async def close(self) -> None:
+        self.stop_health_probe()
+        await self._redis.close()
+        log.info("llm_node_closed")
 
-    async def __call__(self, state: dict[str, Any]) -> dict[str, Any]:
-        rid = state.get("request_id") or new_request_id()
-        result = await self.generate(state.get("user_input", ""), request_id=rid)
-        return {
-            **state,
-            "request_id": rid,
-            "llm_response": result["response"],
-            "llm_tokens": {
-                "prompt": result["prompt_tokens"],
-                "completion": result["completion_tokens"],
+
+# ── prompt injection detector ──────────────────────────────────────────────────
+
+class PromptInjectionDetector:
+    """
+    Scans raw candidate answer text for prompt injection attempts BEFORE
+    it is included in any LLM input. Strips or redacts detected phrases.
+    """
+
+    _PATTERNS: list[re.Pattern] = [
+        re.compile(r"ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)", re.I),
+        re.compile(r"(you\s+are\s+now|act\s+as|pretend\s+(you\s+are|to\s+be))\s+", re.I),
+        re.compile(r"(repeat|reveal|print|output|show)\s+(your\s+)?(system\s+prompt|instructions?)", re.I),
+        re.compile(r"\bDAN\b"),
+        re.compile(r"jailbreak", re.I),
+        re.compile(r"(disregard|forget|override)\s+(all|any)\s+(above|previous|prior|instructions?)", re.I),
+        re.compile(r"your\s+new\s+(task|job|role|instruction)\s+is", re.I),
+        re.compile(r"<\|im_start\|>|<\|im_end\|>|<system>|</system>|\[INST\]|\[/INST\]", re.I),  # noqa
+        re.compile(r"(say|respond\s+with|output\s+only)\s+[\"']?(yes|no|I\s+will|I\s+am)", re.I),
+    ]
+
+    _MIN_CLEAN_CHARS = 10
+
+    def scan(self, text: str) -> tuple[str, bool]:
+        """
+        Returns (clean_text, was_injected).
+        Injection phrases are replaced with [REDACTED].
+        """
+        detected   = False
+        clean_text = text
+
+        for pattern in self._PATTERNS:
+            if pattern.search(clean_text):
+                clean_text = pattern.sub("[REDACTED]", clean_text)
+                detected   = True
+
+        if detected:
+            _injection_blocks.inc()
+            log.warning(
+                "llm_injection_detected",
+                original_len = len(text),
+                clean_len    = len(clean_text),
+                sample       = text[:60].replace("\n", " "),
+            )
+            if len(clean_text.strip()) < self._MIN_CLEAN_CHARS:
+                clean_text = "[redacted due to policy violation]"
+
+        return clean_text, detected
+
+
+# ── content policy filter ──────────────────────────────────────────────────────
+
+class ContentPolicyFilter:
+    """
+    Post-processing filter on LLM OUTPUTS (interviewer mode only).
+
+    Catches cases where the LLM breaks the strict interviewer persona and
+    starts behaving like a chatbot or tutor.
+    """
+
+    class ContentPolicyViolation(ValueError):
+        """Raised when output violates content policy and cannot be repaired."""
+
+    _WARN_PATTERNS: list[tuple[str, re.Pattern]] = [
+        ("filler", re.compile(
+            r"^(great|awesome|excellent|wonderful|fantastic|certainly|absolutely|"
+            r"of course|sure|ok|okay|no problem|got it|understood)[!.,]?\s*",
+            re.I | re.MULTILINE,
+        )),
+        ("self_ref", re.compile(
+            r"\b(I can|I'll|I will|I'd be|let me|I'm going to|I should|I think)\b",
+            re.I,
+        )),
+    ]
+
+    _BLOCK_PATTERNS: list[tuple[str, re.Pattern]] = [
+        ("offer_help", re.compile(
+            r"\b(I can (explain|help|show|guide|walk you through)|"
+            r"let me (explain|help|show|clarify)|"
+            r"feel free to ask|don'?t hesitate|happy to help|"
+            r"hope that helps|does that make sense|does that answer)\b",
+            re.I,
+        )),
+        ("tutorial", re.compile(
+            r"\b(the (answer|solution|reason|explanation) is|"
+            r"basically,|in other words,|what this means is|"
+            r"to summarize,|to clarify,|in simple terms)\b",
+            re.I,
+        )),
+    ]
+
+    def filter(self, response: str, mode: str = "interviewer") -> str:
+        if mode != "interviewer" or not CONTENT_POLICY_BLOCK:
+            return response
+
+        text = response.strip()
+
+        for rule, pattern in self._WARN_PATTERNS:
+            if pattern.search(text):
+                text = pattern.sub("", text).strip()
+                _policy_blocks.labels(rule=rule).inc()
+                log.debug("llm_policy_warn_stripped", rule=rule)
+
+        for rule, pattern in self._BLOCK_PATTERNS:
+            if pattern.search(text):
+                _policy_blocks.labels(rule=rule).inc()
+                log.warning("llm_policy_block", rule=rule, response=text[:80])
+                raise ContentPolicyFilter.ContentPolicyViolation(
+                    f"Content policy violation ({rule}): {text[:60]}"
+                )
+
+        return text
+
+
+# ── streaming word guard ───────────────────────────────────────────────────────
+
+class StreamingWordGuard:
+    """
+    Wraps an async token stream and enforces a hard word count limit IN-STREAM,
+    avoiding unnecessary token generation and cost after the cap is reached.
+    """
+
+    def __init__(self, max_words: int = MAX_RESPONSE_WORDS) -> None:
+        self._max_words  = max_words
+        self._word_count = 0
+        self._buffer     = ""
+        self._cut        = False
+
+    async def wrap(self, source: AsyncIterator[str]) -> AsyncIterator[str]:
+        async for chunk in source:
+            if self._cut:
+                break
+            self._buffer += chunk
+            if len(self._buffer.split()) >= self._max_words:
+                truncated = self._truncate_to_last_question(self._buffer)
+                if truncated:
+                    yield truncated
+                _stream_word_cuts.inc()
+                self._cut = True
+                break
+            else:
+                yield chunk
+                self._word_count += len(chunk.split())
+
+    @staticmethod
+    def _truncate_to_last_question(text: str) -> str:
+        idx = text.rfind("?")
+        if idx >= 0:
+            return text[: idx + 1].strip()
+        return text.strip()
+
+
+# ── question diversity enforcer ────────────────────────────────────────────────
+
+class QuestionDiversityEnforcer:
+    """
+    Character-level N-gram cosine similarity check on generated questions
+    against recent questions in the same session/domain. Forces regeneration
+    if similarity exceeds DIVERSITY_THRESHOLD (up to MAX_DIVERSITY_RETRIES).
+    """
+
+    def __init__(self, n: int = DIVERSITY_NGRAM_N, window: int = DIVERSITY_WINDOW) -> None:
+        self._n      = n
+        self._window = window
+        self._recent: dict[str, list[str]] = defaultdict(list)
+
+    def _ngrams(self, text: str) -> Counter:
+        text   = re.sub(r"\s+", " ", text.lower().strip())
+        return Counter(text[i: i + self._n] for i in range(len(text) - self._n + 1))
+
+    def _cosine(self, a: Counter, b: Counter) -> float:
+        if not a or not b:
+            return 0.0
+        intersection = sum((a & b).values())
+        mag_a        = math.sqrt(sum(v * v for v in a.values()))
+        mag_b        = math.sqrt(sum(v * v for v in b.values()))
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        return intersection / (mag_a * mag_b)
+
+    def is_too_similar(self, session_id: str, domain: str, question: str) -> tuple[bool, float]:
+        key     = f"{session_id}:{domain}"
+        recent  = self._recent.get(key, [])[-self._window:]
+        q_ng    = self._ngrams(question)
+        max_sim = max((self._cosine(q_ng, self._ngrams(p)) for p in recent), default=0.0)
+        _diversity_similarity.observe(max_sim)
+        return max_sim >= DIVERSITY_THRESHOLD, max_sim
+
+    def register(self, session_id: str, domain: str, question: str) -> None:
+        key = f"{session_id}:{domain}"
+        self._recent[key].append(question)
+        if len(self._recent[key]) > 50:
+            self._recent[key] = self._recent[key][-50:]
+
+    def evict_session(self, session_id: str) -> None:
+        for k in [k for k in self._recent if k.startswith(f"{session_id}:")]:
+            del self._recent[k]
+
+
+# ── static question bank ───────────────────────────────────────────────────────
+
+class StaticQuestionBank:
+    """
+    Pre-classified domain × level × difficulty question bank (~300+ questions).
+    Priority 3 fallback when all LLM paths are exhausted.
+    Tracks served questions per session to avoid repeats.
+    """
+
+    _BANK: dict[str, dict[str, dict[str, list[str]]]] = {
+        "python": {
+            "beginner": {
+                "easy": [
+                    "What is the difference between a list and a tuple in Python?",
+                    "How do you define a function in Python?",
+                    "What does the `len()` function do in Python?",
+                    "What is an f-string and how do you use one?",
+                    "How do you handle a divide-by-zero error in Python?",
+                ],
+                "medium": [
+                    "What is the difference between `__init__` and `__new__` in Python?",
+                    "How does Python's garbage collector work?",
+                    "What are list comprehensions and when would you use one?",
+                    "What is the purpose of `*args` and `**kwargs`?",
+                ],
             },
-            "llm_model_used": result["model_used"],
-            "llm_cached": result["cached"],
-        }
+            "intermediate": {
+                "easy": [
+                    "What is a Python decorator and what problem does it solve?",
+                    "Explain the difference between `is` and `==` in Python.",
+                    "What is the Global Interpreter Lock and why does it matter?",
+                ],
+                "medium": [
+                    "How does Python's `asyncio` event loop work?",
+                    "What is the difference between a generator and an iterator?",
+                    "How would you implement a context manager using `__enter__` and `__exit__`?",
+                    "What are metaclasses in Python and when would you use them?",
+                ],
+                "hard": [
+                    "Explain how Python's `__slots__` affects memory layout and attribute access.",
+                    "What is the MRO and how does C3 linearization resolve diamond inheritance?",
+                    "How does `functools.lru_cache` work internally?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "How would you implement a thread-safe singleton in Python?",
+                    "Explain the tradeoffs between multiprocessing and asyncio for CPU-bound tasks.",
+                    "How do Python descriptors work and when would you use `__get__`?",
+                ],
+                "expert": [
+                    "Walk me through how CPython compiles source to bytecode.",
+                    "How would you implement a coroutine scheduler from scratch?",
+                    "What are the memory implications of circular references with weakrefs?",
+                ],
+            },
+        },
+        "java": {
+            "beginner": {
+                "easy": [
+                    "What is the difference between `==` and `.equals()` in Java?",
+                    "What is an interface in Java and how is it different from an abstract class?",
+                    "What does the `final` keyword mean when applied to a variable?",
+                    "What is autoboxing in Java?",
+                ],
+                "medium": [
+                    "How does Java's garbage collector decide which objects to collect?",
+                    "What is the difference between `ArrayList` and `LinkedList`?",
+                    "How does exception handling work in Java — checked vs unchecked?",
+                ],
+            },
+            "intermediate": {
+                "medium": [
+                    "What is the Java Memory Model and why does it matter for concurrency?",
+                    "How do Java generics work and what is type erasure?",
+                    "Explain the difference between `volatile`, `synchronized`, and `AtomicInteger`.",
+                    "What is the difference between `Callable` and `Runnable`?",
+                ],
+                "hard": [
+                    "How does the Fork/Join framework work in Java?",
+                    "Explain the happens-before guarantee in the Java Memory Model.",
+                    "How would you implement a lock-free stack using `compareAndSet`?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "What are Java's virtual threads and how do they differ from platform threads?",
+                    "How does G1GC differ from ZGC in Java garbage collection?",
+                ],
+                "expert": [
+                    "Walk me through how the JIT compiler performs inlining and escape analysis.",
+                    "How would you design a thread pool with work-stealing semantics?",
+                ],
+            },
+        },
+        "cpp": {
+            "beginner": {
+                "easy": [
+                    "What is the difference between a pointer and a reference in C++?",
+                    "What does the `const` keyword do in C++?",
+                    "What is a destructor and when is it called?",
+                ],
+                "medium": [
+                    "What is RAII and how does it prevent resource leaks?",
+                    "What is the Rule of Three in C++?",
+                    "What is the difference between `new`/`delete` and `malloc`/`free`?",
+                ],
+            },
+            "intermediate": {
+                "medium": [
+                    "What are move semantics in C++ and what problem do they solve?",
+                    "What is a virtual table (vtable) and how does it implement polymorphism?",
+                    "What is template specialization and partial specialization?",
+                ],
+                "hard": [
+                    "Explain the difference between `std::unique_ptr` and `std::shared_ptr`.",
+                    "What is undefined behaviour in C++ and give three common examples.",
+                    "How does `std::move` work and what does it actually do to the source object?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "What is SFINAE and how is it used for compile-time dispatch?",
+                    "How does `std::atomic` prevent data races without using a mutex?",
+                ],
+                "expert": [
+                    "Walk me through how the compiler handles a virtual function call.",
+                    "What are the memory ordering models in C++11 and when would you use `memory_order_acquire`?",
+                ],
+            },
+        },
+        "javascript": {
+            "beginner": {
+                "easy": [
+                    "What is the difference between `let`, `const`, and `var`?",
+                    "What is a closure in JavaScript?",
+                    "What does `===` check that `==` does not?",
+                    "What is the event loop in JavaScript?",
+                ],
+                "medium": [
+                    "What is prototypal inheritance and how does it differ from class-based?",
+                    "What is the difference between `null` and `undefined`?",
+                ],
+            },
+            "intermediate": {
+                "medium": [
+                    "How does the JavaScript event loop handle microtasks vs macrotasks?",
+                    "What is the difference between a Promise and async/await?",
+                    "How does `this` binding work in arrow functions vs regular functions?",
+                ],
+                "hard": [
+                    "What is a WeakMap and when would you use it instead of a Map?",
+                    "How does V8's hidden class optimization work?",
+                    "What are generators in JavaScript and how do they differ from async functions?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "How does Node.js achieve non-blocking I/O with a single thread?",
+                    "Explain the difference between `Object.freeze` and `const`.",
+                ],
+                "expert": [
+                    "How would you implement a job queue with backpressure in Node.js?",
+                    "Walk me through how V8 compiles JavaScript to machine code via Ignition and TurboFan.",
+                ],
+            },
+        },
+        "dsa": {
+            "beginner": {
+                "easy": [
+                    "What is the time complexity of searching in a sorted array using binary search?",
+                    "What is the difference between a stack and a queue?",
+                    "What is a hash table and how does it achieve O(1) average lookup?",
+                ],
+                "medium": [
+                    "What is the difference between BFS and DFS, and when would you use each?",
+                    "How does a min-heap guarantee the minimum element is at the root?",
+                ],
+            },
+            "intermediate": {
+                "medium": [
+                    "What is dynamic programming and how do you identify overlapping subproblems?",
+                    "Explain the difference between a B-tree and a binary search tree.",
+                    "How does quicksort choose a pivot and what is its worst-case complexity?",
+                ],
+                "hard": [
+                    "What is the difference between Dijkstra's and Bellman-Ford algorithms?",
+                    "How would you detect a cycle in a directed graph?",
+                    "What is the time complexity of building a heap using heapify?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "How does a segment tree support range queries in O(log n)?",
+                    "What is amortized analysis and how does it apply to a dynamic array?",
+                ],
+                "expert": [
+                    "Explain van Emde Boas trees and their advantage over balanced BSTs.",
+                    "How would you design a data structure for LFU cache eviction in O(1)?",
+                ],
+            },
+        },
+        "system_design": {
+            "intermediate": {
+                "medium": [
+                    "What is the CAP theorem and how does it apply to distributed databases?",
+                    "What is the difference between horizontal and vertical scaling?",
+                    "How does consistent hashing minimize reshuffling when nodes are added?",
+                ],
+                "hard": [
+                    "How would you design a URL shortener that handles 10,000 requests per second?",
+                    "What is event sourcing and how does it differ from CRUD?",
+                    "How does a write-ahead log guarantee durability in databases?",
+                ],
+            },
+            "advanced": {
+                "hard": [
+                    "How would you design a distributed rate limiter across multiple data centers?",
+                    "What is the two-phase commit protocol and why is it slow?",
+                ],
+                "expert": [
+                    "How does Google Spanner achieve external consistency without NTP?",
+                    "Walk me through designing a globally distributed key-value store with strong consistency.",
+                ],
+            },
+        },
+        "databases": {
+            "beginner": {
+                "easy": [
+                    "What is the difference between a primary key and a foreign key?",
+                    "What is an index in a database and why does it speed up queries?",
+                    "What does ACID stand for in database transactions?",
+                ],
+            },
+            "intermediate": {
+                "medium": [
+                    "What is the difference between an inner join and an outer join?",
+                    "What is database normalization and what problem does it solve?",
+                    "How does a B+ tree index differ from a hash index?",
+                ],
+                "hard": [
+                    "How does MVCC (multi-version concurrency control) work?",
+                    "What is the difference between optimistic and pessimistic locking?",
+                    "How would you diagnose and fix N+1 query problems in an ORM?",
+                ],
+            },
+            "advanced": {
+                "expert": [
+                    "How does PostgreSQL's VACUUM process handle dead tuples?",
+                    "Walk me through how a distributed SQL database handles a two-phase commit.",
+                ],
+            },
+        },
+        "os_concepts": {
+            "intermediate": {
+                "medium": [
+                    "What is the difference between a process and a thread?",
+                    "How does virtual memory allow a process to use more memory than physically available?",
+                    "What is a deadlock and what are the four conditions required for one?",
+                ],
+                "hard": [
+                    "How does the kernel handle a page fault?",
+                    "What is the difference between a mutex and a semaphore?",
+                    "How does copy-on-write work in the context of `fork()`?",
+                ],
+            },
+            "advanced": {
+                "expert": [
+                    "How does the Linux CFS scheduler prioritize processes?",
+                    "Walk me through what happens when a user process calls `read()` on a file.",
+                ],
+            },
+        },
+    }
 
-    # ── cleanup ───────────────────────────────────────────────────────────────
+    _GENERIC_QUESTIONS: list[str] = [
+        "What is the most significant challenge you've faced in this domain and how did you solve it?",
+        "Describe a production bug related to this technology and how you diagnosed it.",
+        "How do you stay current with changes in this technology area?",
+        "What is the most important thing a developer should understand before using this in production?",
+        "Describe a tradeoff you made in a project using this technology.",
+    ]
+
+    def __init__(self) -> None:
+        self._served: dict[str, set[tuple]] = defaultdict(set)
+
+    def get_question(self, session_id: str, domain: str, level: str, difficulty: str) -> str:
+        q = self._try_get(session_id, domain, level, difficulty)
+        if q:
+            _bank_fallbacks.labels(domain=domain, level=level).inc()
+            return q
+        for diff_alt in ("medium", "hard", "easy", "expert"):
+            if diff_alt == difficulty:
+                continue
+            q = self._try_get(session_id, domain, level, diff_alt)
+            if q:
+                _bank_fallbacks.labels(domain=domain, level=level).inc()
+                return q
+        for level_alt in ("intermediate", "beginner", "advanced"):
+            if level_alt == level:
+                continue
+            q = self._try_get(session_id, domain, level_alt, "medium")
+            if q:
+                _bank_fallbacks.labels(domain=domain, level=level).inc()
+                return q
+        generic_idx = len(self._served[session_id]) % len(self._GENERIC_QUESTIONS)
+        _bank_fallbacks.labels(domain="generic", level="any").inc()
+        return self._GENERIC_QUESTIONS[generic_idx]
+
+    def _try_get(self, session_id: str, domain: str, level: str, difficulty: str) -> str | None:
+        questions = self._BANK.get(domain, {}).get(level, {}).get(difficulty, [])
+        for i, q in enumerate(questions):
+            idx_key = (domain, level, difficulty, i)
+            if idx_key not in self._served[session_id]:
+                self._served[session_id].add(idx_key)
+                return q
+        return None
+
+    def evict_session(self, session_id: str) -> None:
+        self._served.pop(session_id, None)
+
+
+# ── ATS schema validator ───────────────────────────────────────────────────────
+
+if _PYDANTIC_AVAILABLE:
+    class ATSExtractionSchema(BaseModel):
+        """Pydantic v2 schema for ATS LLM output validation."""
+
+        name:      str
+        domains:   list[str]
+        level:     str
+        languages: list[str]
+        notes:     str
+
+        _VALID_DOMAINS: ClassVar[frozenset[str]] = frozenset({
+            "python", "java", "cpp", "csharp", "javascript", "php",
+            "golang", "rust", "dsa", "system_design", "databases",
+            "os_concepts", "behavioral", "ml",
+        })
+        _VALID_LEVELS: ClassVar[frozenset[str]] = frozenset({
+            "beginner", "intermediate", "advanced"
+        })
+
+        @field_validator("domains")
+        @classmethod
+        def validate_domains(cls, v: list[str]) -> list[str]:
+            valid = [d for d in v if d in cls._VALID_DOMAINS]
+            if not valid:
+                raise ValueError(f"No valid domains in: {v}")
+            return valid
+
+        @field_validator("level")
+        @classmethod
+        def validate_level(cls, v: str) -> str:
+            return v if v in cls._VALID_LEVELS else "intermediate"
+
+        @field_validator("name")
+        @classmethod
+        def truncate_name(cls, v: str) -> str:
+            return v[:64]
+
+
+def validate_ats_json(raw: str) -> dict | None:
+    """
+    Parse and validate ATS extraction JSON.
+    Returns the validated dict on success, None on failure.
+    """
+    try:
+        data = json.loads(raw.strip())
+    except json.JSONDecodeError as exc:
+        _ats_schema_fails.inc()
+        log.warning("llm_ats_json_parse_failed", error=str(exc), raw=raw[:80])
+        return None
+
+    if not _PYDANTIC_AVAILABLE:
+        return data
+
+    try:
+        return ATSExtractionSchema(**data).model_dump()
+    except (ValidationError, Exception) as exc:
+        _ats_schema_fails.inc()
+        log.warning("llm_ats_schema_validation_failed", error=str(exc))
+        return None
+
+
+# ── eval mode LLM ──────────────────────────────────────────────────────────────
+
+class EvalModeLLM:
+    """
+    Dedicated LLM wrapper for evaluation_engine.py internal use ONLY.
+
+    Wider token budget, higher temperature, no interviewer guardrails.
+    voice_graph.node_llm MUST NOT call this class under any circumstances.
+    """
+
+    def __init__(self, llm_node_ref: LLMNode) -> None:
+        self._node    = llm_node_ref
+        self._breaker = CircuitBreaker(name="llm_eval_mode", failure_threshold=5, recovery_timeout=30.0)
+        self._sem     = asyncio.Semaphore(3)
+
+    async def generate(self, messages: list, request_id: str | None = None) -> str:
+        """Non-streaming eval call. Returns full response text."""
+        rid = request_id or new_request_id()
+        t0  = time.monotonic()
+
+        with tracer.start_as_current_span("llm.eval_mode.generate") as span:
+            span.set_attribute("request_id", rid)
+
+            async with self._sem:
+                _eval_calls.labels(status="attempt").inc()
+                try:
+                    chain  = self._node._chains.get(EVAL_MODEL, LLMMode.EVAL, streaming=False)
+                    result = await self._breaker.call(chain.ainvoke, messages)
+
+                    latency = time.monotonic() - t0
+                    _eval_latency.observe(latency)
+                    _eval_calls.labels(status="ok").inc()
+                    span.set_attribute("latency_s", round(latency, 3))
+                    log.info("llm_eval_generate_ok", request_id=rid, latency_ms=round(latency * 1000, 1), chars=len(result))
+                    return result
+
+                except Exception as exc:
+                    _eval_calls.labels(status="error").inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    log.error("llm_eval_generate_failed", request_id=rid, error=str(exc))
+                    raise
+
+    async def stream(self, messages: list, request_id: str | None = None) -> AsyncIterator[str]:
+        """Streaming eval call for long-form evaluation responses."""
+        rid = request_id or new_request_id()
+        with tracer.start_as_current_span("llm.eval_mode.stream") as span:
+            span.set_attribute("request_id", rid)
+            async with self._sem:
+                _eval_calls.labels(status="stream_attempt").inc()
+                try:
+                    result     = await self.generate(messages, request_id=rid)
+                    words      = result.split()
+                    chunk_size = 5
+                    for i in range(0, len(words), chunk_size):
+                        yield " ".join(words[i: i + chunk_size]) + " "
+                    _eval_calls.labels(status="stream_ok").inc()
+                except Exception as exc:
+                    _eval_calls.labels(status="stream_error").inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    raise
+
+
+# ── batch ATS processor ────────────────────────────────────────────────────────
+
+class BatchATSProcessor:
+    """
+    Offline ATS processing for bulk intro extraction.
+    NOT used by the live voice graph.
+    """
+
+    def __init__(self, llm_node_ref: LLMNode) -> None:
+        self._node = llm_node_ref
+        self._sem  = asyncio.Semaphore(BATCH_ATS_CONCURRENCY)
+
+    async def process_batch(
+        self,
+        items:       list[dict],
+        on_progress: Any | None = None,
+    ) -> list[dict]:
+        t0      = time.monotonic()
+        total   = len(items)
+        results: list[dict] = [{} for _ in range(total)]
+        done    = 0
+
+        async def process_one(index: int, item: dict) -> None:
+            nonlocal done
+            cid        = item.get("candidate_id", str(index))
+            intro_text = item.get("intro_text", "")
+
+            async with self._sem:
+                try:
+                    raw_json  = await asyncio.wait_for(
+                        self._node.extract_ats(intro_text), timeout=BATCH_ATS_TIMEOUT
+                    )
+                    validated = validate_ats_json(raw_json)
+                    results[index] = {"candidate_id": cid, "result": validated, "error": None}
+                    _batch_ats_calls.labels(status="ok").inc()
+                except asyncio.TimeoutError:
+                    results[index] = {"candidate_id": cid, "result": None, "error": "timeout"}
+                    _batch_ats_calls.labels(status="timeout").inc()
+                except Exception as exc:
+                    results[index] = {"candidate_id": cid, "result": None, "error": str(exc)}
+                    _batch_ats_calls.labels(status="error").inc()
+                finally:
+                    done += 1
+                    if on_progress:
+                        try:
+                            on_progress(done, total)
+                        except Exception:
+                            pass
+
+        await asyncio.gather(*(process_one(i, item) for i, item in enumerate(items)))
+
+        elapsed_minutes = (time.monotonic() - t0) / 60
+        if elapsed_minutes > 0:
+            _batch_ats_throughput.observe(total / elapsed_minutes)
+
+        ok_count    = sum(1 for r in results if r.get("error") is None)
+        error_count = sum(1 for r in results if r.get("error") is not None)
+        log.info("llm_batch_ats_complete", total=total, ok=ok_count, errors=error_count)
+        return results
+
+
+# ── LLMNodeV2 ─────────────────────────────────────────────────────────────────
+
+class LLMNodeV2(LLMNode):
+    """
+    Production LLMNode v2 — extends LLMNode with all security and quality guards:
+      - PromptInjectionDetector on all candidate answer text
+      - ContentPolicyFilter on all interviewer responses
+      - QuestionDiversityEnforcer with N-gram cosine similarity
+      - StaticQuestionBank as Priority 3 fallback
+      - ATSSchemaValidator replacing manual JSON checks
+      - StreamingWordGuard cutting generation in-stream at the word cap
+      - EvalModeLLM for evaluation_engine use
+      - BatchATSProcessor for offline screening
+
+    CRITICAL: Injection detection and content policy filtering are always active
+    and cannot be bypassed per-request.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._injection = PromptInjectionDetector()
+        self._policy    = ContentPolicyFilter()
+        self._diversity = QuestionDiversityEnforcer()
+        self._bank      = StaticQuestionBank()
+        self.eval_mode  = EvalModeLLM(self)
+        self.batch_ats  = BatchATSProcessor(self)
+
+    async def stream_question(
+        self,
+        llm_input:  LLMInterviewInput,
+        request_id: str | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Extended stream_question with ALL guardrails active:
+
+          1. Injection scan on llm_input.last_answer
+          2. Parent stream_question (rate limit → cache → LLM → validate → sanitize)
+          3. ContentPolicyFilter on output
+          4. QuestionDiversityEnforcer — retry up to MAX_DIVERSITY_RETRIES
+          5. StaticQuestionBank if all LLM paths exhausted
+          6. DiversityEnforcer registration on the final question
+        """
+        rid = request_id or new_request_id()
+
+        # ── Step 1: Injection scan ─────────────────────────────────────────────
+        if llm_input and llm_input.last_answer:
+            clean_answer, was_injected = self._injection.scan(llm_input.last_answer)
+            if was_injected:
+                new_messages = []
+                for msg in llm_input.messages:
+                    if hasattr(msg, "content") and llm_input.last_answer in msg.content:
+                        new_content = msg.content.replace(llm_input.last_answer, clean_answer)
+                        new_messages.append(type(msg)(content=new_content))
+                    else:
+                        new_messages.append(msg)
+                llm_input = dc_replace(llm_input, last_answer=clean_answer, messages=new_messages)
+
+        domain   = getattr(llm_input, "domain",     "")             if llm_input else ""
+        level    = getattr(llm_input, "level",       "intermediate") if llm_input else "intermediate"
+        diff_val = getattr(llm_input, "difficulty",  "medium")       if llm_input else "medium"
+        diff_str = diff_val.value if hasattr(diff_val, "value") else str(diff_val)
+
+        final_question: str | None = None
+
+        # ── Steps 2–4: Generate with diversity retries ─────────────────────────
+        for attempt in range(MAX_DIVERSITY_RETRIES + 1):
+            try:
+                chunks: list[str] = []
+                guard = StreamingWordGuard(max_words=MAX_RESPONSE_WORDS)
+
+                async for chunk in guard.wrap(
+                    super().stream_question(llm_input, request_id=rid, session_id=session_id)
+                ):
+                    chunks.append(chunk)
+
+                candidate_q = "".join(chunks).strip()
+
+                # Content policy filter
+                try:
+                    candidate_q = self._policy.filter(candidate_q, mode="interviewer")
+                except ContentPolicyFilter.ContentPolicyViolation as exc:
+                    log.warning("llm_content_policy_blocked", attempt=attempt, error=str(exc))
+                    if attempt < MAX_DIVERSITY_RETRIES:
+                        _diversity_retries.labels(result="policy_retry").inc()
+                        continue
+                    break
+
+                if not candidate_q:
+                    continue
+
+                # Diversity check
+                if session_id:
+                    too_similar, sim_score = self._diversity.is_too_similar(session_id, domain, candidate_q)
+                    if too_similar and attempt < MAX_DIVERSITY_RETRIES:
+                        _diversity_retries.labels(result="diversity_retry").inc()
+                        log.debug(
+                            "llm_diversity_retry",
+                            session_id = session_id[:8],
+                            domain     = domain,
+                            similarity = round(sim_score, 3),
+                            attempt    = attempt,
+                        )
+                        continue
+
+                final_question = candidate_q
+                _diversity_retries.labels(result="ok").inc()
+                break
+
+            except (StopAsyncIteration, Exception) as exc:
+                if attempt < MAX_DIVERSITY_RETRIES:
+                    _diversity_retries.labels(result="error_retry").inc()
+                    log.debug("llm_diversity_attempt_failed", attempt=attempt, error=str(exc))
+                    continue
+                break
+
+        # ── Step 5: Static bank fallback ───────────────────────────────────────
+        if not final_question:
+            if BANK_FALLBACK_ENABLED:
+                final_question = self._bank.get_question(
+                    session_id = session_id or "",
+                    domain     = domain,
+                    level      = level,
+                    difficulty = diff_str,
+                )
+                log.warning(
+                    "llm_bank_fallback_used",
+                    session_id = (session_id or "")[:8],
+                    domain     = domain,
+                    level      = level,
+                )
+            else:
+                raise ValueError(
+                    f"LLMNodeV2: all question generation paths exhausted for domain={domain}"
+                )
+
+        # ── Step 6: Register with diversity enforcer ───────────────────────────
+        if session_id and final_question:
+            self._diversity.register(session_id, domain, final_question)
+
+        yield final_question
+
+    async def extract_ats(self, intro_text: str, request_id: str | None = None) -> str:
+        """
+        Extended extract_ats with ATSSchemaValidator.
+        Falls back to ATSRuleExtractor on schema failure.
+        """
+        raw       = await super().extract_ats(intro_text, request_id=request_id)
+        validated = validate_ats_json(raw)
+
+        if validated is None:
+            log.warning("llm_ats_schema_fallback_triggered")
+            from app.interview.qa_controller import ATSRuleExtractor
+            rule_result = ATSRuleExtractor().extract(intro_text)
+            return json.dumps({
+                "name":      rule_result.name,
+                "domains":   rule_result.domains,
+                "level":     rule_result.level,
+                "languages": rule_result.languages,
+                "notes":     rule_result.notes,
+                "_fallback": "rule_based",
+            })
+
+        return json.dumps(validated)
+
+    def evict_session(self, session_id: str) -> None:
+        """Clean up session-specific in-process state. Call on session close."""
+        self._diversity.evict_session(session_id)
+        self._bank.evict_session(session_id)
+
+    async def health(self) -> ServiceHealthState:
+        base = await super().health()
+        base.extra.update({
+            "injection_detection": INJECTION_BLOCK,
+            "content_policy":      CONTENT_POLICY_BLOCK,
+            "diversity_threshold": DIVERSITY_THRESHOLD,
+            "bank_fallback":       BANK_FALLBACK_ENABLED,
+            "eval_model":          EVAL_MODEL,
+            "bank_domains":        list(self._bank._BANK.keys()),
+        })
+        return base
 
     async def close(self) -> None:
-        if self._redis is not None:
-            await self._redis.aclose()
-            self._redis = None
+        await super().close()
+        log.info("llm_node_v2_closed")
 
 
-# ── remote LLM client ─────────────────────────────────────────────────────────
-
+# ── remote LLM client ──────────────────────────────────────────────────────────
 
 class RemoteLLMClient:
     """
-    Calls a remote LLM microservice over HTTPS. Satisfies LLMNodeProtocol
-    so VoiceGraph can swap between local and remote with zero graph changes.
+    HTTP client implementing LLMNodeProtocol against a remote LLM service.
 
-    The remote service is expected to expose:
-      POST /generate              → {"response": str, "model_used": str, ...}
-      GET  /stream?prompt=...     → text/event-stream of token chunks
-      GET  /health                → {"healthy": bool, "circuit_state": str, ...}
-
-    OTel TraceContext and LatencyBudget are injected as HTTP headers on every
-    outbound request so distributed traces stay stitched and the remote service
-    can honour the remaining SLA budget.
+    Remote service expected endpoints:
+      POST /stream_question  → SSE stream: interview question tokens
+      POST /extract_ats      → JSON: {"result": "<json string>"}
+      POST /stream_messages  → SSE stream: evaluation/raw tokens
+      GET  /health           → {"healthy": bool, ...}
     """
 
     def __init__(
         self,
-        base_url: str = LLM_SERVICE_URL,
-        api_key: str = LLM_SERVICE_API_KEY,
-        timeout: float = LLM_SERVICE_TIMEOUT,
+        base_url: str   = LLM_SERVICE_URL,
+        api_key:  str   = LLM_SERVICE_API_KEY,
+        timeout:  float = LLM_SERVICE_TIMEOUT,
     ) -> None:
-        if not base_url:
-            raise ValueError("LLM_SERVICE_URL must be set to use RemoteLLMClient.")
         self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout = timeout
-        self._breaker = CircuitBreaker(name="llm:remote")
+        self._api_key  = api_key
+        self._timeout  = timeout
+        self._http     = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
+        self._breaker  = CircuitBreaker(name="llm.remote")
         self._inflight = 0
 
-        self._http = httpx.AsyncClient(
-            base_url=self._base_url,
-            timeout=timeout,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-        )
+    def _headers(self) -> dict[str, str]:
+        h: dict[str, str] = {"Content-Type": "application/json"}
+        if self._api_key:
+            h["Authorization"] = f"Bearer {self._api_key}"
+        inject_trace_headers(h)
+        return h
 
-    def _request_headers(self) -> dict[str, str]:  # noqa
-        """Merge OTel trace headers + remaining latency budget."""
-        headers: dict[str, str] = {}
-        inject_trace_headers(headers)
-        budget = LatencyBudget.current()
-        if budget:
-            headers["X-Latency-Budget-Ms"] = budget.as_header_value()
-            headers["X-Request-Id"] = current_request_id()
-        return headers
-
-    async def generate(
-        self, prompt: str, request_id: str | None = None
-    ) -> dict[str, Any]:
-        rid = request_id or new_request_id()
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt must not be empty.")
-
-        budget = LatencyBudget.current()
-        if budget:
-            budget.check(stage="remote_llm.generate")
-
-        headers = self._request_headers()
-        headers["X-Request-Id"] = rid
-
-        with tracer.start_as_current_span("llm.remote.generate") as span:
-            span.set_attribute("request_id", rid)
+    async def stream_question(
+        self,
+        llm_input:  LLMInterviewInput,
+        request_id: str | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[str]:
+        rid     = request_id or new_request_id()
+        headers = {**self._headers(), "X-Request-Id": rid, "Accept": "text/event-stream"}
+        payload = {
+            "domain":          llm_input.domain,
+            "domain_label":    llm_input.domain_label,
+            "level":           llm_input.level,
+            "last_question":   llm_input.last_question,
+            "last_answer":     llm_input.last_answer,
+            "is_first":        llm_input.is_first_in_domain,
+            "domain_switched": llm_input.domain_switched,
+            "prev_domain":     llm_input.prev_domain_label,
+            "q_index":         llm_input.q_index_in_domain,
+            "request_id":      rid,
+        }
+        with tracer.start_as_current_span("llm.remote.stream_question"):
             self._inflight += 1
-            t0 = time.monotonic()
             try:
-
-                async def _call() -> dict[str, Any]:
-                    resp = await self._http.post(
-                        "/generate",
-                        json={"prompt": prompt, "request_id": rid},
-                        headers=headers,
-                    )
+                async with self._http.stream("POST", "/stream_question", json=payload, headers=headers) as resp:
                     resp.raise_for_status()
-                    return resp.json()
-
-                result = await self._breaker.call(
-                    backoff_retry,
-                    _call,
-                    attempts=3,
-                    base_delay=1.0,
-                    exceptions=(Exception,),
-                )
-                span.set_attribute("latency_s", round(time.monotonic() - t0, 3))
-                log.info(
-                    "remote_llm_generate_ok",
-                    request_id=rid,
-                    latency_s=round(time.monotonic() - t0, 3),
-                )
-                return result
-
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        yield data
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                span.set_status(StatusCode.ERROR, str(exc))
-                log.error("remote_llm_generate_error", request_id=rid, error=str(exc))
+                log.error("remote_llm_stream_question_error", request_id=rid, error=str(exc))
                 raise
             finally:
                 self._inflight -= 1
 
-    async def stream(
-        self, prompt: str, request_id: str | None = None
+    async def extract_ats(self, intro_text: str, request_id: str | None = None) -> str:
+        rid     = request_id or new_request_id()
+        headers = {**self._headers(), "X-Request-Id": rid}
+        payload = {"intro_text": intro_text, "request_id": rid}
+        with tracer.start_as_current_span("llm.remote.extract_ats"):
+            self._inflight += 1
+            try:
+                resp = await self._http.post("/extract_ats", json=payload, headers=headers)
+                resp.raise_for_status()
+                return resp.json().get("result", "{}")
+            except Exception as exc:
+                log.error("remote_llm_extract_ats_error", request_id=rid, error=str(exc))
+                raise
+            finally:
+                self._inflight -= 1
+
+    async def stream_messages(
+        self,
+        messages:   list,
+        request_id: str | None = None,
     ) -> AsyncIterator[str]:
-        """
-        Stream tokens from the remote service via SSE (text/event-stream).
-
-        Each SSE event contains one token chunk. The stream ends with a
-        special [DONE] event that the client strips before yielding.
-        """
-        rid = request_id or new_request_id()
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt must not be empty.")
-
-        budget = LatencyBudget.current()
-        if budget:
-            budget.check(stage="remote_llm.stream")
-
-        headers = self._request_headers()
-        headers["X-Request-Id"] = rid
-        headers["Accept"] = "text/event-stream"
-
-        with tracer.start_as_current_span("llm.remote.stream") as span:
-            span.set_attribute("request_id", rid)
-
-            async with bulkheads.acquire("llm.stream"):
-                self._inflight += 1
-                t0 = time.monotonic()
-                first_token = True
-                try:
-                    async with self._http.stream(
-                        "POST",
-                        "/stream",
-                        json={"prompt": prompt, "request_id": rid},
-                        headers=headers,
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                break
-
-                            # Enforce SLA before emitting token
-                            if budget:
-                                try:
-                                    budget.check(stage="remote_llm.stream.before_yield")
-                                except LatencyBudgetExceeded:
-                                    _budget_exceeded.inc()
-                                    raise
-
-                            if first_token:
-                                _ttft.labels(model="remote").observe(
-                                    time.monotonic() - t0
-                                )
-                                first_token = False
-
-                            yield data
-
-                    span.set_attribute("latency_s", round(time.monotonic() - t0, 3))
-
-                except LatencyBudgetExceeded:
-                    _budget_exceeded.inc()
-                    log.warning("remote_llm_stream_budget_exceeded", request_id=rid)
-                    raise
-
-                except asyncio.CancelledError:
-                    log.warning("remote_llm_stream_cancelled", request_id=rid)
-                    raise
-
-                except Exception as exc:
-                    span.set_status(StatusCode.ERROR, str(exc))
-                    log.error("remote_llm_stream_error", request_id=rid, error=str(exc))
-                    raise
-
-                finally:
-                    self._inflight -= 1
+        rid      = request_id or new_request_id()
+        headers  = {**self._headers(), "X-Request-Id": rid, "Accept": "text/event-stream"}
+        role_map = {"SystemMessage": "system", "HumanMessage": "user", "AIMessage": "assistant"}
+        payload  = {
+            "messages": [
+                {"role": role_map.get(type(m).__name__, "user"), "content": getattr(m, "content", "")}
+                for m in messages
+            ],
+            "request_id": rid,
+        }
+        with tracer.start_as_current_span("llm.remote.stream_messages"):
+            self._inflight += 1
+            try:
+                async with self._http.stream("POST", "/stream_messages", json=payload, headers=headers) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        yield data
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("remote_llm_stream_messages_error", request_id=rid, error=str(exc))
+                raise
+            finally:
+                self._inflight -= 1
 
     async def health(self) -> ServiceHealthState:
         try:
             resp = await self._http.get("/health", timeout=5.0)
             data = resp.json()
             return ServiceHealthState(
-                service="llm.remote",
-                healthy=data.get("healthy", False),
-                circuit_state=self._breaker.state,
-                inflight=self._inflight,
+                service       = "llm.remote",
+                healthy       = data.get("healthy", False),
+                circuit_state = self._breaker.state,
+                inflight      = self._inflight,
             )
         except Exception as exc:
             return ServiceHealthState(
-                service="llm.remote",
-                healthy=False,
-                circuit_state=self._breaker.state,
-                inflight=self._inflight,
-                error=str(exc),
+                service       = "llm.remote",
+                healthy       = False,
+                circuit_state = self._breaker.state,
+                inflight      = self._inflight,
+                error         = str(exc),
             )
 
     async def close(self) -> None:
         await self._http.aclose()
 
 
-# ── node factory ──────────────────────────────────────────────────────────────
+# ── SSE streaming utilities ────────────────────────────────────────────────────
 
+class SSEEncoder:
+    """
+    Encodes streaming token chunks into Server-Sent Events format.
+    Used by RemoteLLMClient-serving endpoints, not by the local LLMNode.
+    """
+
+    @staticmethod
+    def encode(chunk: str) -> str:
+        return f"data: {chunk.replace(chr(10), chr(92) + 'n')}\n\n"
+
+    @staticmethod
+    def done() -> str:
+        return "data: [DONE]\n\n"
+
+    @staticmethod
+    def error(message: str) -> str:
+        return f"event: error\ndata: {json.dumps({'error': message})}\n\n"
+
+    @staticmethod
+    def decode(line: str) -> str | None:
+        if not line.startswith("data:"):
+            return None
+        data = line[5:].strip()
+        if data == "[DONE]":
+            return None
+        return data.replace("\\n", "\n")
+
+
+class SSEAccumulator:
+    """Accumulates SSE token stream chunks into a complete response string."""
+
+    def __init__(self) -> None:
+        self._chunks: list[str] = []
+        self._lock = asyncio.Lock()
+
+    async def push(self, chunk: str) -> None:
+        async with self._lock:
+            self._chunks.append(chunk)
+
+    async def get_full(self) -> str:
+        async with self._lock:
+            return "".join(self._chunks)
+
+    def get_full_sync(self) -> str:
+        return "".join(self._chunks)
+
+    def reset(self) -> None:
+        self._chunks.clear()
+
+    @property
+    def char_count(self) -> int:
+        return sum(len(c) for c in self._chunks)
+
+
+# ── voice_graph convenience helpers ───────────────────────────────────────────
+
+async def generate_interviewer_question(
+    *,
+    llm_input:  LLMInterviewInput,
+    session_id: str,
+    request_id: str = "",
+) -> str:
+    """
+    Single entry point for voice_graph.node_llm to generate the next question.
+    Returns the final validated question string (never a raw stream).
+
+    Usage:
+        question = await generate_interviewer_question(
+            llm_input  = llm_input,
+            session_id = state["session_id"],
+            request_id = state["request_id"],
+        )
+    """
+    rid    = request_id or new_request_id()
+    chunks = []
+    async for chunk in llm_node.stream_question(llm_input, request_id=rid, session_id=session_id):
+        chunks.append(chunk)
+    return "".join(chunks).strip()
+
+
+async def extract_and_validate_intro(
+    intro_text: str,
+    request_id: str = "",
+) -> dict | None:
+    """
+    Single entry point for voice_graph.node_ats to extract intro data.
+    Returns validated dict or None if extraction failed completely.
+    """
+    try:
+        raw = await llm_node.extract_ats(intro_text, request_id=request_id or None)
+        return validate_ats_json(raw)
+    except Exception as exc:
+        log.error("llm_ats_extract_failed", error=str(exc))
+        return None
+
+
+# ── factory and module-level singletons ───────────────────────────────────────
 
 def get_llm_node() -> LLMNodeProtocol:
     """
-    Return a RemoteLLMClient if LLM_SERVICE_URL is configured,
-    otherwise the local LLMNode.
-
-    This is the only import VoiceGraph needs — it never references the
-    concrete classes directly, so local ↔ distributed switching is a
-    single env-var change with zero code changes.
+    Factory. Returns RemoteLLMClient for distributed deployments,
+    LLMNodeV2 for local/monolith deployments.
     """
     if LLM_SERVICE_URL:
         log.info("llm_using_remote_client", url=LLM_SERVICE_URL)
-        return RemoteLLMClient()
-    log.info("llm_using_local_node", model=PRIMARY_MODEL)
-    return LLMNode()
+        return cast(LLMNodeProtocol, RemoteLLMClient())
+    log.info("llm_using_local_node_v2", primary=PRIMARY_MODEL, ats=ATS_MODEL)
+    return cast(LLMNodeProtocol, LLMNodeV2())
 
-
-# ── module-level singleton (backward-compatible) ──────────────────────────────
 
 llm_node: LLMNodeProtocol = get_llm_node()
 
-if __name__ == "__main__":
-    import asyncio
-
-    async def _smoke():
-        node = get_llm_node()
-        r = await node.generate("Explain binary search in one sentence.")
-        print("Response:", r["response"])
-        print("Model:", r["model_used"], "| Cached:", r["cached"])
-
-        print("\nStreaming:")
-        async for tok in node.stream("What is a hash map?"):
-            print(tok, end="", flush=True)
-        print()
-
-        print("\nHealth:", await node.health())
-        await node.close()
-
-    asyncio.run(_smoke())
+# Convenience references for eval_engine.py and offline tooling
+eval_llm  = getattr(llm_node, "eval_mode", None)
+batch_ats = getattr(llm_node, "batch_ats", None)

@@ -242,9 +242,10 @@ def _dispatch(audio_path: str) -> None:
                 except Exception as exc:
                     _pipeline_errors.inc()
                     ControllerEmitter.pipeline_error(
+                        session_id=_session_id or "",
                         request_id=rid,
                         error=str(exc),
-                        exc_type=type(exc).__name__,
+                        error_type=type(exc).__name__,
                     )
                     log.error(
                         "controller_pipeline_error", request_id=rid, error=str(exc)
@@ -275,7 +276,7 @@ def _interrupt(*, source: str) -> None:
     if rid:
         voice_graph.cancel(rid, reason="interrupt", source=source)
         _sessions_interrupted.inc()
-        ControllerEmitter.interrupt(request_id=rid, source=source)
+        ControllerEmitter.interrupt(session_id=_session_id or "", request_id=rid)
         log.info("controller_interrupt", request_id=rid, source=source)
 
     stop_all()
@@ -298,7 +299,7 @@ def _shutdown(*, source: str) -> None:
       6. thread join — wait for the loop thread to exit
     """
     log.info("controller_shutdown_start", source=source)
-    ControllerEmitter.shutdown(source=source, session_id=_session_id or "")
+    ControllerEmitter.shutdown(reason=source)
     _interrupt(source=source)
 
     time.sleep(LOOP_DRAIN_S)
@@ -466,7 +467,10 @@ def listen_loop() -> None:
                 time.sleep(INTERRUPT_DRAIN_S)
                 _interrupt_flag.clear()
 
-                ControllerEmitter.ptt_press()
+                ControllerEmitter.ptt_press(
+                    session_id=_session_id or "",
+                    ptt_key=PTT_KEY,
+                )
                 log.info("controller_recording_start")
 
                 t_start = time.monotonic()
@@ -478,7 +482,11 @@ def listen_loop() -> None:
 
                 if audio_path:
                     _sessions_started.inc()
-                    ControllerEmitter.ptt_release(duration_s=round(duration, 2))
+                    ControllerEmitter.ptt_release(
+                        session_id=_session_id or "",
+                        ptt_key=PTT_KEY,
+                        recording_s=round(duration, 2),
+                    )
                     log.info(
                         "controller_recording_done",
                         duration_s=round(duration, 2),
@@ -487,7 +495,10 @@ def listen_loop() -> None:
                     _dispatch(audio_path)
                 else:
                     _empty_recordings.inc()
-                    ControllerEmitter.empty_recording(duration_s=round(duration, 2))
+                    ControllerEmitter.empty_recording(
+                        session_id=_session_id or "",
+                        recording_s=round(duration, 2),
+                    )
                     log.warning(
                         "controller_recording_empty", duration_s=round(duration, 2)
                     )
