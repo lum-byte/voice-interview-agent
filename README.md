@@ -2014,15 +2014,15 @@ Jitter prevents retry storms when multiple callers all hit an API limit simultan
 
 ### LLM
 
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_MODEL` | `gpt-4o-mini` | Primary model |
-| `LLM_FALLBACK_MODEL` | `gpt-3.5-turbo` | Fallback when primary circuit opens |
-| `LLM_TEMPERATURE` | `0.7` | Sampling temperature (0.0–2.0) |
-| `LLM_MAX_CONCURRENT` | `50` | Max simultaneous LLM calls |
-| `LLM_RATE_PER_SEC` | `20.0` | Sustained calls/sec |
-| `LLM_RATE_BURST` | `40.0` | Burst headroom |
-| `LLM_CACHE_TTL` | `3600` | Redis cache TTL in seconds |
+| Variable | Default      | Description |
+|---|--------------|---|
+| `LLM_MODEL` | `gpt-5-mini` | Primary model |
+| `LLM_FALLBACK_MODEL` | `gpt-5-nano` | Fallback when primary circuit opens |
+| `LLM_TEMPERATURE` | `0.7`        | Sampling temperature (0.0–2.0) |
+| `LLM_MAX_CONCURRENT` | `50`         | Max simultaneous LLM calls |
+| `LLM_RATE_PER_SEC` | `20.0`       | Sustained calls/sec |
+| `LLM_RATE_BURST` | `40.0`       | Burst headroom |
+| `LLM_CACHE_TTL` | `3600`       | Redis cache TTL in seconds |
 
 ### Redis
 

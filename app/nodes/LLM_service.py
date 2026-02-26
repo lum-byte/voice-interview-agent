@@ -117,7 +117,6 @@ from app.common.shared import (
     bulkheads,
     current_request_id,  # noqa
     degraded_mode,
-    get_logger,
     get_meter,
     get_tracer,
     inject_trace_headers,
@@ -135,7 +134,7 @@ from app.interview.qa_controller import (
     ATS_USER_TEMPLATE,
     DOMAIN_REGISTRY,  # noqa
 )
-
+from app.monitoring.observability import get_logger
 load_dotenv()
 
 log    = get_logger(__name__)
@@ -148,15 +147,15 @@ meter  = get_meter(__name__)
 OPENAI_API_KEY: str = os.environ["OPENAI_API_KEY"]
 
 # Question engine model — fast and instruction-following
-PRIMARY_MODEL:  str = os.getenv("LLM_MODEL",          "gpt-4o-mini")
-FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "gpt-3.5-turbo")
+PRIMARY_MODEL:  str = os.getenv("LLM_MODEL",          "gpt-5-mini")
+FALLBACK_MODEL: str = os.getenv("LLM_FALLBACK_MODEL", "gpt-5-nano")
 
 # ATS extraction model — json_object mode required
-ATS_MODEL:    str = os.getenv("ATS_MODEL",          "gpt-4o-mini")
-ATS_FALLBACK: str = os.getenv("ATS_FALLBACK_MODEL", "gpt-3.5-turbo")
+ATS_MODEL:    str = os.getenv("ATS_MODEL",          "gpt-5-mini")
+ATS_FALLBACK: str = os.getenv("ATS_FALLBACK_MODEL", "gpt-5-nano")
 
 # Eval model — wider token budget, higher temperature, internal only
-EVAL_MODEL:       str   = os.getenv("LLM_EVAL_MODEL",        "gpt-4o")
+EVAL_MODEL:       str   = os.getenv("LLM_EVAL_MODEL",        "gpt-5.2")
 EVAL_TEMPERATURE: float = float(os.getenv("LLM_EVAL_TEMPERATURE", "0.2"))
 EVAL_MAX_TOKENS:  int   = int(os.getenv("LLM_EVAL_MAX_TOKENS",  "1500"))
 
@@ -285,8 +284,8 @@ class _ResponseValidator:
     If repair fails, raises ValueError so the caller can fall back gracefully.
     """
 
-    _BULLET_PATTERN   = re.compile(r"^[\s]*[-•*]\s",  re.MULTILINE)
-    _NUMBERED_PATTERN = re.compile(r"^[\s]*\d+[.)]\s", re.MULTILINE)
+    _BULLET_PATTERN   = re.compile(r"^[\s]*[-•*]\s",  re.MULTILINE) # noqa
+    _NUMBERED_PATTERN = re.compile(r"^[\s]*\d+[.)]\s", re.MULTILINE) # noqa
     _HEADER_PATTERN   = re.compile(r"^#{1,6}\s",       re.MULTILINE)
     _MULTI_Q_PATTERN  = re.compile(r"\?.*\?",          re.DOTALL)
 
@@ -335,7 +334,7 @@ class _ResponseValidator:
         text = re.sub(r"`[^`]+`", "", text)
         return text.strip()
 
-    def _extract_last_question(self, text: str) -> str:
+    def _extract_last_question(self, text: str) -> str: # noqa
         sentences = re.split(r"(?<=[.!?])\s+", text)
         questions = [i for i, s in enumerate(sentences) if s.strip().endswith("?")]
         if questions:
@@ -343,7 +342,7 @@ class _ResponseValidator:
             return " ".join(sentences[i] for i in sorted(keep_indices) if i < len(sentences))
         return text
 
-    def _truncate_to_question(self, text: str) -> str:
+    def _truncate_to_question(self, text: str) -> str: # noqa
         sentences = re.split(r"(?<=[.!?])\s+", text)
         result    = []
         for s in sentences:
@@ -452,7 +451,7 @@ class _SharedRedis:
             if r is None:
                 return True
             return bool(await self._breaker.call(r.set, lock_key, "1", nx=True, ex=STAMPEDE_LOCK_TTL))
-        except Exception:
+        except Exception: # noqa
             return True
 
     async def release_lock(self, lock_key: str) -> None:
@@ -460,7 +459,7 @@ class _SharedRedis:
             r = await self._conn()
             if r:
                 await self._breaker.call(r.delete, lock_key)
-        except Exception:
+        except Exception: # noqa
             pass
 
     async def poll_for_cached(self, key: str) -> str | None:
@@ -475,7 +474,7 @@ class _SharedRedis:
         if self._redis:
             try:
                 await self._redis.aclose()
-            except Exception:
+            except Exception: # noqa
                 pass
             self._redis = None
 
@@ -497,7 +496,7 @@ class _ChainFactory:
             self._chains[key] = self._build(model, mode, streaming)
         return self._chains[key]
 
-    def _build(self, model: str, mode: LLMMode, streaming: bool) -> Any:
+    def _build(self, model: str, mode: LLMMode, streaming: bool) -> Any: # noqa
         common = dict(
             model       = model,
             api_key     = OPENAI_API_KEY,
@@ -866,11 +865,11 @@ class _LLMWarmup:
             SystemMessage(content="You are a terse assistant."),
             HumanMessage(content="Reply with exactly: ready"),
         ]
-        models_to_warm = list({node._primary, node._fallback, node._ats_model})
+        models_to_warm = list({node._primary, node._fallback, node._ats_model}) # noqa
         for model in models_to_warm:
             t0 = time.monotonic()
             try:
-                chain   = node._chains.get(model, LLMMode.INTERVIEWER, streaming=False)
+                chain   = node._chains.get(model, LLMMode.INTERVIEWER, streaming=False) # noqa
                 result: str = await asyncio.wait_for(chain.ainvoke(probe_messages), timeout=8.0)
                 latency = time.monotonic() - t0
                 _latency.labels(model=model, mode="warmup").observe(latency)
@@ -1150,7 +1149,7 @@ class LLMNode:
                     _active.labels(mode="interviewer").dec()
                     self._inflight["interviewer"] -= 1
 
-    def _validate_messages(
+    def _validate_messages( # noqa
             self,
             messages: list,
             llm_input: LLMInterviewInput,
@@ -1279,8 +1278,8 @@ class LLMNode:
                         got_lock = True
 
                     model_used  = self._ats_model
-                    primary_err: Exception | None = None
-                    text        = ""
+                    primary_err: Exception | None = None # noqa
+                    text        = "" # noqa
 
                     try:
                         text = await self._batch_model(self._ats_model, messages, LLMMode.ATS, rid)
@@ -1469,7 +1468,7 @@ class LLMNode:
             if hasattr(iterator, "aclose"):
                 try:
                     await iterator.aclose()
-                except Exception:
+                except Exception: # noqa
                     pass
 
     async def _batch_model(
@@ -1477,7 +1476,7 @@ class LLMNode:
         model:      str,
         messages:   list,
         mode:       LLMMode,
-        request_id: str,
+        request_id: str, # noqa
     ) -> str:
         """Batch (non-streaming) model call. Used ONLY by ATSMode."""
         counter = _TokenCounter(model)
@@ -1508,11 +1507,11 @@ class LLMNode:
         cb_state   = iv_breaker.state if iv_breaker else "UNKNOWN"
         redis_ok   = False
         try:
-            r = await self._redis._conn()
+            r = await self._redis._conn() # noqa
             if r:
                 await r.ping()
                 redis_ok = True
-        except Exception:
+        except Exception: # noqa
             pass
 
         return ServiceHealthState(
@@ -1707,7 +1706,7 @@ class QuestionDiversityEnforcer:
         text   = re.sub(r"\s+", " ", text.lower().strip())
         return Counter(text[i: i + self._n] for i in range(len(text) - self._n + 1))
 
-    def _cosine(self, a: Counter, b: Counter) -> float:
+    def _cosine(self, a: Counter, b: Counter) -> float: # noqa
         if not a or not b:
             return 0.0
         intersection = sum((a & b).values())
@@ -2041,7 +2040,11 @@ class StaticQuestionBank:
             if q:
                 _bank_fallbacks.labels(domain=domain, level=level).inc()
                 return q
-        generic_idx = len(self._served[session_id]) % len(self._GENERIC_QUESTIONS)
+        # Count how many generic questions have already been served this session
+        # so the index advances on each call rather than being stuck at the same slot.
+        served_generics = sum(1 for k in self._served[session_id] if len(k) == 4 and k[0] == "__generic__")
+        generic_idx = served_generics % len(self._GENERIC_QUESTIONS)
+        self._served[session_id].add(("__generic__", "", "", served_generics))
         _bank_fallbacks.labels(domain="generic", level="any").inc()
         return self._GENERIC_QUESTIONS[generic_idx]
 
@@ -2079,7 +2082,7 @@ if _PYDANTIC_AVAILABLE:
             "beginner", "intermediate", "advanced"
         })
 
-        @field_validator("domains")
+        @field_validator("domains") # noqa
         @classmethod
         def validate_domains(cls, v: list[str]) -> list[str]:
             valid = [d for d in v if d in cls._VALID_DOMAINS]
@@ -2087,12 +2090,12 @@ if _PYDANTIC_AVAILABLE:
                 raise ValueError(f"No valid domains in: {v}")
             return valid
 
-        @field_validator("level")
+        @field_validator("level") # noqa
         @classmethod
         def validate_level(cls, v: str) -> str:
             return v if v in cls._VALID_LEVELS else "intermediate"
 
-        @field_validator("name")
+        @field_validator("name") # noqa
         @classmethod
         def truncate_name(cls, v: str) -> str:
             return v[:64]
@@ -2147,7 +2150,7 @@ class EvalModeLLM:
             async with self._sem:
                 _eval_calls.labels(status="attempt").inc()
                 try:
-                    chain  = self._node._chains.get(EVAL_MODEL, LLMMode.EVAL, streaming=False)
+                    chain  = self._node._chains.get(EVAL_MODEL, LLMMode.EVAL, streaming=False) # noqa
                     result = await self._breaker.call(chain.ainvoke, messages)
 
                     latency = time.monotonic() - t0
@@ -2229,7 +2232,7 @@ class BatchATSProcessor:
                     if on_progress:
                         try:
                             on_progress(done, total)
-                        except Exception:
+                        except Exception: # noqa
                             pass
 
         await asyncio.gather(*(process_one(i, item) for i, item in enumerate(items)))
@@ -2422,7 +2425,7 @@ class LLMNodeV2(LLMNode):
             "diversity_threshold": DIVERSITY_THRESHOLD,
             "bank_fallback":       BANK_FALLBACK_ENABLED,
             "eval_model":          EVAL_MODEL,
-            "bank_domains":        list(self._bank._BANK.keys()),
+            "bank_domains":        list(self._bank._BANK.keys()), # noqa
         })
         return base
 
@@ -2431,18 +2434,80 @@ class LLMNodeV2(LLMNode):
         log.info("llm_node_v2_closed")
 
 
-# ── remote LLM client ──────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# REMOTE LLM CLIENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
 
 class RemoteLLMClient:
     """
     HTTP client implementing LLMNodeProtocol against a remote LLM service.
+    Drop-in replacement for LLMNodeV2 in any voice_graph configuration.
 
-    Remote service expected endpoints:
-      POST /stream_question  → SSE stream: interview question tokens
+    Expected remote endpoints
+    ─────────────────────────
+      POST /stream_question  → SSE stream of interview question tokens
       POST /extract_ats      → JSON: {"result": "<json string>"}
-      POST /stream_messages  → SSE stream: evaluation/raw tokens
-      GET  /health           → {"healthy": bool, ...}
+      POST /stream_messages  → SSE stream of evaluation/raw tokens
+      GET  /health           → {"healthy": bool, "circuit_state": str, ...}
+
+    SSE framing
+    ───────────
+    All streaming endpoints use standard SSE framing:
+      data: <token>\n\n   — yield this token
+      data: [DONE]\n\n    — stream complete
+      event: error\n      — remote signalled an error; logged and raised
+
+    Observability
+    ─────────────
+    Every public method participates in the module-level Prometheus counters
+    (_req_total, _latency, _ttft, _budget_exc, _active, _cb_open) so
+    dashboards and alerts are identical whether the node is local or remote.
+    OTel spans are opened per call and trace headers propagated outbound
+    so the remote service joins the same distributed trace as voice_graph.
+
+    Latency budget
+    ──────────────
+    LatencyBudget.current() is checked at entry to every streaming method.
+    The remaining budget is forwarded as X-Latency-Budget-Ms so the remote
+    can self-abort rather than producing a result voice_graph will discard.
+    Per-token budget checks run inside every streaming loop so mid-stream
+    SLA violations abort immediately rather than waiting for [DONE].
+
+    Resilience
+    ──────────
+    Single CircuitBreaker ("llm.remote") wraps all three methods — a remote
+    LLM outage trips the breaker regardless of which method surfaced the
+    failure.  All streaming calls use backoff_retry (2 attempts, 1.0 s base)
+    inside the breaker so transient 5xx errors are retried before tripping.
+    extract_ats() uses 3 attempts with 1.5 s base (mirrors local ATSMode).
+
+    Cancellation
+    ────────────
+    asyncio.CancelledError is always re-raised from all call sites.
+    GeneratorExit is caught inside streaming yield sites and logged at
+    DEBUG — not as an error — so caller drop-out cleans up silently.
+
+    evict_session
+    ─────────────
+    No-op with a debug log — remote manages its own session state.
+    Callers that call evict_session() on an LLMNodeProtocol reference work
+    correctly regardless of which implementation is behind the protocol.
+
+    warmup / health probe stubs
+    ───────────────────────────
+    warmup(), start_health_probe(), stop_health_probe() are provided as
+    no-ops so the voice_graph on_startup / on_shutdown hooks work without
+    isinstance checks when a RemoteLLMClient is injected.
+
+    Env config (resolved at module load)
+    ─────────────────────────────────────
+      LLM_SERVICE_URL      required — base URL of the remote LLM service
+      LLM_SERVICE_API_KEY  optional — Bearer token
+      LLM_SERVICE_TIMEOUT  optional — per-request timeout in seconds (default 60)
     """
+
+    # ── construction ──────────────────────────────────────────────────────────
 
     def __init__(
         self,
@@ -2450,28 +2515,155 @@ class RemoteLLMClient:
         api_key:  str   = LLM_SERVICE_API_KEY,
         timeout:  float = LLM_SERVICE_TIMEOUT,
     ) -> None:
+        if not base_url:
+            raise ValueError("LLM_SERVICE_URL must be set to use RemoteLLMClient.")
+
         self._base_url = base_url.rstrip("/")
         self._api_key  = api_key
         self._timeout  = timeout
-        self._http     = httpx.AsyncClient(base_url=self._base_url, timeout=self._timeout)
         self._breaker  = CircuitBreaker(name="llm.remote")
-        self._inflight = 0
 
-    def _headers(self) -> dict[str, str]:
-        h: dict[str, str] = {"Content-Type": "application/json"}
-        if self._api_key:
-            h["Authorization"] = f"Bearer {self._api_key}"
-        inject_trace_headers(h)
-        return h
+        # Per-mode inflight counters — mirroring LLMNode._inflight dict so
+        # health() can report the same granularity.
+        self._inflight: dict[str, int] = {
+            "interviewer": 0,
+            "ats":         0,
+            "eval":        0,
+        }
+
+        # Auth baked into the client so it is never omitted per-call.
+        base_headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            base_headers["Authorization"] = f"Bearer {api_key}"
+
+        self._http = httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=self._timeout,
+            headers=base_headers,
+            http2=True,
+        )
+
+    # ── internal helpers ──────────────────────────────────────────────────────
+
+    def _request_headers(self, rid: str, accept_sse: bool = False) -> dict[str, str]: # noqa
+        """
+        Build per-request headers.
+
+        Injects:
+          X-Request-Id          — propagated to remote for correlated logging
+          X-Latency-Budget-Ms   — remaining SLA; remote uses this to self-abort
+          Accept                — "text/event-stream" for SSE endpoints
+          OTel trace headers    — remote joins the same distributed trace
+        """
+        headers: dict[str, str] = {"X-Request-Id": rid}
+        if accept_sse:
+            headers["Accept"] = "text/event-stream"
+        inject_trace_headers(headers)
+
+        budget = LatencyBudget.current()
+        if budget:
+            headers["X-Latency-Budget-Ms"] = budget.as_header_value()
+
+        return headers
+
+    def _check_budget(self, stage: str) -> None: # noqa
+        """Raise LatencyBudgetExceeded if the pipeline SLA is already blown."""
+        budget = LatencyBudget.current()
+        if budget:
+            budget.check(stage=stage)
+
+    def _parse_sse_line(self, raw_line: str) -> str | None: # noqa
+        """
+        Parse a single SSE line.
+
+        Returns:
+          token string   — for "data: <token>" lines
+          None           — for blank lines, "data: [DONE]", and event lines
+        Raises:
+          RuntimeError   — for "event: error" lines (remote signalled failure)
+        """
+        line = raw_line.strip()
+        if not line:
+            return None
+
+        if line.startswith("event:"):
+            event = line[len("event:"):].strip()
+            if event == "error":
+                raise RuntimeError("Remote LLM service signalled an error event")
+            return None
+
+        if not line.startswith("data:"):
+            return None
+
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return None
+
+        # Unescape newlines encoded by SSEEncoder.encode()
+        return data.replace("\\n", "\n")
+
+    def _serialize_messages(self, messages: list) -> list[dict[str, str]]: # noqa
+        """
+        Serialize LangChain message objects into plain dicts for JSON transport.
+
+        Handles SystemMessage, HumanMessage, AIMessage by type name.
+        Unknown types fall back to role "user" with a warning so the stream
+        is never silently dropped due to an unexpected message type.
+        """
+        role_map = {
+            "SystemMessage": "system",
+            "HumanMessage":  "user",
+            "AIMessage":     "assistant",
+        }
+        serialised = []
+        for m in messages:
+            role    = role_map.get(type(m).__name__, "user")
+            content = getattr(m, "content", "")
+            if role == "user" and type(m).__name__ not in role_map:
+                log.warning(
+                    "remote_llm_unknown_message_type",
+                    type=type(m).__name__,
+                    content_preview=str(content)[:60],
+                )
+            serialised.append({"role": role, "content": content})
+        return serialised
+
+    # ── stream_question ───────────────────────────────────────────────────────
 
     async def stream_question(
         self,
         llm_input:  LLMInterviewInput,
         request_id: str | None = None,
-        session_id: str | None = None,
+        session_id: str | None = None,  # noqa — forwarded to remote
     ) -> AsyncIterator[str]:
-        rid     = request_id or new_request_id()
-        headers = {**self._headers(), "X-Request-Id": rid, "Accept": "text/event-stream"}
+        """
+        POST /stream_question — SSE stream of interview question tokens.
+
+        Mirrors LLMNode.stream_question() latency-budget behaviour:
+          1. Budget check at entry — abort if SLA already blown
+          2. Per-token budget check — abort mid-stream if SLA expires
+
+        The full LLMInterviewInput is serialised to the remote so it can
+        apply its own interviewer mode logic (validation, fallback bank,
+        diversity enforcement).  Callers receive the same validated token
+        stream they would get from LLMNode.
+
+        Raises:
+          LatencyBudgetExceeded  — SLA blown at entry or mid-stream
+          asyncio.CancelledError — task was cancelled; always re-raised
+          RuntimeError           — remote signalled an error event
+          httpx.HTTPStatusError  — non-2xx from remote
+        """
+        rid = request_id or new_request_id()
+
+        try:
+            self._check_budget("remote_llm.stream_question")
+        except LatencyBudgetExceeded:
+            _budget_exc.inc()
+            log.warning("remote_llm_stream_question_budget_exceeded_entry", request_id=rid)
+            raise
+
+        headers = self._request_headers(rid, accept_sse=True)
         payload = {
             "domain":          llm_input.domain,
             "domain_label":    llm_input.domain_label,
@@ -2482,103 +2674,523 @@ class RemoteLLMClient:
             "domain_switched": llm_input.domain_switched,
             "prev_domain":     llm_input.prev_domain_label,
             "q_index":         llm_input.q_index_in_domain,
+            "session_id":      session_id,
             "request_id":      rid,
         }
-        with tracer.start_as_current_span("llm.remote.stream_question"):
-            self._inflight += 1
-            try:
-                async with self._http.stream("POST", "/stream_question", json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        yield data
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.error("remote_llm_stream_question_error", request_id=rid, error=str(exc))
-                raise
-            finally:
-                self._inflight -= 1
 
-    async def extract_ats(self, intro_text: str, request_id: str | None = None) -> str:
-        rid     = request_id or new_request_id()
-        headers = {**self._headers(), "X-Request-Id": rid}
-        payload = {"intro_text": intro_text, "request_id": rid}
-        with tracer.start_as_current_span("llm.remote.extract_ats"):
-            self._inflight += 1
-            try:
-                resp = await self._http.post("/extract_ats", json=payload, headers=headers)
-                resp.raise_for_status()
-                return resp.json().get("result", "{}")
-            except Exception as exc:
-                log.error("remote_llm_extract_ats_error", request_id=rid, error=str(exc))
-                raise
-            finally:
-                self._inflight -= 1
+        with tracer.start_as_current_span("llm.remote.stream_question") as span:
+            span.set_attribute("request_id",      rid)
+            span.set_attribute("domain",          llm_input.domain)
+            span.set_attribute("level",           llm_input.level)
+            span.set_attribute("domain_switched", llm_input.domain_switched)
+            span.set_attribute("provider",        "remote")
+
+            async with bulkheads.acquire("llm.interviewer"):
+                _active.labels(mode="interviewer").inc()
+                _cb_open.labels(model="remote", path="interviewer.stream").set(
+                    1 if self._breaker.state == "OPEN" else 0
+                )
+                self._inflight["interviewer"] += 1
+                t0            = time.monotonic()
+                token_count   = 0
+                first_token   = True
+
+                try:
+                    async def _open_stream() -> Any:
+                        return self._http.stream(
+                            "POST", "/stream_question",
+                            json=payload,
+                            headers=headers,
+                        )
+
+                    stream_ctx = await self._breaker.call(
+                        backoff_retry,
+                        _open_stream,
+                        attempts=2,
+                        base_delay=1.0,
+                        exceptions=(Exception,),
+                    )
+
+                    async with stream_ctx as resp:
+                        resp.raise_for_status()
+
+                        async for raw_line in resp.aiter_lines():
+                            token = self._parse_sse_line(raw_line)
+                            if token is None:
+                                continue
+
+                            try:
+                                self._check_budget("remote_llm.stream_question.token")
+                            except LatencyBudgetExceeded:
+                                _budget_exc.inc()
+                                log.warning(
+                                    "remote_llm_stream_question_budget_mid",
+                                    request_id  = rid,
+                                    tokens_seen = token_count,
+                                )
+                                raise
+
+                            if first_token:
+                                _ttft.labels(model="remote").observe(
+                                    time.monotonic() - t0
+                                )
+                                first_token = False
+
+                            token_count += 1
+
+                            try:
+                                yield token
+                            except (GeneratorExit, asyncio.CancelledError):
+                                log.debug(
+                                    "remote_llm_stream_question_generator_exit",
+                                    request_id  = rid,
+                                    tokens_seen = token_count,
+                                )
+                                return
+
+                    elapsed = round(time.monotonic() - t0, 3)
+                    _req_total.labels(
+                        model="remote", status="ok", mode="interviewer"
+                    ).inc()
+                    _latency.labels(model="remote", mode="interviewer").observe(elapsed)
+
+                    span.set_attribute("latency_s",   elapsed)
+                    span.set_attribute("token_count", token_count)
+                    log.info(
+                        "remote_llm_stream_question_ok",
+                        request_id  = rid,
+                        domain      = llm_input.domain,
+                        level       = llm_input.level,
+                        token_count = token_count,
+                        latency_s   = elapsed,
+                    )
+
+                except LatencyBudgetExceeded:
+                    _req_total.labels(
+                        model="remote", status="budget_exceeded", mode="interviewer"
+                    ).inc()
+                    raise
+
+                except asyncio.CancelledError:
+                    _req_total.labels(
+                        model="remote", status="cancelled", mode="interviewer"
+                    ).inc()
+                    log.warning(
+                        "remote_llm_stream_question_cancelled",
+                        request_id  = rid,
+                        tokens_seen = token_count,
+                    )
+                    raise
+
+                except Exception as exc:
+                    _req_total.labels(
+                        model="remote", status="error", mode="interviewer"
+                    ).inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    log.error(
+                        "remote_llm_stream_question_error",
+                        request_id  = rid,
+                        error       = str(exc),
+                        tokens_seen = token_count,
+                    )
+                    raise
+
+                finally:
+                    _active.labels(mode="interviewer").dec()
+                    _cb_open.labels(model="remote", path="interviewer.stream").set(
+                        1 if self._breaker.state == "OPEN" else 0
+                    )
+                    self._inflight["interviewer"] -= 1
+
+    # ── extract_ats ───────────────────────────────────────────────────────────
+
+    async def extract_ats(
+        self,
+        intro_text:  str,
+        request_id:  str | None = None,
+    ) -> str:
+        """
+        POST /extract_ats — returns raw JSON string.
+
+        Mirrors LLMNode.extract_ats() input validation so callers get the
+        same ValueError for empty intro_text regardless of local vs remote.
+        Uses 3 attempts / 1.5 s base (matches local ATSMode retry config).
+        Validates that the response is parseable JSON before returning,
+        logging a warning on invalid JSON rather than raising — the schema
+        validation is the caller's responsibility (validate_ats_json in
+        extract_and_validate_intro()).
+
+        Raises:
+          ValueError             — empty intro_text
+          LatencyBudgetExceeded  — SLA blown before the call
+          asyncio.CancelledError — task was cancelled; always re-raised
+          httpx.HTTPStatusError  — non-2xx from remote
+          RuntimeError           — both retry attempts failed
+        """
+        if not intro_text or not intro_text.strip():
+            raise ValueError("extract_ats: intro_text is empty")
+
+        rid = request_id or new_request_id()
+
+        try:
+            self._check_budget("remote_llm.extract_ats")
+        except LatencyBudgetExceeded:
+            _budget_exc.inc()
+            log.warning("remote_llm_extract_ats_budget_exceeded", request_id=rid)
+            raise
+
+        headers = self._request_headers(rid)
+        payload = {"intro_text": intro_text.strip(), "request_id": rid}
+
+        with tracer.start_as_current_span("llm.remote.extract_ats") as span:
+            span.set_attribute("request_id",  rid)
+            span.set_attribute("intro_chars", len(intro_text))
+            span.set_attribute("provider",    "remote")
+
+            async with bulkheads.acquire("llm.ats"):
+                _active.labels(mode="ats").inc()
+                _cb_open.labels(model="remote", path="ats.batch").set(
+                    1 if self._breaker.state == "OPEN" else 0
+                )
+                self._inflight["ats"] += 1
+                t0 = time.monotonic()
+
+                try:
+                    async def _call() -> str:
+                        resp = await self._http.post(
+                            "/extract_ats",
+                            json=payload,
+                            headers=headers,
+                        )
+                        resp.raise_for_status()
+                        data = resp.json()
+                        return data.get("result", "{}")
+
+                    raw: str = await self._breaker.call(
+                        backoff_retry,
+                        _call,
+                        attempts=3,
+                        base_delay=1.5,
+                        exceptions=(Exception,),
+                    )
+
+                    if not raw or not raw.strip():
+                        raise ValueError(
+                            f"Remote ATS returned empty result (request_id={rid})"
+                        )
+
+                    # Warn on invalid JSON — schema validation is caller's job
+                    try:
+                        json.loads(raw.strip())
+                    except json.JSONDecodeError:
+                        log.warning(
+                            "remote_llm_extract_ats_invalid_json",
+                            request_id=rid,
+                            raw_len=len(raw),
+                        )
+
+                    elapsed = round(time.monotonic() - t0, 3)
+                    _req_total.labels(model="remote", status="ok", mode="ats").inc()
+                    _latency.labels(model="remote", mode="ats").observe(elapsed)
+                    _cb_open.labels(model="remote", path="ats.batch").set(
+                        1 if self._breaker.state == "OPEN" else 0
+                    )
+
+                    span.set_attribute("latency_s",  elapsed)
+                    span.set_attribute("json_chars", len(raw))
+                    log.info(
+                        "remote_llm_extract_ats_ok",
+                        request_id = rid,
+                        json_chars = len(raw),
+                        latency_s  = elapsed,
+                    )
+                    return raw
+
+                except LatencyBudgetExceeded:
+                    _req_total.labels(
+                        model="remote", status="budget_exceeded", mode="ats"
+                    ).inc()
+                    raise
+
+                except asyncio.CancelledError:
+                    _req_total.labels(
+                        model="remote", status="cancelled", mode="ats"
+                    ).inc()
+                    log.warning("remote_llm_extract_ats_cancelled", request_id=rid)
+                    raise
+
+                except Exception as exc:
+                    _req_total.labels(
+                        model="remote", status="error", mode="ats"
+                    ).inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    log.error(
+                        "remote_llm_extract_ats_error",
+                        request_id=rid,
+                        error=str(exc),
+                    )
+                    raise
+
+                finally:
+                    _active.labels(mode="ats").dec()
+                    _cb_open.labels(model="remote", path="ats.batch").set(
+                        1 if self._breaker.state == "OPEN" else 0
+                    )
+                    self._inflight["ats"] -= 1
+
+    # ── stream_messages ───────────────────────────────────────────────────────
 
     async def stream_messages(
         self,
         messages:   list,
         request_id: str | None = None,
     ) -> AsyncIterator[str]:
-        rid      = request_id or new_request_id()
-        headers  = {**self._headers(), "X-Request-Id": rid, "Accept": "text/event-stream"}
-        role_map = {"SystemMessage": "system", "HumanMessage": "user", "AIMessage": "assistant"}
-        payload  = {
-            "messages": [
-                {"role": role_map.get(type(m).__name__, "user"), "content": getattr(m, "content", "")}
-                for m in messages
-            ],
+        """
+        POST /stream_messages — SSE stream of evaluation/raw tokens.
+
+        For evaluation_engine.py and legacy paths only.
+        MUST NOT be called from voice_graph.node_llm for interview turns —
+        the same constraint as LLMNode.stream_messages().
+
+        LangChain message objects are serialised via _serialize_messages()
+        (SystemMessage → "system", HumanMessage → "user", AIMessage →
+        "assistant") so the remote receives clean role/content dicts.
+
+        Budget checks and GeneratorExit handling mirror stream_question()
+        for consistency.
+
+        Raises:
+          ValueError             — empty messages list
+          LatencyBudgetExceeded  — SLA blown at entry or mid-stream
+          asyncio.CancelledError — task was cancelled; always re-raised
+          RuntimeError           — remote signalled an error event
+          httpx.HTTPStatusError  — non-2xx from remote
+        """
+        if not messages:
+            raise ValueError("stream_messages: messages list is empty")
+
+        rid = request_id or new_request_id()
+
+        try:
+            self._check_budget("remote_llm.stream_messages")
+        except LatencyBudgetExceeded:
+            _budget_exc.inc()
+            log.warning("remote_llm_stream_messages_budget_exceeded_entry", request_id=rid)
+            raise
+
+        headers = self._request_headers(rid, accept_sse=True)
+        payload = {
+            "messages":   self._serialize_messages(messages),
             "request_id": rid,
         }
-        with tracer.start_as_current_span("llm.remote.stream_messages"):
-            self._inflight += 1
-            try:
-                async with self._http.stream("POST", "/stream_messages", json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        yield data
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.error("remote_llm_stream_messages_error", request_id=rid, error=str(exc))
-                raise
-            finally:
-                self._inflight -= 1
+
+        with tracer.start_as_current_span("llm.remote.stream_messages") as span:
+            span.set_attribute("request_id",    rid)
+            span.set_attribute("message_count", len(messages))
+            span.set_attribute("provider",      "remote")
+
+            async with bulkheads.acquire("llm.eval"):
+                _active.labels(mode="eval").inc()
+                _cb_open.labels(model="remote", path="eval.stream").set(
+                    1 if self._breaker.state == "OPEN" else 0
+                )
+                self._inflight["eval"] += 1
+                t0          = time.monotonic()
+                token_count = 0
+                first_token = True
+
+                try:
+                    async def _open_stream() -> Any:
+                        return self._http.stream(
+                            "POST", "/stream_messages",
+                            json=payload,
+                            headers=headers,
+                        )
+
+                    stream_ctx = await self._breaker.call(
+                        backoff_retry,
+                        _open_stream,
+                        attempts=2,
+                        base_delay=1.0,
+                        exceptions=(Exception,),
+                    )
+
+                    async with stream_ctx as resp:
+                        resp.raise_for_status()
+
+                        async for raw_line in resp.aiter_lines():
+                            token = self._parse_sse_line(raw_line)
+                            if token is None:
+                                continue
+
+                            try:
+                                self._check_budget(
+                                    "remote_llm.stream_messages.token"
+                                )
+                            except LatencyBudgetExceeded:
+                                _budget_exc.inc()
+                                log.warning(
+                                    "remote_llm_stream_messages_budget_mid",
+                                    request_id  = rid,
+                                    tokens_seen = token_count,
+                                )
+                                raise
+
+                            if first_token:
+                                _ttft.labels(model="remote").observe(
+                                    time.monotonic() - t0
+                                )
+                                first_token = False
+
+                            token_count += 1
+
+                            try:
+                                yield token
+                            except (GeneratorExit, asyncio.CancelledError):
+                                log.debug(
+                                    "remote_llm_stream_messages_generator_exit",
+                                    request_id  = rid,
+                                    tokens_seen = token_count,
+                                )
+                                return
+
+                    elapsed = round(time.monotonic() - t0, 3)
+                    _req_total.labels(
+                        model="remote", status="ok", mode="eval"
+                    ).inc()
+                    _latency.labels(model="remote", mode="eval").observe(elapsed)
+
+                    span.set_attribute("latency_s",   elapsed)
+                    span.set_attribute("token_count", token_count)
+                    log.info(
+                        "remote_llm_stream_messages_ok",
+                        request_id  = rid,
+                        token_count = token_count,
+                        latency_s   = elapsed,
+                    )
+
+                except LatencyBudgetExceeded:
+                    _req_total.labels(
+                        model="remote", status="budget_exceeded", mode="eval"
+                    ).inc()
+                    raise
+
+                except asyncio.CancelledError:
+                    _req_total.labels(
+                        model="remote", status="cancelled", mode="eval"
+                    ).inc()
+                    log.warning(
+                        "remote_llm_stream_messages_cancelled",
+                        request_id  = rid,
+                        tokens_seen = token_count,
+                    )
+                    raise
+
+                except Exception as exc:
+                    _req_total.labels(
+                        model="remote", status="error", mode="eval"
+                    ).inc()
+                    span.set_status(StatusCode.ERROR, str(exc))
+                    log.error(
+                        "remote_llm_stream_messages_error",
+                        request_id  = rid,
+                        error       = str(exc),
+                        tokens_seen = token_count,
+                    )
+                    raise
+
+                finally:
+                    _active.labels(mode="eval").dec()
+                    _cb_open.labels(model="remote", path="eval.stream").set(
+                        1 if self._breaker.state == "OPEN" else 0
+                    )
+                    self._inflight["eval"] -= 1
+
+    # ── health ────────────────────────────────────────────────────────────────
 
     async def health(self) -> ServiceHealthState:
+        """
+        GET /health — returns ServiceHealthState.
+
+        Merges the remote service's own health flag with the local circuit
+        breaker state.  A remote reporting healthy=True while the local
+        breaker is OPEN is still considered unhealthy — consistent with
+        LLMNode.health() logic.
+
+        Reports per-mode inflight counts in the extra dict, matching
+        the format returned by LLMNode.health() so operator dashboards
+        work identically for both implementations.
+
+        5-second timeout prevents a dead health probe from blocking the
+        voice graph health check cycle.  Always returns (never raises).
+        """
         try:
             resp = await self._http.get("/health", timeout=5.0)
             data = resp.json()
+            is_remote_healthy = bool(data.get("healthy", False))
+            _cb_open.labels(model="remote", path="all").set(
+                1 if self._breaker.state == "OPEN" else 0
+            )
             return ServiceHealthState(
                 service       = "llm.remote",
-                healthy       = data.get("healthy", False),
+                healthy       = is_remote_healthy and self._breaker.state != "OPEN",
                 circuit_state = self._breaker.state,
-                inflight      = self._inflight,
+                inflight      = sum(self._inflight.values()),
+                extra         = {
+                    "inflight_by_mode": dict(self._inflight),
+                    "base_url":         self._base_url,
+                },
             )
         except Exception as exc:
+            _cb_open.labels(model="remote", path="all").set(
+                1 if self._breaker.state == "OPEN" else 0
+            )
             return ServiceHealthState(
                 service       = "llm.remote",
                 healthy       = False,
                 circuit_state = self._breaker.state,
-                inflight      = self._inflight,
+                inflight      = sum(self._inflight.values()),
                 error         = str(exc),
+                extra         = {"inflight_by_mode": dict(self._inflight)},
             )
 
+    # ── lifecycle stubs ───────────────────────────────────────────────────────
+
+    async def warmup(self) -> None:
+        """
+        No-op — the remote service manages its own warmup.
+        Provided so on_startup() works without isinstance checks when
+        RemoteLLMClient is injected instead of LLMNodeV2.
+        """
+        log.debug("remote_llm_warmup_noop", base_url=self._base_url)
+
+    def start_health_probe(self) -> None:
+        """No-op — the remote service runs its own probe loop."""
+        log.debug("remote_llm_start_health_probe_noop", base_url=self._base_url)
+
+    def stop_health_probe(self) -> None:
+        """No-op — nothing to stop."""
+        log.debug("remote_llm_stop_health_probe_noop", base_url=self._base_url)
+
+    def evict_session(self, session_id: str) -> None: # noqa
+        """
+        No-op for the remote client — the remote service manages its own
+        session state (diversity cache, budget store, etc.).  Satisfies
+        LLMNodeProtocol.evict_session() so callers can call it unconditionally
+        without isinstance checks.
+        """
+        log.debug(
+            "remote_llm_evict_session_noop",
+            session_id=session_id[:8] if session_id else "",
+        )
+
     async def close(self) -> None:
+        """Drain and close the underlying httpx connection pool."""
         await self._http.aclose()
 
 
 # ── SSE streaming utilities ────────────────────────────────────────────────────
+
 
 class SSEEncoder:
     """
@@ -2636,6 +3248,7 @@ class SSEAccumulator:
 
 # ── voice_graph convenience helpers ───────────────────────────────────────────
 
+
 async def generate_interviewer_question(
     *,
     llm_input:  LLMInterviewInput,
@@ -2654,8 +3267,10 @@ async def generate_interviewer_question(
         )
     """
     rid    = request_id or new_request_id()
-    chunks = []
-    async for chunk in llm_node.stream_question(llm_input, request_id=rid, session_id=session_id):
+    chunks: list[str] = []
+    async for chunk in llm_node.stream_question(
+        llm_input, request_id=rid, session_id=session_id
+    ):
         chunks.append(chunk)
     return "".join(chunks).strip()
 
@@ -2678,6 +3293,7 @@ async def extract_and_validate_intro(
 
 # ── factory and module-level singletons ───────────────────────────────────────
 
+
 def get_llm_node() -> LLMNodeProtocol:
     """
     Factory. Returns RemoteLLMClient for distributed deployments,
@@ -2693,5 +3309,5 @@ def get_llm_node() -> LLMNodeProtocol:
 llm_node: LLMNodeProtocol = get_llm_node()
 
 # Convenience references for eval_engine.py and offline tooling
-eval_llm  = getattr(llm_node, "eval_mode", None)
-batch_ats = getattr(llm_node, "batch_ats", None)
+eval_llm  = getattr(llm_node, "eval_mode",  None)
+batch_ats = getattr(llm_node, "batch_ats",  None)

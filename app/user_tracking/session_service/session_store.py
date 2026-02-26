@@ -62,13 +62,13 @@ from app.common.shared import (
     ServiceHealthState,
     backoff_retry,  # noqa
     degraded_mode,
-    get_logger,
     get_tracer,
     make_counter,
     make_gauge,
     make_histogram,
     new_request_id,
 )
+from app.monitoring.observability import get_logger
 
 log = get_logger(__name__)
 tracer = get_tracer(__name__)

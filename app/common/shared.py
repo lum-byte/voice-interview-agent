@@ -686,12 +686,15 @@ bulkheads = BulkheadPool()
 
 # Register standard bulkhead pools. Nodes also call register() themselves
 # for any additional names they need — register() is idempotent.
-bulkheads.register("stt.batch", limit=int(os.getenv("BULKHEAD_STT_BATCH", "20")))
-bulkheads.register("stt.stream", limit=int(os.getenv("BULKHEAD_STT_STREAM", "10")))
-bulkheads.register("llm.batch", limit=int(os.getenv("BULKHEAD_LLM_BATCH", "50")))
-bulkheads.register("llm.stream", limit=int(os.getenv("BULKHEAD_LLM_STREAM", "30")))
-bulkheads.register("tts.batch", limit=int(os.getenv("BULKHEAD_TTS_BATCH", "20")))
-bulkheads.register("tts.stream", limit=int(os.getenv("BULKHEAD_TTS_STREAM", "20")))
+bulkheads.register("stt.batch",       limit=int(os.getenv("BULKHEAD_STT_BATCH",         "20")))
+bulkheads.register("stt.stream",      limit=int(os.getenv("BULKHEAD_STT_STREAM",        "10")))
+bulkheads.register("llm.batch",       limit=int(os.getenv("BULKHEAD_LLM_BATCH",         "50")))
+bulkheads.register("llm.stream",      limit=int(os.getenv("BULKHEAD_LLM_STREAM",        "30")))
+bulkheads.register("llm.interviewer", limit=int(os.getenv("BULKHEAD_LLM_INTERVIEWER",   "30")))
+bulkheads.register("llm.ats",         limit=int(os.getenv("BULKHEAD_LLM_ATS",           "10")))
+bulkheads.register("llm.eval",        limit=int(os.getenv("BULKHEAD_LLM_EVAL",          "5")))
+bulkheads.register("tts.batch",       limit=int(os.getenv("BULKHEAD_TTS_BATCH",         "20")))
+bulkheads.register("tts.stream",      limit=int(os.getenv("BULKHEAD_TTS_STREAM",        "20")))
 
 
 # ── load shedder ──────────────────────────────────────────────────────────────
@@ -721,8 +724,9 @@ class LoadSheddingGuard:
         ["tier"],
     )
 
-    def __init__(self, max_inflight: int = 100) -> None:
+    def __init__(self, max_inflight: int = 100, queue_size: int = 0) -> None:
         self._max = max_inflight
+        self._queue_size = queue_size
         self._inflight = 0
         self._lock = asyncio.Lock()
 
@@ -1031,7 +1035,7 @@ def make_versioned_cache_key(
     """
     Build a cache key that is invalidated whenever model config changes.
 
-    Without versioning, a cache entry created with gpt-4o-mini at temperature=0.7
+    Without versioning, a cache entry created with gpt-5-mini at temperature=0.7
     would be incorrectly returned after the operator switches to gpt-4o at
     temperature=0.0, producing wrong answers silently.
 

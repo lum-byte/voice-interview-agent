@@ -62,7 +62,6 @@ from app.common.shared import (
     backoff_retry,
     bulkheads,
     degraded_mode,
-    get_logger,
     get_tracer,
     make_counter,
     make_gauge,
@@ -70,7 +69,7 @@ from app.common.shared import (
     make_versioned_cache_key,  # noqa
     new_request_id,
 )
-
+from app.monitoring.observability import get_logger
 from dotenv import load_dotenv
 
 load_dotenv()

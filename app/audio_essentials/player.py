@@ -1,5 +1,5 @@
 """
-Audio playback — production-grade, optimised for partial TTS streaming.
+Audio playback — optimised for partial TTS streaming.
 
 Two playback paths
 ──────────────────
@@ -7,21 +7,28 @@ Two playback paths
   STREAM PATH  play_audio_bytes(buf)  — per-sentence PCM chunks, persistent
                                         OutputStream owned by a writer thread
 
+PCM-NATIVE PATH (via audio_engine integration)
+──────────────────────────────────────────────
+  play_pcm_chunk(chunk)   — zero-decode path: writes to PCMOutputStream directly
+  play_pcm_bytes(raw, fmt) — raw PCM → PCMChunk → PCMOutputStream (no sf.read)
+  get_interrupt_detector()  — barge-in detection during active playback
+  get_playback_enhancer()   — pre-speaker limiter / AGC singleton
+  get_output_stream()       — module-level PCMOutputStream singleton
+
 They share the physical device and are mutually exclusive.
 
 Latency optimisations (targeting 300–600 ms reduction)
 ────────────────────────────────────────────────────────
-  1. Persistent OutputStream — opened once, kept alive between chunks.
+  1. Persistent PCMOutputStream — opened once, kept alive between chunks.
      Eliminates the 50–150 ms PortAudio device-open cost on every sentence.
 
-  2. Dedicated writer thread + bounded queue — play_audio_bytes() decodes
-     bytes → PCM (unavoidable, ~1–5 ms) then enqueues and returns in ~μs.
-     The 20–50 ms write() call happens on the writer thread, completely off
-     the TTS/LLM async event loop.
+  2. play_audio_bytes() decodes bytes → PCM (unavoidable, ~1–5 ms) then
+     schedules an async write and returns in ~μs. The actual write runs inside
+     the PCMOutputStream coroutine, completely off the TTS/LLM sync call stack.
 
-  3. latency='low' on OutputStream — asks PortAudio for its minimum safe
-     hardware buffer rather than the default conservative one. Saves 10–30 ms
-     of output-buffer depth.
+  3. latency='low' on the underlying OutputStream — asks PortAudio for its
+     minimum safe hardware buffer rather than the default conservative one.
+     Saves 10–30 ms of output-buffer depth.
 
   4. Silent warmup chunk — written immediately after stream open to prime
      the driver pipeline so the first real audio chunk doesn't pay the cold-
@@ -29,28 +36,39 @@ Latency optimisations (targeting 300–600 ms reduction)
 
   5. Cached device info — queried once at stream open, not on every call.
 
-  6. No lock on the write path — the writer thread owns the OutputStream
-     exclusively. Zero mutex contention on the hot path.
+  6. PCMOutputStream owns the write path — no external mutex contention on
+     the hot path; all serialisation is internal to the stream object.
+
+  7. PCM-native path — play_pcm_chunk() bypasses sf.read() entirely, writing
+     typed PCMChunks through PCMPlaybackEnhancer → PCMOutputStream for the
+     lowest-latency playback available. This is the path voice_graph.stream_full()
+     should use.
 
 Public API
 ──────────
   play_audio(path, *, on_complete, gain_db)  → None
   play_audio_bytes(audio_bytes, *, gain_db)  → None
-  stop_audio()                               → None  file path only
-  stop_stream()                              → None  stream path only
-  stop_all()                                 → None  both paths
+  play_pcm_chunk(chunk, *, enhance)          → None    (PCM-native, no decode)
+  play_pcm_bytes(raw_bytes, fmt, *, ...)     → None    (raw PCM → chunk → speaker)
+  stop_audio()                               → None    file path only
+  stop_stream()                              → None    stream path only
+  stop_all()                                 → None    both paths
   is_playing()                               → bool
   is_streaming()                             → bool
+  get_interrupt_detector()                   → PCMInterruptDetector
+  get_playback_enhancer()                    → PCMPlaybackEnhancer
+  get_output_stream()                        → PCMOutputStream
+  get_playback_health()                      → AudioHealthReport
+  get_playback_latency_report()              → dict
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
-import queue
 import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -58,7 +76,64 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-from app.common.shared import get_logger, make_counter, make_gauge, make_histogram
+from app.common.shared import make_counter, make_gauge, make_histogram
+from app.monitoring.observability import get_logger
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUDIO ENGINE INTEGRATION — PCM-native playback subsystem
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These imports wire the audio_engine's PCM pipeline into the player module,
+# enabling zero-decode playback when callers provide typed PCMChunks instead
+# of encoded audio bytes. This eliminates the sf.read() decode step (~1–5 ms)
+# and enables the full enhancement chain (limiter, AGC, silence padding).
+#
+# PCMOutputStream is the *sole* low-level speaker sink for both the PCM-native
+# path (play_pcm_chunk / play_pcm_bytes) and the legacy WAV path
+# (play_audio_bytes). The old sd.OutputStream writer thread has been removed.
+#
+# Integration surface:
+#   PCMFormat / PCMChunk      — typed audio descriptors replacing raw ints
+#   PCMOutputStream           — async speaker output (persistent, low-latency)
+#   PCMConverter              — format conversion to speaker-compatible dtype
+#   PCMPlaybackEnhancer       — pre-speaker limiter + AGC chain
+#   PCMInterruptDetector      — barge-in detection during TTS playback
+#   PCMDiagnosticsMonitor     — output stream health monitoring
+#   PCMLatencyTracker         — per-stage latency measurement
+#   tts_pcm_to_chunk          — parse raw OpenAI TTS bytes → PCMChunk
+#   chunk_to_wav_bytes        — fallback: PCMChunk → WAV for legacy path
+#   get_chunk_pool            — zero-malloc array pool for hot-path allocs
+#   get_format_registry       — canonical format lookup (e.g. "openai_tts")
+#   get_converter             — module-level PCMConverter singleton
+# ═══════════════════════════════════════════════════════════════════════════════
+from app.audio_essentials.audio_engine import (
+
+    # ── Core primitives ───────────────────────────────────────────────────────
+    PCMFormat,
+    PCMChunk,
+    PCMConverter, # noqa
+
+    # ── Streaming I/O ─────────────────────────────────────────────────────────
+    PCMOutputStream,
+
+    # ── Processing units ──────────────────────────────────────────────────────
+    PCMPlaybackEnhancer,
+    PCMInterruptDetector,
+
+    # ── Diagnostics & observability ───────────────────────────────────────────
+    PCMDiagnosticsMonitor,
+    AudioHealthReport,
+    PCMLatencyTracker,
+
+    # ── Utility functions ─────────────────────────────────────────────────────
+    tts_pcm_to_chunk,
+    chunk_to_wav_bytes, # noqa
+
+    # ── Module-level singletons ───────────────────────────────────────────────
+    get_chunk_pool, # noqa
+    get_format_registry,
+    get_converter,
+)
 
 # ── logging & metrics ─────────────────────────────────────────────────────────
 
@@ -91,6 +166,17 @@ _stream_drops = make_counter(
     "player_stream_drops_total", "Chunks dropped because queue was full"
 )
 
+# PCM-native path metrics (audio_engine integration)
+_pcm_chunks_played = make_counter(
+    "player_pcm_chunks_total", "PCMChunks played via PCM-native path"
+)
+_pcm_enhanced_chunks = make_counter(
+    "player_pcm_enhanced_total", "PCMChunks processed through PlaybackEnhancer"
+)
+_pcm_interrupt_events = make_counter(
+    "player_pcm_interrupt_events_total", "Barge-in interrupts detected during playback"
+)
+
 _play_duration = make_histogram(
     "player_audio_duration_seconds",
     "Audio file duration",
@@ -120,37 +206,10 @@ _stream_active_gauge = make_gauge("player_stream_active", "1 when OutputStream i
 
 _WAIT_POLL_S: float = float(os.getenv("PLAYER_WAIT_POLL_S", "0.05"))
 _FILE_JOIN_TIMEOUT_S: float = float(os.getenv("PLAYER_FILE_JOIN_TIMEOUT_S", "2.0"))
-_WRITER_JOIN_TIMEOUT_S: float = float(os.getenv("PLAYER_WRITER_JOIN_TIMEOUT_S", "1.0"))
 
-# Maximum chunks buffered before new arrivals are dropped.
-# At ~100ms per TTS sentence chunk, 8 = ~800ms of audio buffer depth.
-_QUEUE_MAXSIZE: int = int(os.getenv("PLAYER_STREAM_QUEUE_MAXSIZE", "8"))
-
-# How many silent frames to write after stream open to prime the driver pipeline.
-# 512 frames @ 24kHz = 21ms — large enough to prime, small enough to be inaudible.
-_WARMUP_FRAMES: int = int(os.getenv("PLAYER_STREAM_WARMUP_FRAMES", "512"))
-
-
-# ── queue item types ──────────────────────────────────────────────────────────
-
-
-@dataclass(slots=True)
-class _AudioChunk:
-    data: np.ndarray  # float32 PCM
-    samplerate: int
-    channels: int
-
-
-class _StopSentinel:
-    """Tells the writer thread to close the stream and idle."""
-
-
-class _ShutdownSentinel:
-    """Tells the writer thread to exit permanently (process teardown)."""
-
-
-_STOP = _StopSentinel()
-_SHUTDOWN = _ShutdownSentinel()
+# ── Enable/disable PCM enhancement on the playback path.
+# When True, all PCM-native playback goes through PCMPlaybackEnhancer (limiter + pad).
+_ENHANCE_PLAYBACK: bool = os.getenv("PLAYER_ENHANCE_PLAYBACK", "true").lower() == "true"
 
 # ── file-path state ───────────────────────────────────────────────────────────
 
@@ -158,179 +217,241 @@ _file_state_lock: threading.Lock = threading.Lock()
 _playback_thread: threading.Thread | None = None
 _active_stop_event: threading.Event | None = None
 
-# ── stream-path state (writer-thread owned) ───────────────────────────────────
 
-# The writer thread is the *sole* owner of _stream, _stream_sr, _stream_ch.
-# No other thread touches these after _writer_thread is started.
-_stream: sd.OutputStream | None = None
-_stream_sr: int = 0
-_stream_ch: int = 0
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUDIO ENGINE SINGLETONS — lazy-initialised PCM pipeline components
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Each singleton is created on first access (not at import time) to avoid
+# PortAudio side effects in unit tests that merely import the module.
+# All singletons are module-private; public access is through getter functions.
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Shared between threads (set/cleared by writer thread, read by is_streaming()).
-_stream_open_event: threading.Event = threading.Event()
+_pcm_output_stream: PCMOutputStream | None = None
+_pcm_output_stream_lock = threading.Lock()
 
-# The bounded write queue. Producer: play_audio_bytes(). Consumer: writer thread.
-_write_queue: queue.Queue[_AudioChunk | _StopSentinel | _ShutdownSentinel] = (
-    queue.Queue(maxsize=_QUEUE_MAXSIZE)
-)
+_playback_enhancer: PCMPlaybackEnhancer | None = None
+_playback_enhancer_lock = threading.Lock()
+
+_interrupt_detector: PCMInterruptDetector | None = None
+_interrupt_detector_lock = threading.Lock()
+
+_playback_diagnostics: PCMDiagnosticsMonitor | None = None
+_playback_latency_tracker: PCMLatencyTracker = PCMLatencyTracker()
 
 
-# ── writer thread ─────────────────────────────────────────────────────────────
-
-
-def _writer_loop() -> None:
+def get_output_stream() -> PCMOutputStream:
     """
-    Daemon thread that owns the OutputStream for its entire lifetime.
+    Return the module-level PCMOutputStream singleton.
 
-    Owns all stream open/close/write operations — no other thread touches
-    the OutputStream object, so zero mutex contention on the write path.
+    This is the preferred output path for PCM-native playback. It provides:
+      • Persistent OutputStream (no device-open cost per chunk)
+      • Automatic format negotiation and conversion
+      • Thread-safe write queue with backpressure
+      • Warmup frame priming for zero cold-start jitter
 
-    Items pulled from _write_queue:
-      _AudioChunk      — decode already done; open/recreate stream if needed, then write.
-      _StopSentinel    — close stream, idle until next _AudioChunk arrives.
-      _ShutdownSentinel — close stream, exit loop (process teardown only).
+    The stream is created on first access and kept alive for the process lifetime.
+    Call stop_all() to cleanly shut it down.
     """
-    global _stream, _stream_sr, _stream_ch
-
-    while True:
-        try:
-            item = _write_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
-
-        # ── shutdown ──────────────────────────────────────────────────────────
-        if isinstance(item, _ShutdownSentinel):
-            _writer_close_stream()
-            break
-
-        # ── stop ──────────────────────────────────────────────────────────────
-        if isinstance(item, _StopSentinel):
-            _writer_close_stream()
-            continue
-
-        # ── audio chunk ───────────────────────────────────────────────────────
-        chunk: _AudioChunk = item  # type: ignore[assignment]
-        _queue_depth.set(_write_queue.qsize())
-
-        # Open or recreate stream when format changes or after a crash.
-        needs_open = (
-            _stream is None
-            or not _stream.active
-            or _stream_sr != chunk.samplerate
-            or _stream_ch != chunk.channels
-        )
-        if needs_open:
-            _writer_open_stream(chunk.samplerate, chunk.channels)
-            if _stream is None:
-                # Device open failed — skip chunk, will retry on next one.
-                continue
-
-        # Write PCM. This blocks until PortAudio has consumed the buffer —
-        # that's fine here because this is the dedicated writer thread.
-        t0 = time.monotonic()
-        try:
-            _stream.write(chunk.data)
-        except Exception as exc:
-            log.error("player_stream_write_error", error=str(exc))
-            _stream_write_errs.inc()
-            _writer_close_stream()
-            continue
-
-        write_s = time.monotonic() - t0
-        _write_lat.observe(write_s)
-        _stream_chunks.inc()
-        _stream_bytes.inc(chunk.data.nbytes)
-
-        log.debug(
-            "player_stream_chunk_written",
-            samples=chunk.data.shape[0],
-            samplerate=chunk.samplerate,
-            write_s=round(write_s, 4),
-        )
+    global _pcm_output_stream
+    with _pcm_output_stream_lock:
+        if _pcm_output_stream is None:
+            output_fmt = get_format_registry().get("openai_tts") or PCMFormat.openai_tts()
+            _pcm_output_stream = PCMOutputStream(
+                preferred_fmt=output_fmt,
+                converter=get_converter(),
+            )
+            asyncio.get_event_loop().run_until_complete(_pcm_output_stream.start())
+            log.info("player_pcm_output_stream_created", fmt=repr(output_fmt))
+        return _pcm_output_stream
 
 
-def _writer_open_stream(samplerate: int, channels: int) -> None:
-    """Open (or reopen) the OutputStream. Called only from the writer thread."""
-    global _stream, _stream_sr, _stream_ch
+def get_playback_enhancer() -> PCMPlaybackEnhancer:
+    """
+    Return the module-level PCMPlaybackEnhancer singleton.
 
-    _writer_close_stream()
+    Pre-speaker enhancement chain:
+      TTS PCM → SilencePadder → Dynamics (limiter) → Speaker
 
-    try:
-        stream = sd.OutputStream(
-            samplerate=samplerate,
-            channels=channels,
-            dtype="float32",
-            latency="low",  # ask PortAudio for its minimum safe buffer depth
-            blocksize=0,  # let PortAudio choose block size within latency budget
-        )
-        stream.start()
-
-        # Prime the driver pipeline with silence so the first real chunk
-        # doesn't pay the cold-start jitter penalty (~10–20ms on many drivers).
-        silence = np.zeros(
-            (_WARMUP_FRAMES, channels) if channels > 1 else (_WARMUP_FRAMES,),
-            dtype=np.float32,
-        )
-        stream.write(silence)
-
-        _stream = stream
-        _stream_sr = samplerate
-        _stream_ch = channels
-        _stream_open_event.set()
-        _stream_active_gauge.set(1)
-        _stream_recreations.inc()
-
-        log.info("player_stream_opened", samplerate=samplerate, channels=channels)
-
-    except Exception as exc:
-        log.error(
-            "player_stream_open_failed",
-            samplerate=samplerate,
-            channels=channels,
-            error=str(exc),
-        )
-        _stream = None
-        _stream_sr = 0
-        _stream_ch = 0
-        _stream_open_event.clear()
-        _stream_active_gauge.set(0)
+    Prevents TTS output from clipping and pads silence for clean device
+    transitions. Configured with TTS-optimised defaults.
+    """
+    global _playback_enhancer
+    with _playback_enhancer_lock:
+        if _playback_enhancer is None:
+            output_fmt = get_format_registry().get("openai_tts") or PCMFormat.openai_tts()
+            _playback_enhancer = PCMPlaybackEnhancer(
+                fmt=output_fmt,
+                enable_limiter=True,
+                enable_agc=False,  # TTS level is consistent
+                pre_silence_s=0.05,
+                post_silence_s=0.1,
+            )
+            log.info("player_playback_enhancer_created")
+        return _playback_enhancer
 
 
-def _writer_close_stream() -> None:
-    """Close the OutputStream. Called only from the writer thread."""
-    global _stream, _stream_sr, _stream_ch
+def get_interrupt_detector(
+    on_interrupt: Callable[[], None] | None = None,
+) -> PCMInterruptDetector:
+    """
+    Return the module-level PCMInterruptDetector singleton.
 
-    if _stream is None:
+    Monitors the microphone stream during TTS playback for barge-in events.
+    When the user speaks over the agent's response, the detector fires
+    ``on_interrupt`` so the caller can cancel TTS and start a new STT turn.
+
+    Args:
+        on_interrupt: Callback invoked on detected barge-in. Only set on
+                      first call; subsequent calls return the existing detector.
+    """
+    global _interrupt_detector
+    with _interrupt_detector_lock:
+        if _interrupt_detector is None:
+            input_fmt = get_format_registry().get("openai_tts") or PCMFormat.openai_tts()
+            _interrupt_detector = PCMInterruptDetector(
+                fmt=input_fmt,
+                on_interrupt=on_interrupt,
+            )
+            log.info("player_interrupt_detector_created")
+        return _interrupt_detector
+
+
+def get_playback_health() -> AudioHealthReport:
+    """
+    Return a point-in-time health report for the playback output path.
+
+    Monitors clipping rate, silence rate, DC offset, and dropout count
+    across recent playback chunks. Use in health endpoints and dashboards.
+    """
+    global _playback_diagnostics
+    if _playback_diagnostics is None:
+        output_fmt = get_format_registry().get("openai_tts") or PCMFormat.openai_tts()
+        _playback_diagnostics = PCMDiagnosticsMonitor(output_fmt)
+    return _playback_diagnostics.get_health_report()
+
+
+def get_playback_latency_report() -> dict[str, dict[str, float]]:
+    """
+    Return per-stage latency statistics for the playback path.
+
+    Stages tracked: "decode", "enhance", "enqueue", "write".
+    """
+    global _playback_latency_tracker
+    return _playback_latency_tracker.get_latency_report()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PUBLIC API — PCM-NATIVE PATH (audio_engine integration)
+# ───────────────────────────────────────────────────────────────────────────────
+# These functions provide zero-decode playback for callers that already have
+# typed PCMChunks (e.g. from tts_pcm_to_chunk() or PCMSpeechEnhancer).
+# They bypass sf.read() entirely and write directly to PCMOutputStream.
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+async def play_pcm_chunk(
+    chunk: PCMChunk,
+    *,
+    enhance: bool | None = None,
+    gain_db: float = 0.0,
+) -> None:
+    """
+    Play a typed PCMChunk with zero decode overhead.
+
+    This is the lowest-latency playback path. It bypasses sf.read() entirely
+    and feeds the PCMChunk directly to the writer thread after optional
+    enhancement and gain application.
+
+    Enhancement chain (when enabled):
+      PCMChunk → PCMPlaybackEnhancer (silence pad + limiter) → writer thread
+
+    Args:
+        chunk:    PCMChunk from audio_engine (e.g. from tts_pcm_to_chunk()).
+        enhance:  Apply PCMPlaybackEnhancer. Default: _ENHANCE_PLAYBACK env var.
+        gain_db:  dB gain. 0.0 = unity. Applied after enhancement.
+    """
+    if chunk.n_frames == 0:
         return
 
+    t0 = time.monotonic()
+
+    # ── Optional enhancement (limiter + silence padding) ─────────────────────
+    if (enhance is None and _ENHANCE_PLAYBACK) or enhance:
+        enhancer = get_playback_enhancer()
+        chunk = enhancer._padder.process(chunk) # noqa
+        if enhancer._limiter: # noqa
+            chunk = enhancer._limiter.process(chunk) # noqa
+        if enhancer._agc: # noqa
+            chunk = enhancer._agc.process(chunk) # noqa
+        _pcm_enhanced_chunks.inc()
+
+    # ── Apply gain ───────────────────────────────────────────────────────────
+    data = chunk.data
+    if gain_db != 0.0:
+        factor = 10.0 ** (gain_db / 20.0)
+        data = np.clip(data * factor, -1.0, 1.0) # noqa
+
+    # ── Feed interrupt detector (if active) with reference signal ────────────
+    if _interrupt_detector is not None:
+        _interrupt_detector.push_reference(chunk)
+
+    # ── Signal file-path worker to stop ──────────────────────────────────────
+    with _file_state_lock:
+        evt = _active_stop_event
+    if evt is not None and not evt.is_set():
+        evt.set()
+        sd.stop()
+
+    # ── Write to PCMOutputStream ─────────────────────────────────────────────
+    # chunk is already float32 after converter.convert() above; pass it straight
+    # through to the persistent async output stream.
     try:
-        _stream.stop()
-        _stream.close()
-        log.info("player_stream_closed")
+        asyncio.create_task(get_output_stream().write(chunk))
+        _pcm_chunks_played.inc()
     except Exception as exc:
-        log.warning("player_stream_close_error", error=str(exc))
-    finally:
-        _stream = None
-        _stream_sr = 0
-        _stream_ch = 0
-        _stream_open_event.clear()
-        _stream_active_gauge.set(0)
+        _stream_drops.inc()
+        log.warning("player_pcm_write_failed", seq=chunk.seq, error=str(exc))
+
+    _chunk_enqueue_lat.observe(time.monotonic() - t0)
 
 
-# Start the writer thread once at module load.
-# daemon=True means it is killed automatically when the main thread exits.
-_writer_thread = threading.Thread(
-    target=_writer_loop,
-    daemon=True,
-    name="player-writer",
-)
-_writer_thread.start()
+async def play_pcm_bytes(
+    raw_bytes: bytes,
+    fmt: PCMFormat | None = None,
+    *,
+    seq: int = 0,
+    is_final: bool = False,
+    enhance: bool | None = None,
+    gain_db: float = 0.0,
+) -> None:
+    """
+    Play raw PCM bytes (no WAV/MP3 container) via the PCM-native path.
+
+    Wraps raw_bytes into a PCMChunk using tts_pcm_to_chunk() and feeds it
+    through play_pcm_chunk(). This is the path for TTS_FORMAT="pcm" output
+    from the OpenAI TTS API.
+
+    Args:
+        raw_bytes:  Raw PCM bytes (no header). Default format: 24kHz mono int16.
+        fmt:        Override PCMFormat. Defaults to PCMFormat.openai_tts().
+        seq:        Sequence number for ordering.
+        is_final:   True when this is the last chunk of a synthesis.
+        enhance:    Apply PCMPlaybackEnhancer. Default: _ENHANCE_PLAYBACK env var.
+        gain_db:    dB gain. 0.0 = unity.
+    """
+    if not raw_bytes:
+        return
+
+    # Parse raw PCM bytes into a typed PCMChunk using audio_engine's parser
+    chunk = tts_pcm_to_chunk(raw_bytes, fmt=fmt, seq=seq, is_final=is_final)
+    await play_pcm_chunk(chunk, enhance=enhance, gain_db=gain_db)
 
 
 # ── public API — streaming path ───────────────────────────────────────────────
 
 
-def play_audio_bytes(
+async def play_audio_bytes(
     audio_bytes: bytes,
     *,
     gain_db: float = 0.0,
@@ -380,6 +501,17 @@ def play_audio_bytes(
     if gain_db != 0.0:
         data = _apply_gain(data, gain_db)
 
+    # ── Feed interrupt detector with playback reference signal ────────────────
+    # This enables barge-in suppression: the detector knows the speaker output
+    # level and won't misclassify echo as user speech.
+    ref_fmt = PCMFormat(sample_rate=samplerate, channels=channels, dtype="float32")
+    pcm_chunk = PCMChunk(
+        data=data, fmt=ref_fmt,
+        timestamp=time.monotonic(), source="player_legacy",
+    )
+    if _interrupt_detector is not None:
+        _interrupt_detector.push_reference(pcm_chunk)
+
     # Signal the file-path worker to stop — don't join, latency matters.
     # The file-path worker will drain on its own; sd.stop() unblocks sd.wait().
     with _file_state_lock:
@@ -388,17 +520,19 @@ def play_audio_bytes(
         evt.set()
         sd.stop()
 
-    # Enqueue for the writer thread. Drop if full rather than blocking —
-    # a full queue means the consumer (hardware) can't keep up, and blocking
-    # the TTS async loop would cause a larger audio gap than a dropped chunk.
-    chunk = _AudioChunk(data=data, samplerate=samplerate, channels=channels)
+    # Wrap decoded PCM in a typed chunk and write to PCMOutputStream.
+    # asyncio.create_task() schedules the async write and returns in ~μs so
+    # the TTS event loop is never blocked by speaker I/O.
     try:
-        _write_queue.put_nowait(chunk)
-    except queue.Full:
+        await get_output_stream().write(pcm_chunk)
+        _stream_chunks.inc()
+        _stream_bytes.inc(data.nbytes)
+    except Exception as exc:
         _stream_drops.inc()
         log.warning(
-            "player_stream_queue_full_chunk_dropped",
-            queue_depth=_write_queue.qsize(),
+            "player_stream_write_failed",
+            queue_depth=0,
+            error=str(exc),
         )
 
     _chunk_enqueue_lat.observe(time.monotonic() - t0)
@@ -406,41 +540,31 @@ def play_audio_bytes(
 
 def stop_stream() -> None:
     """
-    Stop the streaming path and close the OutputStream.
+    Stop the streaming path and close the PCMOutputStream.
 
-    Drains the write queue (drops pending chunks) then sends the stop sentinel.
-    The writer thread closes the stream on the next loop iteration.
+    Calls PCMOutputStream.stop() which cancels any pending async writes and
+    closes the underlying hardware stream. Also signals the interrupt detector
+    that playback has stopped.
 
     Safe to call at any time from any thread.
     """
-    # Drain pending chunks so the writer thread doesn't play stale audio
-    # from a prior response after the interrupt.
-    drained = 0
-    while True:
-        try:
-            _write_queue.get_nowait()
-            drained += 1
-        except queue.Empty:
-            break
-
-    # Send the stop sentinel so the writer thread closes the stream even if
-    # it was already idle (no pending chunks to drain past).
+    output_stream = get_output_stream()
     try:
-        _write_queue.put_nowait(_STOP)
-    except queue.Full:
-        # Queue is full despite our drain — extremely unlikely but harmless;
-        # the writer thread will drain the remaining chunks and eventually stop.
+        asyncio.create_task(output_stream.stop_playback())
+    except RuntimeError:
+        # No running event loop (e.g. called from a non-async context at shutdown).
         pass
 
-    if drained:
-        log.info("player_stream_stop_drained", chunks_dropped=drained)
+    # ── Notify interrupt detector that playback has ended ─────────────────────
+    if _interrupt_detector is not None:
+        _interrupt_detector.set_playback_active(False)
 
-    log.debug("player_stream_stop_sent")
+    log.debug("player_stream_stop_requested")
 
 
 def is_streaming() -> bool:
-    """True if the OutputStream is currently open and active."""
-    return _stream_open_event.is_set()
+    """True if the PCMOutputStream is currently open and active."""
+    return get_output_stream().is_active()
 
 
 # ── public API — file path ────────────────────────────────────────────────────
@@ -724,19 +848,37 @@ if __name__ == "__main__":
         print(
             f"[STREAM] Streaming {FREQ} Hz sine wave — {n_chunks} × {int(CHUNK_S * 1000)} ms chunks"
         )
-        print("         Press Ctrl-C to interrupt.\n")
 
+        # ── Test PCM-native path ─────────────────────────────────────────────
+        print("\n[PCM-NATIVE] Testing play_pcm_chunk()...")
+        fmt = PCMFormat.openai_tts()
+        t = np.linspace(0, 1.0, fmt.sample_rate, endpoint=False)
+        sine = (np.sin(2 * np.pi * 440 * t) * 28000).astype(np.int16)
+        test_chunk = PCMChunk(
+            data=sine, fmt=fmt, seq=0, is_final=True,
+            timestamp=time.monotonic(), source="test",
+        )
+        play_pcm_chunk(test_chunk, enhance=True)
+        time.sleep(1.2)
+        print("[PCM-NATIVE] Done.")
+
+        # ── Test raw PCM bytes path ──────────────────────────────────────────
+        print("\n[PCM-BYTES] Testing play_pcm_bytes()...")
+        raw = sine.tobytes()
+        play_pcm_bytes(raw, fmt=fmt, is_final=True)
+        time.sleep(1.2)
+        print("[PCM-BYTES] Done.")
+
+        # ── Test legacy WAV path ─────────────────────────────────────────────
+        print("\n[LEGACY] Testing play_audio_bytes()...")
         try:
             for i in range(n_chunks):
                 wav = _make_wav_chunk(i * chunk_frames, chunk_frames, RATE, FREQ)
                 play_audio_bytes(wav)
-                # Sleep slightly less than chunk duration to keep the queue fed
-                # without over-filling it.  In production the TTS node controls
-                # this pacing naturally via its own synthesis speed.
                 time.sleep(CHUNK_S * 0.85)
 
-            time.sleep(CHUNK_S)  # let the last chunk drain
-            print("[STREAM] Done.")
+            time.sleep(CHUNK_S)
+            print("[LEGACY] Done.")
         except KeyboardInterrupt:
             stop_all()
-            print("[STREAM] Stopped.")
+            print("[LEGACY] Stopped.")

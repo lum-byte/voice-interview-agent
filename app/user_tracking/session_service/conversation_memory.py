@@ -108,7 +108,6 @@ from app.common.shared import (
     InMemoryLRU,
     ServiceHealthState,
     backoff_retry, # noqa
-    get_logger, # noqa
     get_tracer,
     make_counter,
     make_gauge,
@@ -785,17 +784,13 @@ class _RouteProcessor:
         )
 
         # Sink A: transcript_writer
-        transcript_ok = await _call_transcript_turn(
-            session_id     = sid,
-            user_text      = ct.answer,       # candidate's answer is the "user" speech
-            assistant_text = ct.question,     # AI's question is the "assistant" speech
-            request_id     = task.request_id,
-        )
+        # NOTE: transcript writes are owned by voice_graph._flush_deferred_transcripts,
+        # which applies the late-patch (substituting the full STT buffer for partial
+        # early-fire text) before writing. Writing here would produce a duplicate entry
+        # in the transcript file for every turn. We set transcript_ok=True optimistically.
+        transcript_ok = True
         record.transcript_ok = transcript_ok
-        if transcript_ok:
-            _transcript_fanouts.labels(status="ok").inc()
-        else:
-            _transcript_fanouts.labels(status="error").inc()
+        _transcript_fanouts.labels(status="ok").inc()
 
         # Sink B: audit Redis append
         await self._redis.append_turn(sid, record)

@@ -67,7 +67,7 @@ KNOWN_CHAT_MODELS = {
     "gpt-3.5-turbo",
     "gpt-3.5-turbo-16k",
     # GPT-5 family
-    "gpt-5",
+    "gpt-5.2",
     "gpt-5-mini",
     "gpt-5-nano",
 }
@@ -115,8 +115,8 @@ class Settings(BaseSettings):
     )
 
     # ── LLM node ──────────────────────────────────────────────────────────────
-    llm_model: str = Field("gpt-4o-mini", alias="LLM_MODEL")
-    llm_fallback_model: str = Field("gpt-3.5-turbo", alias="LLM_FALLBACK_MODEL")
+    llm_model: str = Field("gpt-5-mini", alias="LLM_MODEL")
+    llm_fallback_model: str = Field("gpt-5-nano", alias="LLM_FALLBACK_MODEL")
     llm_temperature: float = Field(0.7, alias="LLM_TEMPERATURE", ge=0.0, le=2.0)
     llm_max_concurrent: int = Field(50, alias="LLM_MAX_CONCURRENT", ge=1, le=500)
     llm_rate_per_sec: float = Field(20.0, alias="LLM_RATE_PER_SEC", gt=0)
@@ -811,9 +811,9 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _validate_dev_flags(self) -> Settings:
         """
-        Catch common production misconfiguration at startup:
-        - Wildcard CORS in production is a security concern worth surfacing explicitly.
-        - localhost bind address in production means the service is unreachable.
+        Catch common misconfiguration at startup:
+        - Wildcard CORS is a security concern worth surfacing explicitly.
+        - localhost bind address means the service is unreachable.
         """
         if self.env == "production":
             if self.cors_origins_raw.strip() == "*":

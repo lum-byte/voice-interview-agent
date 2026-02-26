@@ -1,4 +1,4 @@
-# PATCHFIX — `audio_engine.py` Deep Scan
+# 🔧 PATCHFIX — `audio_engine.py` Deep Scan
 
 **File:** `audio_engine.py` (5739 lines)
 **Date:** 2026-02-25

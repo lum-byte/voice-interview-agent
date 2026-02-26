@@ -20,7 +20,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiofiles
 from fastapi import (
@@ -74,6 +74,15 @@ from app.orchestration.voice_graph import (
     voice_graph_realtime,
     voice_graph_low_latency,
     GRAPH_VERSION,
+    VoiceState,
+)
+
+from app.orchestration.voice_graph import (
+    set_audit_bus,
+    set_transcript_writer,
+    set_finalize_eval,
+    integrations_health,
+    reset_integrations,
 )
 
 log = get_logger(__name__)
@@ -261,9 +270,9 @@ async def _save_upload(data: bytes, suffix: str, request_id: str) -> Path:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):  # noqa
-    # Boot observability first so every subsequent log/metric/trace is captured.
-    # start_prometheus=False because shared.py already bound its own registry
-    # to prom_registry; we expose both registries on /metrics below.
+    # ── 1. Observability ──────────────────────────────────────────────────────
+    # Boot first so every subsequent log/metric/trace is captured from here on.
+    # start_prometheus=False because shared.py already bound prom_registry.
     _obs_bootstrap(
         start_prometheus=False,
         start_mongo=True,
@@ -271,14 +280,97 @@ async def _lifespan(app: FastAPI):  # noqa
         start_otel=True,
     )
     log.info("api_startup", version=GRAPH_VERSION, service=SERVICE_NAME)
-    yield
 
-    # Drain all three graph instances concurrently. Each owns its own node
-    # pool and _active_tasks registry — shutting only voice_graph left the
-    # realtime and low_latency pools open and their in-flight tasks untracked.
+    # ── 2. Wire integrations ──────────────────────────────────────────────────
+    # Import the singletons lazily here to avoid circular imports at module load.
+    # All three imports are safe at this point — the module graph is resolved.
+    _wire_errors: list[str] = []
+
+    try:
+        from app.user_tracking.session_service.conversation_memory import (
+            qa_audit_bus as _bus,
+            finalize_session_eval as _finalize,
+        )
+        set_audit_bus(_bus)
+        set_finalize_eval(_finalize)
+        log.info("integration_wired", subsystem="audit_bus+finalize_eval")
+    except Exception as exc:
+        _wire_errors.append(f"audit_bus/finalize_eval: {exc}")
+        log.error(
+            "integration_wire_failed",
+            subsystem="audit_bus+finalize_eval",
+            error=str(exc),
+            note="eval scheduling and session audit will be disabled for this worker",
+        )
+
+    try:
+        from app.user_tracking.transcript.transcription import (
+            transcript_writer as _writer,
+        )
+        set_transcript_writer(_writer)
+        log.info("integration_wired", subsystem="transcript_writer")
+    except Exception as exc:
+        _wire_errors.append(f"transcript_writer: {exc}")
+        log.error(
+            "integration_wire_failed",
+            subsystem="transcript_writer",
+            error=str(exc),
+            note="transcript writes will be disabled for this worker",
+        )
+
+    if _wire_errors:
+        log.warning(
+            "api_startup_partial_degradation",
+            failed_integrations=_wire_errors,
+            note="pipeline will serve requests in degraded mode",
+        )
+
+    # ── 3. Voice graph startup ────────────────────────────────────────────────
+    # Warms node pools, negotiates PCM formats, runs health checks.
+    # Called after integrations are wired so the first session open has
+    # all three subsystems available.
+    try:
+        from app.orchestration.voice_graph import on_startup
+        await on_startup()
+        log.info("voice_graph_startup_complete")
+    except Exception as exc:
+        # Non-fatal — the graph will attempt lazy init on first request.
+        log.error("voice_graph_startup_failed", error=str(exc))
+
+    # ────────────────────────── YIELD ─────────────────────────────────────────
+    yield
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Teardown 1: flush transcript writer ───────────────────────────────────
+    # Drains the asyncio.Queue with a 10s timeout before cancelling anything.
+    # This ensures no completed turns are lost when gunicorn sends SIGTERM.
+    # The timeout (10s) is generous: normal queue drain takes <100ms.
     log.info("api_shutdown_start")
+    try:
+        from app.user_tracking.transcript.transcription import (
+            transcript_writer as _writer,
+        )
+        log.info("transcript_flush_start")
+        await _writer.flush(timeout=10.0)
+        log.info("transcript_flush_complete")
+    except Exception as exc:
+        log.warning("transcript_flush_shutdown_error", error=str(exc))
+
+    # ── Teardown 2: reset integration state ───────────────────────────────────
+    # Marks all three as unwired so any straggler coroutines that outlive the
+    # event loop don't try to write to a closed queue or a gone Redis connection.
+    try:
+        reset_integrations()
+    except Exception as exc:
+        log.warning("integration_reset_error", error=str(exc))
+
+    # ── Teardown 3: drain all three graph instances ───────────────────────────
+    # Cancels in-flight tasks, closes node pools, waits for load shedding guard.
+    # Concurrent gather with return_exceptions=True so one stalled graph instance
+    # doesn't block the others from shutting down.
+    from app.orchestration.voice_graph import on_shutdown
     await asyncio.gather(
-        *(g.shutdown() for g in _ALL_GRAPHS),
+        on_shutdown(),
         return_exceptions=True,
     )
     log.info("api_shutdown_complete")
@@ -432,6 +524,24 @@ async def health():
             "error": str(exc),
         }
 
+@app.get("/health/integrations", tags=["ops"])
+async def integrations_health_endpoint():
+    """
+    Health snapshot for the three optional integration subsystems:
+    audit bus, transcript writer, and finalize_eval.
+
+    Returns 200 regardless of health state so load balancers don't remove
+    the pod based on a degraded integration. Check the healthy field.
+    Useful for targeted ops debugging when /health shows overall degradation
+    but the pipeline nodes (STT/LLM/TTS) are all green.
+    """
+    try:
+        snapshot = await integrations_health()
+        return snapshot
+    except Exception as exc:
+        log.error("integrations_health_failed", error=str(exc))
+        return {"healthy": False, "error": str(exc)}
+
 
 @app.get("/", tags=["ops"])
 def root():
@@ -565,28 +675,21 @@ async def voice_chat(
 
     # ── run pipeline ──────────────────────────────────────────────────────────
     start_time = time.perf_counter()
-    result: dict[str, Any] | None = None
+    result: VoiceState | None = None
 
     try:
-        pipeline_state: dict = {
-            "audio_path": str(input_path),
-            "request_id": rid,
-            # mode="api" maps to QoSTier.STANDARD in the graph. The graph creates
-            # its own LatencyBudget based on this tier. PIPELINE_TIMEOUT is an
-            # outer API-layer safety net, not a second budget — it must be larger
-            # than the sum of stage timeouts (enforced by the settings validator).
-            "mode": "api",
-            "session_id": session.session_id,
-            "client_ip": _extract_client_ip(request),
-        }
-
-        if language:
-            pipeline_state["language"] = language
-        if tts_voice:
-            pipeline_state["tts_voice"] = tts_voice
-
-        result = await voice_graph.run(
-            pipeline_state,
+        result = await asyncio.wait_for(
+            voice_graph.run(
+                audio_path=str(input_path),
+                request_id=rid,
+                session_id=session.session_id,
+                language=language or "",
+                tts_voice=tts_voice or "",
+                extra_state={
+                    "mode": "api",
+                    "client_ip": _extract_client_ip(request),
+                },
+            ),
             timeout=PIPELINE_TIMEOUT,
         )
 
@@ -615,8 +718,7 @@ async def voice_chat(
         error=(result or {}).get("error") or None,
     )
 
-    return _ok_response(result, rid)
-
+    return _ok_response(cast(dict[str, Any], result), rid)
 
 # ── streaming WebSocket endpoint ──────────────────────────────────────────────
 
@@ -681,15 +783,15 @@ async def voice_stream(ws: WebSocket):
         token_buffer: list[str] = []
 
         async for token in voice_graph.stream(
-            {
-                "audio_path": str(input_path),
-                "request_id": rid,
-                "mode": "stream",
-                "session_id": session_id,
-                "client_ip": client_ip,
-            }
+                audio_path=str(input_path),
+                request_id=rid,
+                session_id=session_id,
+                extra_state={
+                    "mode": "stream",
+                    "client_ip": client_ip,
+                },
         ):
-            token_buffer.append(token)
+            token_buffer.append(token.get("llm_response", ""))
             await ws.send_json({"type": "token", "data": token})
 
         await ws.send_json(
@@ -884,6 +986,33 @@ async def serve_redoc_ui() -> HTMLResponse:
 
 
 # ── local dev entry point ─────────────────────────────────────────────────────
+
+# ── gunicorn entry point ──────────────────────────────────────────────────────
+#
+# Production (gunicorn + uvicorn workers):
+#   gunicorn app.endpoint.main:app \
+#       -k uvicorn.workers.UvicornWorker \
+#       --workers 2 \
+#       --timeout 120 \
+#       --graceful-timeout 30 \
+#       --bind 0.0.0.0:8000
+#
+# --timeout 120          matches PIPELINE_TIMEOUT (120s) so gunicorn doesn't
+#                        kill a worker mid-request during heavy STT+LLM+TTS.
+# --graceful-timeout 30  gives each worker 30s to drain in-flight requests and
+#                        flush the transcript queue before SIGKILL. The
+#                        transcript flush in _lifespan teardown uses 10s, so
+#                        there is a 20s buffer for in-flight pipeline tasks.
+#
+# For a gunicorn.conf.py approach instead of CLI flags:
+#
+#   # gunicorn.conf.py
+#   worker_class      = "uvicorn.workers.UvicornWorker"
+#   workers           = 2
+#   timeout           = 120
+#   graceful_timeout  = 30
+#   bind              = "0.0.0.0:8000"
+#   loglevel          = "info"
 
 if __name__ == "__main__":
     import uvicorn

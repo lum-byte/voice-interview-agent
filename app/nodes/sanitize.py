@@ -65,7 +65,8 @@ import re
 import unicodedata
 from dataclasses import dataclass, field  # noqa
 
-from app.common.shared import get_logger, make_counter, make_histogram
+from app.common.shared import make_counter, make_histogram
+from app.monitoring.observability import get_logger
 
 # ── logging & metrics ─────────────────────────────────────────────────────────
 

@@ -34,14 +34,13 @@ import keyboard
 
 from app.common.settings import settings
 from app.common.shared import (
-    get_logger,
     get_tracer,
     make_counter,
     make_histogram,
     new_request_id,
 )
 
-from app.common.log_config import LOG_MODE
+from app.monitoring.observability import get_logger
 from app.startup.startup_display import show_boot_sequence
 
 from app.monitoring.observability import (
@@ -55,7 +54,11 @@ from app.audio_essentials.player import (
     stop_all,
 )
 from app.audio_essentials.recorder import record_audio_until_released
-from app.orchestration.voice_graph import voice_graph
+from app.orchestration.voice_graph import (
+    voice_graph,
+    on_startup as _voice_graph_startup,
+    on_shutdown as _voice_graph_shutdown,
+)
 
 log = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -290,13 +293,22 @@ def _shutdown(*, source: str) -> None:
     Cancel the active pipeline, drain the event loop, then stop it.
     Safe to call from the keyboard loop, signal handlers, or tests.
 
-    Shutdown order:
-      1. _interrupt() — cancel active task + stop audio
-      2. session end — release IP lock in session_store
-      3. evaluation_engine.close() — flush any pending eval tasks
-      4. voice_graph.shutdown() — close node pools + await remaining tasks
-      5. loop.stop() — stop the asyncio loop
-      6. thread join — wait for the loop thread to exit
+    Shutdown order
+    ──────────────
+      1. _interrupt()                  — cancel active task + stop audio
+      2. transcript close_session()    — write footer line to .txt file
+      3. session_store.end()           — release IP lock; must run while node
+                                         pools are still open (before step 4)
+      4. evaluation_engine.close()     — flush pending eval tasks
+      5. voice_graph.on_shutdown()     — canonical teardown sequence:
+                                           a. flush QA audit bus (15 s timeout)
+                                           b. flush transcript writer queue
+                                           c. stop LLM health probe
+                                           d. shutdown all three graph singletons
+                                              (voice_graph, realtime, low_latency)
+                                           e. close LLM node connection pool
+                                           f. close QA audit bus drain task
+      6. loop.stop() + thread join     — stop the asyncio loop
     """
     log.info("controller_shutdown_start", source=source)
     ControllerEmitter.shutdown(reason=source)
@@ -304,24 +316,22 @@ def _shutdown(*, source: str) -> None:
 
     time.sleep(LOOP_DRAIN_S)
 
-    # flush transcript queue before tearing down the loop
+    # ── close transcript file for this session ─────────────────────────────────
+    # Write the footer line *before* on_shutdown() flushes and drains the queue.
+    # This ensures the close footer is the last line in the .txt file.
     if _session_id:
         try:
             asyncio.run_coroutine_threadsafe(
                 transcript_writer.close_session(_session_id),
                 _loop,
             ).result(timeout=3.0)
-            asyncio.run_coroutine_threadsafe(
-                transcript_writer.flush(timeout=4.0),
-                _loop,
-            ).result(timeout=5.0)
         except Exception as exc:
-            log.warning("controller_transcript_flush_failed", error=str(exc))
+            log.warning("controller_transcript_close_failed", error=str(exc))
 
     # ── end session ────────────────────────────────────────────────────────────
-    # Must run before voice_graph.shutdown() so any session-related pipeline
-    # tasks (e.g. session_store.append_turn still in-flight) complete while the
-    # node pools are still open.
+    # Must run before voice_graph.on_shutdown() closes node pools so any
+    # session-related in-flight tasks (e.g. session_store.append_turn) complete
+    # while the pools are still available.
     if _session_id:
         try:
             asyncio.run_coroutine_threadsafe(
@@ -341,16 +351,21 @@ def _shutdown(*, source: str) -> None:
     except Exception as exc:
         log.warning("controller_eval_close_failed", error=str(exc))
 
-    # ── shut down voice graph ──────────────────────────────────────────────────
-    # Cancels all tasks still registered in voice_graph._active_tasks and
-    # closes the node HTTP connection pools (STT, LLM, TTS). Without this call
-    # the node pools were never released, leaving OS-level sockets open until
-    # the process exited.
+    # ── canonical voice graph teardown ─────────────────────────────────────────
+    # on_shutdown() owns the full teardown sequence:
+    #   - QA audit bus flush (15 s) — eval data not silently dropped
+    #   - transcript writer queue drain
+    #   - LLM health probe stop
+    #   - all three VoiceGraph singletons (voice_graph, realtime, low_latency)
+    #   - LLM node connection pool close
+    #   - QA audit bus task close
+    # Calling voice_graph.shutdown() directly would only tear down the one
+    # singleton and skip the audit bus flush — use on_shutdown() instead.
     try:
         asyncio.run_coroutine_threadsafe(
-            voice_graph.shutdown(),
+            _voice_graph_shutdown(),
             _loop,
-        ).result(timeout=5.0)
+        ).result(timeout=25.0)
         log.info("controller_voice_graph_shutdown")
     except Exception as exc:
         log.warning("controller_voice_graph_shutdown_failed", error=str(exc))
@@ -368,12 +383,62 @@ def _install_signal_handlers() -> None:
     """Route SIGTERM and SIGINT through the same shutdown path as ESC."""
 
     def _handle(sig: int, _frame: object) -> None:
-        log.warning("controller_signal_received", signal=signal.Signals(sig).name)
-        _shutdown(source=f"signal:{signal.Signals(sig).name}")
+        signame = signal.Signals(sig).name
+        log.warning("controller_signal_received", signal=signame)
+        # Emit structured signal event so dashboards can distinguish user-ESC
+        # exits from OS-initiated shutdowns (systemd SIGTERM, Ctrl-C SIGINT).
+        ControllerEmitter.signal(signum=sig, signame=signame)
+        _shutdown(source=f"signal:{signame}")
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
+
+
+# ── health pre-flight ──────────────────────────────────────────────────────────
+
+
+def _check_pipeline_health() -> bool:
+    """
+    Poll the voice graph's health endpoint and log the result.
+
+    Called once after on_startup() completes and before the poll loop starts.
+    Returns True if all three nodes report healthy, False otherwise.
+
+    The controller never blocks on this — an unhealthy node at startup is a
+    warning, not a hard stop, because circuit breakers may recover within the
+    first few seconds of traffic. Callers should log a warning and continue.
+    """
+    try:
+        health = asyncio.run_coroutine_threadsafe(
+            voice_graph.health(),
+            _loop,
+        ).result(timeout=10.0)
+
+        if health["healthy"]:
+            log.info(
+                "controller_health_ok",
+                version=health.get("version"),
+                inflight=health.get("inflight", 0),
+            )
+        else:
+            # Log per-node details so the operator knows which node is unhealthy.
+            unhealthy = [
+                name
+                for name, node_h in health.get("nodes", {}).items()
+                if not node_h.get("healthy")
+            ]
+            log.warning(
+                "controller_health_degraded",
+                unhealthy_nodes=unhealthy,
+                version=health.get("version"),
+            )
+
+        return bool(health["healthy"])
+
+    except Exception as exc:
+        log.warning("controller_health_check_failed", error=str(exc))
+        return False
 
 
 # ── input loop ─────────────────────────────────────────────────────────────────
@@ -409,26 +474,41 @@ def listen_loop() -> None:
 
     _install_signal_handlers()
 
+    # ── pipeline startup ───────────────────────────────────────────────────────
+    # on_startup() warms the LLM node (pre-loads model weights / connection
+    # pool), starts the LLM background health probe, pre-initialises the QA
+    # controller Redis pool, and bootstraps the QA audit bus drain task.
+    # Must run before the boot display and session registration so that the
+    # pipeline is ready to handle the first PTT press immediately after the
+    # user sees the "ready" prompt.
+    try:
+        asyncio.run_coroutine_threadsafe(
+            _voice_graph_startup(),
+            _loop,
+        ).result(timeout=20.0)
+        log.info("controller_voice_graph_startup_ok")
+    except Exception as exc:
+        log.warning("controller_voice_graph_startup_failed", error=str(exc))
+
     # ── boot display ───────────────────────────────────────────────────────────
     # Shown before session registration so the user sees something immediately.
     # Skipped in verbose mode — JSON logs serve the same purpose there.
-    if LOG_MODE == "standard":
-        show_boot_sequence(
-            [
-                {"label": "STT", "model": getattr(settings, "stt_model", "whisper-1")},
-                {
-                    "label": "LLM",
-                    "model": getattr(settings, "llm_model", "gpt-4o-mini"),
-                },
-                {
-                    "label": "TTS",
-                    "model": f"{getattr(settings, 'tts_model', 'tts-1')} / {getattr(settings, 'tts_voice', 'nova')}",
-                },
-                {"label": "Session Store", "model": "redis + lru"},
-            ],
-            ptt_key=PTT_KEY,
-            exit_key=EXIT_KEY,
-        )
+    show_boot_sequence(
+        [
+            {"label": "STT", "model": getattr(settings, "stt_model", "whisper-1")},
+            {
+                "label": "LLM",
+                "model": getattr(settings, "llm_model", "gpt-5-mini"),
+            },
+            {
+                "label": "TTS",
+                "model": f"{getattr(settings, 'tts_model', 'tts-1')} / {getattr(settings, 'tts_voice', 'nova')}",
+            },
+            {"label": "Session Store", "model": "redis + lru"},
+        ],
+        ptt_key=PTT_KEY,
+        exit_key=EXIT_KEY,
+    )
 
     # ── register session ───────────────────────────────────────────────────────
     try:
@@ -453,6 +533,11 @@ def listen_loop() -> None:
         )
     except Exception as exc:
         log.warning("controller_session_register_failed", error=str(exc))
+
+    # ── health pre-flight ──────────────────────────────────────────────────────
+    # Check all three nodes after on_startup() has had a chance to warm them.
+    # Degraded nodes are a warning, not a hard stop — circuit breakers recover.
+    _check_pipeline_health()
 
     log.info("controller_ready", ptt_key=PTT_KEY, exit_key=EXIT_KEY)
 

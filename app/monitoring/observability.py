@@ -213,7 +213,7 @@ class _NoOpSpan:
         return self
 
     def add_event(
-        self, name: str, attributes: dict | None = None
+        self, name: str, attributes: dict | None = None # noqa
     ) -> "_NoOpSpan":  # noqa
         return self
 
@@ -486,6 +486,7 @@ class ObsEvent:
     tts_format: str = ""
     input_chars: int = 0
     audio_output: str = ""
+    audio_size_bytes: int = 0
     s3_uri: str = ""
     s3_ok: bool = False
     chunk_count: int = 0
@@ -1384,18 +1385,43 @@ class _OtelLayer:
             try:
                 from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
 
-                sampler = TraceIdRatioBased(OTEL_SAMPLE_RATE)
-                provider = TracerProvider(resource=resource, sampler=sampler)
-                provider.add_span_processor(
-                    BatchSpanProcessor(
-                        OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
+                existing = otel_trace.get_tracer_provider()
+                # noinspection PyUnreachableCode
+                if isinstance(existing, TracerProvider):
+                    # shared.py installs an SDK TracerProvider unconditionally at module-level
+                    # (via _build_and_install_tracer_provider()) the instant it is first imported.
+                    # Since initialize() is only reachable when self._enabled=True, which requires
+                    # _OTEL_PACKAGES_AVAILABLE=True, which requires shared.py to have imported
+                    # successfully, the SDK provider is always already installed by the time this
+                    # isinstance check runs. Adopt the existing provider rather than building a
+                    # new one — set_tracer_provider() would be silently ignored by the OTel SDK
+                    # but would still print "Overriding of current TracerProvider is not allowed".
+                    # More critically, self._tracer_prov must reference the provider that is
+                    # actually registered globally, not a freshly constructed one that was never
+                    # passed to set_tracer_provider() and will therefore never serve any tracers.
+                    self._tracer_prov = existing
+                else:
+                    # DEAD BRANCH — not reachable in any normal process startup.
+                    # The only way to reach here is if isinstance(existing, TracerProvider) is
+                    # False, meaning the global is still OTel's default ProxyTracerProvider.
+                    # That is only possible if shared.py's module-level block did not run, which
+                    # is only possible if shared.py was not imported — but self._enabled=True
+                    # requires _OTEL_PACKAGES_AVAILABLE=True which requires shared.py to have
+                    # imported successfully. The precondition for entering this method and the
+                    # precondition for the ProxyTracerProvider still being active are mutually
+                    # exclusive at runtime. Kept solely as a safety net for isolated unit tests
+                    # that construct _OtelLayer() directly without going through shared.py.
+                    sampler = TraceIdRatioBased(OTEL_SAMPLE_RATE)
+                    provider = TracerProvider(resource=resource, sampler=sampler)
+                    provider.add_span_processor(
+                        BatchSpanProcessor(
+                            OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
+                        )
                     )
-                )
-                otel_trace.set_tracer_provider(provider)
-                self._tracer_prov = provider
+                    otel_trace.set_tracer_provider(provider)
+                    self._tracer_prov = provider
             except Exception as exc:
                 import sys
-
                 print(
                     f"[observability] OTel TracerProvider init failed: {exc}",
                     file=sys.stderr,
@@ -1405,13 +1431,29 @@ class _OtelLayer:
 
             # ── MeterProvider (OTLP push, independent from Prometheus) ────────
             try:
-                reader = PeriodicExportingMetricReader(
-                    OTLPMetricExporter(endpoint=OTEL_ENDPOINT, insecure=True),
-                    export_interval_millis=OTEL_METRIC_MS,
-                )
-                meter_prov = MeterProvider(resource=resource, metric_readers=[reader])
-                otel_metrics.set_meter_provider(meter_prov)
-                self._meter_prov = meter_prov
+                existing_meter = otel_metrics.get_meter_provider()
+                # noinspection PyUnreachableCode
+                if isinstance(existing_meter, MeterProvider):
+                    # Same reasoning as the TracerProvider block above. shared.py installs an
+                    # SDK MeterProvider at module-level via _build_and_install_meter_provider()
+                    # before any call to initialize() is possible. Adopt the existing provider
+                    # so self._meter_prov references what is actually registered globally.
+                    self._meter_prov = existing_meter
+                else:
+                    # DEAD BRANCH — same mutual exclusion as the TracerProvider else above.
+                    # Reaching here requires isinstance(existing_meter, MeterProvider) to be
+                    # False, i.e. the global is still OTel's default ProxyMeterProvider, which
+                    # is only possible if shared.py did not fully load. That contradicts the
+                    # _OTEL_PACKAGES_AVAILABLE=True precondition required to reach this code.
+                    # Kept for the same isolated unit-test scenario described above.
+                    reader = PeriodicExportingMetricReader(
+                        OTLPMetricExporter(endpoint=OTEL_ENDPOINT, insecure=True),
+                        export_interval_millis=OTEL_METRIC_MS,
+                    )
+                    meter_prov = MeterProvider(resource=resource, metric_readers=[reader])
+                    otel_metrics.set_meter_provider(meter_prov)
+                    self._meter_prov = meter_prov
+
             except Exception:  # noqa
                 pass  # meter failure is non-fatal; traces still work
 
@@ -2827,16 +2869,18 @@ class TTSEmitter:
 
     @staticmethod
     def ok(
-        *,
-        session_id: str,
-        request_id: str,
-        latency_ms: float,
-        voice: str,
-        input_chars: int,
-        audio_output: str,
-        s3_uri: str = "",
-        chunk_count: int = 0,
-        tts_format: str = "",
+            *,
+            session_id: str,
+            request_id: str,
+            latency_ms: float,
+            voice: str,
+            input_chars: int,
+            audio_output: str,
+            audio_duration_s: float = 0.0,
+            audio_size_bytes: int = 0,
+            s3_uri: str = "",
+            chunk_count: int = 0,
+            tts_format: str = "",
     ) -> None:
         emit(
             ObsEvent(
@@ -2848,6 +2892,8 @@ class TTSEmitter:
                 voice=voice,
                 input_chars=input_chars,
                 audio_output=audio_output,
+                audio_duration_s=audio_duration_s,
+                audio_size_bytes=audio_size_bytes,
                 s3_uri=s3_uri,
                 chunk_count=chunk_count,
                 tts_format=tts_format,
@@ -5716,18 +5762,22 @@ __all__ = [
     "configure_logging",
     "get_logger",
     "get_metrics",
+
     # Event taxonomy
     "EventKind",
     "ObsEvent",
     "emit",
+
     # Context
     "session_context",
     "sync_session_context",
     "set_request_context",
     "get_session_id",
     "get_request_id",
+
     # Timing
     "StageTimer",
+
     # Component emitters
     "PipelineEmitter",
     "STTEmitter",
@@ -5744,6 +5794,7 @@ __all__ = [
     "ControllerEmitter",
     "RedisEmitter",
     "TranscriptEmitter",
+
     # OpenTelemetry — span context managers
     "pipeline_span",
     "stt_span",
@@ -5753,13 +5804,16 @@ __all__ = [
     "session_op_span",
     "memory_span",
     "sanitize_span",
+
     # OpenTelemetry — trace propagation + correlation
     "inject_trace_headers",
     "extract_trace_context",
     "get_trace_id",
     "get_span_id",
+
     # OpenTelemetry — attribute constants (for callers that add custom attrs)
     "_OtelLayer",
+
     # Grafana
     "build_grafana_dashboard",
     "write_grafana_dashboard",
