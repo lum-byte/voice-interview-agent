@@ -44,3 +44,4 @@ logs/
 
 .claude/
 *.pdf
+loc_counter.py
