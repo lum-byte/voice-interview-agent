@@ -185,9 +185,9 @@ from app.monitoring.observability import ( # noqa
     SanitizeEmitter,
 )
 from app.nodes.sanitize import sanitize
-from app.nodes.STT_service import STTNodeProtocol, get_stt_node
-from app.nodes.LLM_service import LLMNodeProtocol, get_llm_node
-from app.nodes.TTS_service import TTSNodeProtocol, get_tts_node
+from app.nodes.STT_service import STTNodeProtocol, get_stt_node, stt_node as _stt_singleton  # noqa
+from app.nodes.LLM_service import LLMNodeProtocol, get_llm_node, llm_node as _llm_singleton  # noqa
+from app.nodes.TTS_service import TTSNodeProtocol, get_tts_node, tts_node as _tts_singleton  # noqa
 from app.audio_essentials.player import play_audio
 from langchain_core.messages import HumanMessage # noqa
 
@@ -375,9 +375,9 @@ tracer = get_tracer(__name__)
 # these when no explicit nodes are injected. The compiled graph never references
 # these names — it always closes over the per-instance nodes supplied to
 # _build_graph_for_instance(). These are purely for the "no injection" default.
-_default_stt_node: STTNodeProtocol = get_stt_node()
-_default_llm_node: LLMNodeProtocol = get_llm_node()
-_default_tts_node: TTSNodeProtocol = get_tts_node()
+_default_stt_node: STTNodeProtocol | None = _stt_singleton
+_default_llm_node: LLMNodeProtocol | None = _llm_singleton
+_default_tts_node: TTSNodeProtocol | None = _tts_singleton
 
 # ── QoS / execution mode ───────────────────────────────────────────────────────
 
@@ -700,6 +700,7 @@ _stage_latency = make_histogram(
 _pipeline_latency = make_histogram(
     "voice_pipeline_latency_seconds",
     "Total pipeline wall-clock latency",
+    ["mode", "tier"],
     buckets=(1, 2, 3, 5, 8, 12, 20, 40, 90),
 )
 _cancellations = make_counter(
@@ -1141,13 +1142,17 @@ class StageBus:
 
         async with self._lock:
             self._seq += 1
-            msg = StageBusMessage(
-                payload=payload,
-                seq=self._seq,
-                source_stage=self._pair.split("→")[0] if "→" in self._pair else self._pair,
-                is_sentinel=is_sentinel,
-                is_error=is_error,
-            )
+            # Don't re-wrap if already a StageBusMessage
+            if isinstance(payload, StageBusMessage):
+                msg = payload
+            else:
+                msg = StageBusMessage(
+                    payload=payload,
+                    seq=self._seq,
+                    source_stage=self._pair.split("→")[0] if "→" in self._pair else self._pair,
+                    is_sentinel=is_sentinel,
+                    is_error=is_error,
+                )
 
             if self._queue.qsize() >= self._depth:
                 if self._overflow == OverflowPolicy.DROP_OLDEST:
@@ -1161,7 +1166,7 @@ class StageBus:
                             stage_pair=self._pair,
                             dropped_seq=dropped.seq if hasattr(dropped, "seq") else -1,
                         )
-                    except Exception: # noqa
+                    except Exception:  # noqa
                         pass
                 elif self._overflow == OverflowPolicy.REJECT:
                     _stagebus_overflow_total.labels(
@@ -1611,7 +1616,7 @@ class PipelineWatchdog:
         if degraded:
             self._strikes += 1
             if self._strikes >= self._threshold:
-                _watchdog_alerts.labels(alert_level="critical").inc()
+                _watchdog_alerts.labels(alert_level="critical").inc()  # type: ignore[attr-defined]
                 log.error(
                     "watchdog_critical_threshold",
                     session_id=self._session_id[:8],
@@ -1621,7 +1626,7 @@ class PipelineWatchdog:
                 # Reset strike counter after alerting to avoid spam
                 self._strikes = 0
             else:
-                _watchdog_alerts.labels(alert_level="warning").inc()
+                _watchdog_alerts.labels(alert_level="warning").inc()  # type: ignore[attr-defined]
         else:
             # Decay strikes on healthy heartbeats
             self._strikes = max(0, self._strikes - 1)
@@ -2977,14 +2982,14 @@ async def _node_llm_qa_path(
 
         try:
             # 1. Check session guardrails (total cap, timeout, etc.)
-            guardrail_result = await _qa_guardrail_engine.check(session_id, doc)
+            guardrail_result = _qa_guardrail_engine.evaluate(doc, candidate_answer, doc.created_at)
             if guardrail_result.should_stop:
                 log.info(
                     "qa_path_guardrail_stop",
                     session_id=session_id[:8],
-                    reason=guardrail_result.reason,
+                    reason=guardrail_result.rule,
                 )
-                await _qa_controller.mark_complete(session_id, reason=guardrail_result.reason)
+                await _qa_controller.mark_complete(session_id, reason=guardrail_result.rule)
                 return (_CLOSING_TEXT, "complete", doc.active_domain or "none") # noqa
 
             # 2. Build the next LLM input through the QA controller
@@ -3006,7 +3011,7 @@ async def _node_llm_qa_path(
                 prefetched = _qa_prefetch_buffer.get(session_id, llm_input.domain)
 
             # 4. Generate the question (or use prefetched)
-            if prefetched and _question_fingerprint_store.is_unique(session_id, prefetched):
+            if prefetched and not await _qa_controller._fingerprints.is_duplicate(session_id, llm_input.domain, prefetched): # noqa
                 next_question = prefetched
                 log.info("qa_path_prefetch_hit", session_id=session_id[:8], domain=llm_input.domain)
             else:
@@ -3063,10 +3068,11 @@ async def _node_llm_qa_path(
             # level, so even when the LLM is completely down, the interview can
             # continue without the candidate noticing.
             try:
-                fallback_q = _static_question_bank.get(
+                fallback_q = _static_question_bank.get_question(
+                    session_id=session_id,
                     domain=doc.active_domain or "general",
                     level=doc.candidate.level if doc.candidate else "intermediate",
-                    exclude=_question_fingerprint_store.all_fingerprints(session_id),
+                    difficulty="medium",
                 )
                 if fallback_q:
                     await _qa_controller.commit_turn(session_id, candidate_answer, fallback_q)
@@ -3075,11 +3081,11 @@ async def _node_llm_qa_path(
                         session_id=session_id[:8],
                         domain=doc.active_domain,
                     )
-                    return (fallback_q, "interview", doc.active_domain or "general") # noqa
+                    return (fallback_q, "interview", doc.active_domain or "general")  # noqa
             except Exception as fb_exc:
                 log.error("qa_path_static_fallback_failed", session_id=session_id[:8], error=str(fb_exc))
 
-            return (_APOLOGY_FALLBACK, "interview", doc.active_domain or "general") # noqa
+            return (_APOLOGY_FALLBACK, "interview", doc.active_domain or "general")  # noqa
 
     # ══════════════════════════════════════════════════════════════════════
     #  COMPLETE STAGE
@@ -3131,48 +3137,35 @@ async def _generate_interview_question(
             # the candidate answer is informational, not executable.
 
     # Build the prompt context from the immutable LLMInterviewInput
-    prompt_ctx = _llm_input_builder.build(llm_input)
+    prompt_ctx = llm_input
 
     # Call the LLM
     raw_question = await _llm_generate_question(prompt_ctx, rid)
 
     # Post-generation guardrails
     # 1. Content policy filter
-    filtered = _content_policy_filter.filter(raw_question)
-    if filtered.blocked:
-        log.warning(
-            "qa_question_content_blocked",
-            session_id=session_id[:8],
-            reason=filtered.reason,
-        )
-        # Fall through to static bank
-        raise ValueError(f"Content policy blocked: {filtered.reason}")
+    question = _content_policy_filter.filter(raw_question)
 
-    question = filtered.text
-
-    # 2. Word count cap (80 words, sentence-boundary truncation)
-    question = _streaming_word_guard.enforce(question, max_words=80)
+    # 2. Word count cap (sentence-boundary truncation)
+    question = _streaming_word_guard._truncate_to_last_question(question) # noqa
 
     # 3. Fingerprint deduplication
-    is_unique = _question_fingerprint_store.is_unique(session_id, question)
-    if not is_unique:
-        # Question is a duplicate — try diversity enforcer for a variant
+    is_dup = await _qa_controller._fingerprints.is_duplicate(session_id, llm_input.domain, question) # noqa
+    if is_dup:
         log.info("qa_question_duplicate", session_id=session_id[:8])
-        variant = _question_diversity_enforcer.get_variant(
-            domain=llm_input.domain,
-            level=llm_input.level,
-            original=question,
-        )
-        if variant:
-            question = variant
-        else:
-            raise ValueError("Duplicate question with no variant available")
+        raise ValueError("Duplicate question with no variant available")
 
-    # Record fingerprint for future dedup
-    _question_fingerprint_store.record(session_id, question)
+    # 4. Diversity check against recent questions
+    too_similar, sim_score = _question_diversity_enforcer.is_too_similar(session_id, llm_input.domain, question)
+    if too_similar:
+        log.info("qa_question_too_similar", session_id=session_id[:8], similarity=round(sim_score, 3))
+        raise ValueError("Question too similar to recent questions")
+
+    # Record for future dedup and diversity checks
+    await _qa_controller._fingerprints.register(session_id, llm_input.domain, question) # noqa
+    _question_diversity_enforcer.register(session_id, llm_input.domain, question)
 
     return question
-
 
 async def _ats_llm_extract(intro_input: Any, rid: str) -> Any:
     """
@@ -3287,24 +3280,26 @@ class VoiceGraph:
     )
 
     def __init__(
-        self,
-        *,
-        stt:    STTNodeProtocol | None = None,
-        llm:    LLMNodeProtocol | None = None,
-        tts:    TTSNodeProtocol | None = None,
-        cfg:    VoiceGraphConfig | None = None,
-        is_dev: bool = IS_DEV,
-        tier:   str  = "balanced",
+            self,
+            *,
+            stt: STTNodeProtocol  | None = None,
+            llm: LLMNodeProtocol  | None = None,
+            tts: TTSNodeProtocol  | None = None,
+            cfg: VoiceGraphConfig | None = None,
+            is_dev: bool = IS_DEV,
+            tier: str = "balanced",
     ) -> None:
-        self._cfg    = cfg or VoiceGraphConfig.from_settings()
-        self._stt    = stt or get_stt_node()
-        self._llm    = llm or get_llm_node()
-        self._tts    = tts or get_tts_node()
+
+        self._cfg = cfg or VoiceGraphConfig.from_settings()
+        self._stt = stt or _default_stt_node
+        self._llm = llm or _default_llm_node
+        self._tts = tts or _default_tts_node
+
         self._is_dev = is_dev
-        self._tier   = tier
+        self._tier = tier
 
         self._load_guard = LoadSheddingGuard(
-            max_inflight=self._cfg.max_inflight,
+            max_concurrent=self._cfg.max_inflight,
             queue_size=self._cfg.load_shed_queue_size,
         )
 
@@ -4572,35 +4567,41 @@ class VoiceGraph:
         # STT node health
         try:
             stt_health = await self._stt.health()
-            result["stt"] = stt_health
+            result["stt"] = vars(stt_health)
         except Exception as exc:
             result["stt"] = {"healthy": False, "error": str(exc)}
 
         # LLM node health
         try:
             llm_health = await self._llm.health()
-            result["llm"] = llm_health
+            result["llm"] = vars(llm_health)
         except Exception as exc:
             result["llm"] = {"healthy": False, "error": str(exc)}
 
         # TTS node health
         try:
             tts_health = await self._tts.health()
-            result["tts"] = tts_health
+            result["tts"] = vars(tts_health)
         except Exception as exc:
             result["tts"] = {"healthy": False, "error": str(exc)}
 
         # QA controller health
         try:
-            qa_health = await _qa_controller.health()
-            result["qa_controller"] = qa_health
+            if _qa_controller is not None:
+                qa_health = await _qa_controller.health()
+                result["qa_controller"] = vars(qa_health) if not isinstance(qa_health, dict) else qa_health
+            else:
+                result["qa_controller"] = {"healthy": True}
         except Exception as exc:
             result["qa_controller"] = {"healthy": False, "error": str(exc)}
 
         # Evaluation engine health
         try:
-            eval_health = await _eval_engine.health()
-            result["evaluation"] = eval_health
+            if _eval_engine is not None:
+                eval_health = await _eval_engine.health()
+                result["evaluation"] = vars(eval_health) if not isinstance(eval_health, dict) else eval_health
+            else:
+                result["evaluation"] = {"healthy": True}
         except Exception as exc:
             result["evaluation"] = {"healthy": False, "error": str(exc)}
 
@@ -4705,23 +4706,9 @@ class VoiceGraph:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _split_into_sentences(text: str) -> list[str]:
-    """
-    Split text into sentences for sentence-level TTS pipelining. Uses a simple
-    regex-based splitter that handles common abbreviations and decimal numbers.
-    Returns at least one element even for empty/single-sentence text.
-    """
-    if not text or not text.strip():
-        return [text] if text else [""]
-
-    # Split on sentence-ending punctuation followed by whitespace and uppercase
-    import re
-    # Negative lookbehind for common abbreviations (Mr., Mrs., Dr., etc.)
-    pattern = r'(?<![A-Z][a-z]\.)(?<!\b(?:Mr|Mrs|Ms|Dr|Jr|Sr|St|Prof|Gen|Gov|Sgt|Cpl|Pvt|Rep|Sen|Rev|Hon|Pres|Asst|Supt|Cmdr|Capt|Lt|Col|Maj|Brig|Adm)\.)(?<=[.!?])\s+'
-    sentences = re.split(pattern, text.strip())
-
-    # Filter out empty strings and strip whitespace
-    return [s.strip() for s in sentences if s.strip()]
-
+    """Shim — delegates to sanitize.split_into_sentences()."""
+    from app.nodes.sanitize import split_into_sentences
+    return split_into_sentences(text)
 
 # ── apology strings per stage ─────────────────────────────────────────────────
 
@@ -4751,7 +4738,7 @@ APOLOGY_TTS: str = (
 
 # ── QA controller ─────────────────────────────────────────────────────────────
 try:
-    from qa_controller import (
+    from app.interview.qa_controller import (
         qa_controller as _qa_controller,
         QAAnalytics as _QAAnalytics,
         ATSRuleExtractor as _ATSRuleExtractorCls,
@@ -4759,14 +4746,14 @@ try:
         QuestionPrefetchBuffer as _QuestionPrefetchBufferCls,
         QAGuardrailEngine as _QAGuardrailEngineCls,
         LLMInputBuilder as _LLMInputBuilderCls,
-        StaticQuestionBank as _StaticQuestionBankCls,
         DOMAIN_REGISTRY as _DOMAIN_REGISTRY,
     )
+    from app.nodes.LLM_service import StaticQuestionBank as _StaticQuestionBankCls
     _ats_rule_extractor         = _ATSRuleExtractorCls()
-    _question_fingerprint_store = _QuestionFingerprintStoreCls()
+    _question_fingerprint_store = None  # accessed via _qa_controller._fingerprints at runtime
     _qa_prefetch_buffer         = _QuestionPrefetchBufferCls()
     _qa_guardrail_engine        = _QAGuardrailEngineCls()
-    _llm_input_builder          = _LLMInputBuilderCls()
+    _llm_input_builder          = None  # accessed via _qa_controller._input_builder at runtime
     _static_question_bank       = _StaticQuestionBankCls()
 except ImportError:
     log.warning("qa_controller_import_failed — QA features disabled")
@@ -4790,7 +4777,7 @@ _ATS_RULE_CONFIDENCE_THRESHOLD: float = float(os.getenv("ATS_RULE_CONFIDENCE_THR
 
 # ── Evaluation engine ─────────────────────────────────────────────────────────
 try:
-    from evaluation_engine import evaluation_engine as _eval_engine
+    from app.eval.evaluation_engine import evaluation_engine as _eval_engine
     _eval_enabled = True
 except ImportError:
     log.warning("evaluation_engine_import_failed — eval features disabled")
@@ -4799,7 +4786,7 @@ except ImportError:
 
 # ── LLM wiring ───────────────────────────────────────────────────────────────
 try:
-    from LLM_service import (
+    from app.nodes.LLM_service import (
         get_llm_node,  # noqa
         PromptInjectionDetector as _PromptInjectionDetectorCls,
         ContentPolicyFilter as _ContentPolicyFilterCls,
@@ -4823,13 +4810,13 @@ except ImportError:
 
 # ── STT / TTS node factories ─────────────────────────────────────────────────
 try:
-    from STT_service import get_stt_node
+    from app.nodes.STT_service import get_stt_node
 except ImportError:
     log.warning("STT_service_import_failed")
     get_stt_node = None
 
 try:
-    from TTS_service import get_tts_node
+    from app.nodes.TTS_service import get_tts_node
 except ImportError:
     log.warning("TTS_service_import_failed")
     get_tts_node = None
@@ -6107,17 +6094,21 @@ async def on_startup() -> None:
     t0 = time.monotonic()
 
     # ── 1. STT warm-up ───────────────────────────────────────────────────
+    # STT warm-up
     try:
-        stt_node = get_stt_node()
-        await stt_node.warmup()
+        stt_node = voice_graph._stt # noqa
+        if hasattr(stt_node, "warmup"):
+            await stt_node.warmup()
         log.info("startup_stt_warmup_ok")
     except Exception as exc:
         log.error("startup_stt_warmup_failed", error=str(exc))
 
     # ── 2. TTS warm-up ───────────────────────────────────────────────────
+    # TTS warm-up
     try:
-        tts_node = get_tts_node()
-        await tts_node.warmup()
+        tts_node = voice_graph._tts # noqa
+        if hasattr(tts_node, "warmup"):
+            await tts_node.warmup()
         log.info("startup_tts_warmup_ok")
     except Exception as exc:
         log.error("startup_tts_warmup_failed", error=str(exc))
@@ -6125,7 +6116,6 @@ async def on_startup() -> None:
     # ── 3. QA controller init ────────────────────────────────────────────
     try:
         if _qa_controller is not None:
-            await _qa_controller.connect()
             qa_health = await _qa_controller.health()
             log.info("startup_qa_controller_ok", health=qa_health)
     except Exception as exc:
@@ -6134,7 +6124,6 @@ async def on_startup() -> None:
     # ── 4. Evaluation engine init ────────────────────────────────────────
     try:
         if _eval_engine is not None:
-            await _eval_engine.connect()
             eval_health = await _eval_engine.health()
             log.info("startup_eval_engine_ok", health=eval_health)
     except Exception as exc:
@@ -6142,7 +6131,7 @@ async def on_startup() -> None:
 
     # ── 5. Recording health check ────────────────────────────────────────
     try:
-        rec_ok = await asyncio.to_thread(run_recorder_health_check)
+        rec_ok = await run_recorder_health_check()
         log.info("startup_recorder_health", ok=rec_ok)
     except Exception as exc:
         log.warning("startup_recorder_health_failed", error=str(exc))
@@ -6200,16 +6189,18 @@ async def on_shutdown() -> None:
 
     # ── 2. STT unload ────────────────────────────────────────────────────
     try:
-        stt_node = get_stt_node()
-        await stt_node.shutdown()
+        stt_node = voice_graph._stt # noqa
+        if hasattr(stt_node, "close"):
+            await stt_node.close()
         log.info("shutdown_stt_ok")
     except Exception as exc:
         log.warning("shutdown_stt_error", error=str(exc))
 
     # ── 3. TTS unload ────────────────────────────────────────────────────
     try:
-        tts_node = get_tts_node()
-        await tts_node.shutdown()
+        tts_node = voice_graph._tts # noqa
+        if hasattr(tts_node, "close"):
+            await tts_node.close()
         log.info("shutdown_tts_ok")
     except Exception as exc:
         log.warning("shutdown_tts_error", error=str(exc))
@@ -6225,7 +6216,7 @@ async def on_shutdown() -> None:
     # ── 5. Evaluation engine disconnect ──────────────────────────────────
     try:
         if _eval_engine is not None:
-            await _eval_engine.disconnect()
+            await _eval_engine.close()
             log.info("shutdown_eval_engine_ok")
     except Exception as exc:
         log.warning("shutdown_eval_engine_error", error=str(exc))

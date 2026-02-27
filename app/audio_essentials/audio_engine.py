@@ -133,8 +133,15 @@ _OUTPUT_QUEUE_MAXSIZE: int = int(os.getenv("PCM_OUTPUT_QUEUE_MAXSIZE", "16"))
 _OUTPUT_WARMUP_FRAMES: int = int(os.getenv("PCM_OUTPUT_WARMUP_FRAMES", "512"))
 _OUTPUT_LATENCY: str = os.getenv("PCM_OUTPUT_LATENCY", "low")
 
+# Noise suppressor config
+_NS_OVERSUBTRACTION: float = float(os.getenv("PCM_NS_OVERSUBTRACTION", "1.0"))   # was 2.0; lower = less aggressive
+_NS_SPECTRAL_FLOOR: float  = float(os.getenv("PCM_NS_SPECTRAL_FLOOR",  "0.15"))  # was 0.02; higher = less musical noise
+_NS_WARMUP_FRAMES: int     = int(os.getenv("PCM_NS_WARMUP_FRAMES",     "20"))    # was 10; more frames for noise floor estimate
+
 # VAD config
-_VAD_ONSET_RMS: float = float(os.getenv("PCM_VAD_ONSET_RMS", "200.0"))     # int16 scale
+_VAD_ONSET_RMS: float = float(os.getenv("PCM_VAD_ONSET_RMS", "80.0"))
+# int16 scale — was 200; lowered for post-NS signal levels
+
 _VAD_OFFSET_RMS: float = float(os.getenv("PCM_VAD_OFFSET_RMS", "80.0"))
 _VAD_HANGOVER_S: float = float(os.getenv("PCM_VAD_HANGOVER_S", "0.4"))
 _VAD_PRE_ROLL_S: float = float(os.getenv("PCM_VAD_PRE_ROLL_S", "0.15"))
@@ -2047,12 +2054,14 @@ class PCMVADGate:
         Feed one chunk through the state machine.
         Returns a complete speech segment PCMChunk when a segment ends, else None.
         """
-        rms = self._rms(chunk.data)
         data = chunk.data
+        if data.ndim == 2:
+            data = data[:, 0] if self._fmt.channels == 1 else data.reshape(-1)
+        rms = self._rms(data)
 
         if self._state == _VADState.SILENCE:
             # Always maintain pre-roll buffer
-            self._pre_roll.write(data if data.ndim == 1 else data[:, 0] if data.ndim == 2 and self._fmt.channels == 1 else data.reshape(-1))
+            self._pre_roll.write(data)
             if rms >= self._onset:
                 # Transition SILENCE → SPEECH
                 _vad_transitions.labels(direction="onset").inc()
@@ -3151,10 +3160,10 @@ class PCMNoiseSuppressor:
         fft_size: int = 512,
         hop_size: int | None = None,
         noise_update_rate: float = 0.95,
-        oversubtraction: float = 2.0,
-        spectral_floor: float = 0.02,
+        oversubtraction: float = _NS_OVERSUBTRACTION,
+        spectral_floor: float = _NS_SPECTRAL_FLOOR,
         silence_threshold: float = 0.01,
-        noise_warmup_frames: int = 10,
+        noise_warmup_frames: int = _NS_WARMUP_FRAMES,
     ) -> None:
         if fmt.dtype != "float32":
             raise ValueError(
@@ -3641,7 +3650,7 @@ class PCMDynamicsProcessor:
         """
 
         data = chunk.data.astype(np.float64)
-        scale = 32768.0 if chunk.fmt.dtype == np.int16 else 1.0
+        scale = 32768.0 if chunk.fmt.dtype == "int16" else 1.0
 
         mono = data[:, 0] if data.ndim == 2 else data
         mono_norm = mono / scale
@@ -4057,7 +4066,7 @@ class PCMWaveformAnalyzer:
         peak = float(np.max(np.abs(mono_norm)))
         dc = float(np.mean(mono_norm))
 
-        crest_db = 20 * math.log10(peak / (rms + 1e-12))
+        crest_db = 20 * math.log10(peak / (rms + 1e-12)) if peak > 0.0 else 0.0
         n = len(mono)
         zcr = float(np.sum(np.diff(np.sign(mono_norm)) != 0)) / (n - 1) if n > 1 else 0.0
 
@@ -5424,37 +5433,41 @@ class PCMSpeechEnhancer:
         if enable_bandpass:
             builder.with_bandpass(PCMBandpassFilter(fmt, low_hz=80, high_hz=8000))
 
+        # Always convert int16 → float32 before any DSP stage.
+        # int16_to_float32 was previously inside `if enable_ns`, so disabling NS
+        # left AGC receiving raw int16 (RMS ~1000) while target_rms=0.1 (float32
+        # scale) — gain=0.000085 crushed the signal to silence before VAD.
+        float_fmt = PCMFormat(sample_rate=fmt.sample_rate, channels=fmt.channels, dtype="float32")
+        if fmt.dtype != "float32":
+            _converter = PCMConverter(quality="auto")
+
+            class _DtypeAdapter:
+                async def stream(self, chunks: AsyncIterator[PCMChunk]) -> AsyncIterator[PCMChunk]: # noqa
+                    async for chunk in chunks:
+                        yield _converter.convert(chunk, float_fmt)
+
+            builder.add(_DtypeAdapter(), "int16_to_float32")
+
         if enable_ns:
-            float_fmt = PCMFormat(sample_rate=fmt.sample_rate, channels=fmt.channels, dtype="float32")
-            if fmt.dtype != "float32":
-                _converter = PCMConverter(quality="auto")
-
-                class _DtypeAdapter:
-                    async def stream(self, chunks: AsyncIterator[PCMChunk]) -> AsyncIterator[PCMChunk]: # noqa
-                        async for chunk in chunks:
-                            yield _converter.convert(chunk, float_fmt)
-
-                builder.add(_DtypeAdapter(), "int16_to_float32")
-
             builder.with_noise_suppressor(PCMNoiseSuppressor(float_fmt))
 
         if enable_agc:
-            builder.with_agc(PCMAGCProcessor(fmt))
+            builder.with_agc(PCMAGCProcessor(float_fmt))
 
         if enable_gate:
-            builder.with_noise_gate(PCMNoiseGate(fmt))
+            builder.with_noise_gate(PCMNoiseGate(float_fmt))
 
-        # VAD stage
+        # VAD stage — all backends receive float32 at this point
         if vad_backend == "energy":
-            vad: Any = PCMVADGate(fmt)
+            vad: Any = PCMVADGate(float_fmt)
         elif vad_backend == "spectral":
-            vad = PCMSpectralVAD(fmt)
+            vad = PCMSpectralVAD(float_fmt)
         elif vad_backend == "webrtc":
-            vad = PCMWebRTCVAD(fmt)
+            vad = PCMWebRTCVAD(float_fmt)
         else:  # fused
             energy_b = _EnergyVADBackend()
-            spectral_b = _SpectralVADBackend(PCMSpectralVAD(fmt))
-            vad = PCMFusedVAD(fmt=fmt, backends=[energy_b, spectral_b], mode="majority")
+            spectral_b = _SpectralVADBackend(PCMSpectralVAD(float_fmt, ratio_thresh=0.3))
+            vad = PCMFusedVAD(fmt=float_fmt, backends=[energy_b, spectral_b], mode="majority")
 
         builder.with_vad(vad)
         self._interrupt_detector = interrupt_detector

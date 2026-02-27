@@ -3568,6 +3568,23 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
         })
         return base
 
+    # ── graceful shutdown ──────────────────────────────────────────────────────
+
+    async def disconnect(self) -> None:
+        """
+        Release all held resources. Called by voice_graph.on_shutdown().
+        Closes the underlying aioredis connection held by _QARedisClient.
+        Safe to call multiple times — no-ops if already disconnected.
+        """
+        try:
+            redis_client: _QARedisClient = self._redis  # noqa
+            if redis_client._redis is not None: # noqa
+                await redis_client._redis.aclose() # noqa
+                redis_client._redis = None
+        except Exception as exc:
+            log.warning("qa_controller_disconnect_error", error=str(exc))
+        log.info("qa_controller_disconnected")
+
 
 # ── voice_graph integration: build_next_llm_input ─────────────────────────────
 

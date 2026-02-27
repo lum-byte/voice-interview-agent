@@ -50,9 +50,12 @@ from app.monitoring.observability import (
 )
 
 from app.audio_essentials.player import (
-    play_audio_bytes,
+    play_pcm_bytes,
+    drain_output,
     stop_all,
 )
+
+from app.audio_essentials.audio_engine import PCMFormat
 from app.audio_essentials.recorder import record_audio_until_released
 from app.orchestration.voice_graph import (
     voice_graph,
@@ -223,19 +226,21 @@ def _dispatch(audio_path: str) -> None:
                         audio_path=audio_path,
                     )
 
-                    pipeline_state = {
-                        "audio_path": audio_path,
-                        "mode": "stream",
-                        "request_id": rid,
-                    }
+                    _pcm_fmt = PCMFormat.openai_tts()
 
-                    if _session_id:
-                        pipeline_state["session_id"] = _session_id
-                        pipeline_state["client_ip"] = _local_ip
+                    async for segment in voice_graph.stream_full(
+                            audio_path=audio_path,
+                            session_id=_session_id or "",
+                            request_id=rid,
+                    ):
+                        local_path: str = segment.get("local_path", "")
+                        if not local_path:
+                            continue
+                        with open(local_path, "rb") as _f:
+                            pcm_bytes = _f.read()
+                        await play_pcm_bytes(pcm_bytes, _pcm_fmt)
 
-                    async for audio_bytes in voice_graph.stream_full(pipeline_state):
-                        play_audio_bytes(audio_bytes)
-
+                    await drain_output()  # wait for speaker buffer to flush
                     log.info("controller_pipeline_done", request_id=rid)
 
                 except asyncio.CancelledError:

@@ -273,7 +273,7 @@ _ENABLE_ENHANCEMENT: bool = os.getenv("RECORDER_ENABLE_ENHANCEMENT", "1") == "1"
 #   "spectral" — adds frequency-domain voice-band analysis (better with HVAC noise)
 #   "webrtc"   — Google WebRTC VAD (requires webrtcvad-wheels, very robust)
 #   "fused"    — majority-vote ensemble of energy + spectral (recommended default)
-_VAD_BACKEND: str = os.getenv("RECORDER_VAD_BACKEND", "energy")
+_VAD_BACKEND: str = os.getenv("RECORDER_VAD_BACKEND", "fused")
 
 # ── Ring buffer capacity ──────────────────────────────────────────────────────
 #
@@ -329,9 +329,9 @@ def _get_speech_enhancer() -> PCMSpeechEnhancer:
                 _speech_enhancer = PCMSpeechEnhancer(
                     fmt=_RECORDING_FMT,
                     enable_bandpass=True,
-                    enable_ns=True,
+                    enable_ns=False,    # disabled: suppressor contaminates noise floor with speech
                     enable_agc=True,
-                    enable_gate=True,
+                    enable_gate=False,  # disabled: gate over-suppresses quiet voices
                     vad_backend=_VAD_BACKEND,   # type: ignore[arg-type]
                     tracker=get_latency_tracker(),
                 )
@@ -605,6 +605,10 @@ async def _record_pcm_async(is_held_fn: Callable[[], bool]) -> str | None:
         # trim down to cleaner speech windows. Only confirmed is_final=True speech
         # segments are appended; inter-speech silence is discarded.
         enhancer = _get_speech_enhancer()
+        # Reset stateful DSP/VAD state carried over from previous sessions
+        for stage in enhancer._pipeline._stages: # noqa
+            if hasattr(stage, "reset"):
+                stage.reset()
         async for speech_chunk in enhancer.stream(_collected_source()):
             enhanced_chunks.append(speech_chunk)
 

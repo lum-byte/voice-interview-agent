@@ -159,7 +159,7 @@ _XML_DECLARATION = re.compile(r"<\?xml[^?]*\?>", re.I)
 # ── stage 8: ANSI escape codes ────────────────────────────────────────────────
 # Covers colour codes, cursor movement, and OSC sequences.
 _ANSI_ESCAPE = re.compile(
-    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*[\x07\x1b\\])"
+    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*[\x07\x1b\\])" # noqa
 )  # noqa
 
 # ── stage 9: zero-width + invisible Unicode ───────────────────────────────────
@@ -186,6 +186,7 @@ _PATH_TRAVERSAL = re.compile(r"\.\.[\\/]")
 # ── stage 13: prompt injection ────────────────────────────────────────────────
 # Looks for common jailbreak / instruction-override patterns.
 # We strip the offending sentence rather than the entire response.
+# noinspection RegExpRedundantEscape
 _PROMPT_INJECTION = re.compile(
     r"(?i)"
     r"(ignore\s+(all\s+)?previous\s+instructions?"
@@ -207,7 +208,7 @@ _TEMPLATE_INJECTION = re.compile(r"\{\{.*?\}\}|\{%-?.*?-?%\}", re.S)  # noqa
 
 # ── stage 18: markdown block-level elements ───────────────────────────────────
 # Order matters: fenced code blocks first (they may contain anything).
-_MD_FENCED_CODE = re.compile(r"```[\w]*\n?.*?```", re.S)  # ```python\n…```
+_MD_FENCED_CODE = re.compile(r"```[\w]*\n?.*?```", re.S)  # ```python\n…```  # noqa
 _MD_INDENTED_CODE = re.compile(r"(?m)^(?: {4}|\t)[^\n]+")  # 4-space indent
 _MD_BLOCK_QUOTE = re.compile(r"(?m)^>+\s?")  # > blockquote
 _MD_HR = re.compile(r"(?m)^[ \t]*[-*_]{3,}[ \t]*$")  # --- / *** / ___
@@ -216,21 +217,21 @@ _MD_TABLE_SEP = re.compile(r"(?m)^\|[-| :]+\|$")  # |-----|-----|
 _MD_HEADER = re.compile(r"(?m)^#{1,6}\s+")  # # Heading
 _MD_SETEXT_H1 = re.compile(r"(?m)^=+\s*$")  # Setext heading ====
 _MD_SETEXT_H2 = re.compile(r"(?m)^-+\s*$")  # Setext heading ----
-_MD_TASK_LIST = re.compile(r"(?m)^[-*+]\s+\[[ xX]\]\s+")  # - [x] task
+_MD_TASK_LIST = re.compile(r"(?m)^[-*+]\s+\[[ xX]\]\s+")  # - [x] task # noqa
 
 # ── stage 19: markdown inline elements ───────────────────────────────────────
 # Strip ![alt](url) images before [text](url) links.
-_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")  # ![alt](url) → alt
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")  # [text](url) → text
-_MD_REF_LINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")  # [text][ref]  → text
+_MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")  # ![alt](url) → alt  # noqa
+_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]*\)")  # [text](url) → text  # noqa
+_MD_REF_LINK = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")  # [text][ref]  → text  # noqa
 _MD_AUTO_LINK = re.compile(r"<(https?://[^>]+)>")  # <url> → url
 _MD_STRIKETHROUGH = re.compile(r"~~(.+?)~~")  # ~~strike~~ → strike
 _MD_BOLD_ITALIC = re.compile(r"\*{3}(.+?)\*{3}|_{3}(.+?)_{3}")  # ***…*** or ___…___
 _MD_BOLD = re.compile(r"\*{2}(.+?)\*{2}|_{2}(.+?)_{2}")  # **…** or __…__
 _MD_ITALIC = re.compile(r"\*(.+?)\*|_(.+?)_")  # *…* or _…_
 _MD_INLINE_CODE = re.compile(r"`{1,2}[^`]+`{1,2}")  # `code` or ``code``
-_MD_FOOTNOTE_DEF = re.compile(r"(?m)^\[\^[^\]]+\]:[^\n]+")  # [^1]: footnote
-_MD_FOOTNOTE_REF = re.compile(r"\[\^[^\]]+\]")  # [^1]
+_MD_FOOTNOTE_DEF = re.compile(r"(?m)^\[\^[^\]]+\]:[^\n]+")  # [^1]: footnote  # noqa
+_MD_FOOTNOTE_REF = re.compile(r"\[\^[^\]]+\]")  # [^1]  # noqa
 _MD_LIST_MARKER = re.compile(r"(?m)^[ \t]*[-*+]\s+")  # - / * / + list
 _MD_ORDERED_LIST = re.compile(r"(?m)^\s*\d+\.\s+")  # 1. item
 _MD_HIGHLIGHT = re.compile(r"==(.+?)==")  # ==highlight== → text
@@ -376,7 +377,7 @@ _SYMBOL_SUBS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\+"), " plus "),  # after tech tokens
     (re.compile(r"="), " equals "),
     # Punctuation / glyphs that TTS often misreads
-    (re.compile(r"[\|｜]"), ", "),
+    (re.compile(r"[\|｜]"), ", "),  # noqa
     (re.compile(r"\\"), " "),
     (re.compile(r"~"), " approximately "),
     # Intellectual-property markers — just strip, they add nothing spoken
@@ -749,6 +750,145 @@ def sanitize_text_only(
     """
     return sanitize(text, max_chars=max_chars, request_id=request_id).text
 
+# ── sentence splitter ─────────────────────────────────────────────────────────
+
+_ABBREVS: frozenset[str] = frozenset({
+    # honorifics
+    "mr", "mrs", "ms", "miss", "mx", "dr", "prof", "rev", "hon", "pres",
+    # military
+    "gen", "adm", "cmdr", "capt", "lt", "col", "maj", "brig", "sgt", "cpl", "pvt",
+    # civic / political
+    "rep", "sen", "gov", "atty", "supt",
+    # academic / religious
+    "sr", "jr", "st", "mt",
+    # latin / scholarly
+    "etc", "eg", "ie", "cf", "vs", "al", "ibid", "et",
+    # corporate suffixes
+    "inc", "ltd", "corp", "co", "llc", "llp", "plc", "assn", "assoc",
+    # geographic
+    "ave", "blvd", "rd", "ln", "ct", "pl", "sq", "hwy", "pkwy",
+    # months / days
+    "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    "mon", "tue", "wed", "thu", "fri", "sat", "sun",
+    # misc
+    "no", "vol", "pp", "fig", "dept", "approx", "misc",
+})
+
+# Splits on terminal punctuation optionally followed by a closing quote/paren,
+# then one or more whitespace chars. Fixed-width lookbehind — no variable-width.
+_SENT_SPLIT_RE = re.compile(r'([.!?]["\')]?)\s+')
+
+# Decimal guard: "3.14" or "v1.2" — dot between digits is never a sentence end.
+_DECIMAL_RE = re.compile(r'\w\.\d')
+
+# Single uppercase initial: "J." at end of a token — not a sentence end.
+_INITIAL_RE = re.compile(r'(?<![A-Za-z])[A-Z]\.$')
+
+
+def split_into_sentences(
+    text: str,
+    *,
+    max_chars: int = 400,
+    min_chars: int = 12,
+) -> list[str]:
+    """
+    Split sanitized LLM output into TTS-ready sentence fragments.
+
+    Handles:
+      - Honorifics / titles / military ranks  (Dr., Prof., Gen., Lt., ...)
+      - Corporate / geographic suffixes       (Inc., Ltd., St., Ave., ...)
+      - Latin abbreviations                   (e.g., i.e., etc., vs., cf., ...)
+      - Decimal numbers                       (3.14, v1.9, $2.50)
+      - Single-letter initials                (J. R. R. Tolkien)
+      - Quoted terminal punctuation           ("Hello." / 'Done.')
+      - Hard length cap with word-boundary    (prevents runaway TTS chunks)
+      - Short-fragment merging                (avoids robotic single-word chunks)
+
+    Args:
+        text:      Pre-sanitized text. Run sanitize_for_tts() first.
+        max_chars: Hard cap per fragment. Fragments over this are split at the
+                   last word boundary. Default 400 (safe for OpenAI TTS).
+        min_chars: Fragments shorter than this are merged into the next one.
+                   Default 12. Prevents "OK." or "Yes." becoming lone chunks.
+
+    Returns:
+        Non-empty list of strings. Always returns at least one element.
+        Never raises.
+    """
+    if not text or not text.strip():
+        return [text] if text else [""]
+
+    # re.split with a capturing group interleaves the matched delimiter back in:
+    # "Hello. World" → ["Hello", ".", "World"]
+    # We zip pairs back together so each token carries its own terminal punct.
+    raw_parts = _SENT_SPLIT_RE.split(text.strip())
+    tokens: list[str] = []
+    i = 0
+    while i < len(raw_parts):
+        chunk = raw_parts[i]
+        # next element is the captured punctuation group (if present)
+        if i + 1 < len(raw_parts) and raw_parts[i + 1] in (".", "!", "?", '."', ".'", '?"', "?'", '!"', "!'"):
+            tokens.append(chunk + raw_parts[i + 1])
+            i += 2
+        else:
+            if chunk:
+                tokens.append(chunk)
+            i += 1
+
+    # Walk tokens and decide whether each boundary is a real sentence end.
+    sentences: list[str] = []
+    i = 0
+    while i < len(tokens):
+        frag = tokens[i]
+
+        # Extract the last word before the terminal punct for abbreviation check.
+        stripped = frag.rstrip('.!?"\'').rstrip()
+        last_word = re.split(r'\s+', stripped)[-1].lower().rstrip('.')
+
+        is_abbrev    = last_word in _ABBREVS
+        is_decimal   = bool(_DECIMAL_RE.search(frag))
+        is_initial   = bool(_INITIAL_RE.search(frag))
+
+        if (is_abbrev or is_decimal or is_initial) and i + 1 < len(tokens):
+            # Merge this token into the next — not a real sentence boundary.
+            tokens[i + 1] = frag + " " + tokens[i + 1]
+        else:
+            cleaned = frag.strip()
+            if cleaned:
+                sentences.append(cleaned)
+        i += 1
+
+    # Merge fragments that are too short into the following sentence.
+    merged: list[str] = []
+    carry = ""
+    for s in sentences:
+        combined = (carry + " " + s).strip() if carry else s
+        if len(combined) < min_chars and sentences.index(s) < len(sentences) - 1:
+            carry = combined
+        else:
+            merged.append(combined)
+            carry = ""
+    if carry:
+        # Last fragment was short and had nothing to merge into — keep it.
+        if merged:
+            merged[-1] = (merged[-1] + " " + carry).strip()
+        else:
+            merged.append(carry)
+
+    # Hard length cap: split any fragment that exceeds max_chars at a word boundary.
+    final: list[str] = []
+    for s in merged:
+        while len(s) > max_chars:
+            # Find the last space within the cap.
+            cut = s.rfind(" ", 0, max_chars)
+            if cut == -1:
+                cut = max_chars  # no space found — hard cut
+            final.append(s[:cut].strip())
+            s = s[cut:].strip()
+        if s:
+            final.append(s)
+
+    return final if final else [text.strip()]
 
 # ── smoke test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

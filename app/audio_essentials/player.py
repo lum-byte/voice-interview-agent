@@ -261,7 +261,12 @@ def get_output_stream() -> PCMOutputStream:
                 preferred_fmt=output_fmt,
                 converter=get_converter(),
             )
-            asyncio.get_event_loop().run_until_complete(_pcm_output_stream.start())
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.get_event_loop().run_until_complete(_pcm_output_stream.start())
+            else:
+                asyncio.create_task(_pcm_output_stream.start())
             log.info("player_pcm_output_stream_created", fmt=repr(output_fmt))
         return _pcm_output_stream
 
@@ -407,7 +412,7 @@ async def play_pcm_chunk(
     # chunk is already float32 after converter.convert() above; pass it straight
     # through to the persistent async output stream.
     try:
-        asyncio.create_task(get_output_stream().write(chunk))
+        await get_output_stream().write(chunk)
         _pcm_chunks_played.inc()
     except Exception as exc:
         _stream_drops.inc()
@@ -446,6 +451,16 @@ async def play_pcm_bytes(
     # Parse raw PCM bytes into a typed PCMChunk using audio_engine's parser
     chunk = tts_pcm_to_chunk(raw_bytes, fmt=fmt, seq=seq, is_final=is_final)
     await play_pcm_chunk(chunk, enhance=enhance, gain_db=gain_db)
+
+
+async def drain_output() -> None:
+    """Block until the PCMOutputStream queue is empty and audio has played out."""
+    stream = get_output_stream()
+    # Poll until the internal queue is empty
+    while stream.is_active() and getattr(stream, '_queue', None) and stream._queue.qsize() > 0:  # noqa
+        await asyncio.sleep(0.05)
+    # Extra buffer for the final hardware frame to flush
+    await asyncio.sleep(0.15)
 
 
 # ── public API — streaming path ───────────────────────────────────────────────
@@ -549,11 +564,13 @@ def stop_stream() -> None:
     Safe to call at any time from any thread.
     """
     output_stream = get_output_stream()
+    coro = output_stream.stop_playback()
     try:
-        asyncio.create_task(output_stream.stop_playback())
+        asyncio.create_task(coro)
     except RuntimeError:
         # No running event loop (e.g. called from a non-async context at shutdown).
-        pass
+        # Explicitly close the coroutine to suppress the "never awaited" warning.
+        coro.close()
 
     # ── Notify interrupt detector that playback has ended ─────────────────────
     if _interrupt_detector is not None:
