@@ -984,9 +984,6 @@ async def serve_redoc_ui() -> HTMLResponse:
         title="Voice Assistant API",
     )
 
-
-# ── local dev entry point ─────────────────────────────────────────────────────
-
 # ── gunicorn entry point ──────────────────────────────────────────────────────
 #
 # Production (gunicorn + uvicorn workers):

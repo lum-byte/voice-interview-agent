@@ -191,9 +191,27 @@ DOMAIN_REGISTRY: dict[str, dict] = {
 }
 
 LEVEL_KEYWORDS: dict[str, list[str]] = {
-    "beginner":     ["beginner", "fresher", "student", "learning", "new to", "just started", "btech", "b.tech", "pursuing", "first year", "second year"],
-    "advanced":     ["senior", "lead", "architect", "4 year", "5 year", "6 year", "7 year", "8 year", "production", "expert", "principal", "staff"],
-    "intermediate": ["2 year", "3 year", "mid", "associate", "junior", "some experience"],
+    "beginner": [
+        "beginner", "fresher", "student", "learning", "new to", "just started",
+        "btech", "b.tech", "pursuing", "first year", "second year",
+        "just learning", "starting out", "getting started", "entry level",
+        "entry-level", "newbie", "novice", "basic", "basics",
+    ],
+    "advanced": [
+        "senior", "lead", "architect", "4 year", "5 year", "6 year", "7 year",
+        "8 year", "production", "expert", "principal", "staff",
+        "advanced", "proficient", "strong", "solid", "excellent",
+        "very good", "highly skilled", "highly experienced", "seasoned",
+        "veteran", "deep knowledge", "deep understanding", "extensive",
+        "10 year", "9 year", "decade",
+    ],
+    "intermediate": [
+        "2 year", "3 year", "mid", "associate", "junior", "some experience",
+        "intermediate", "comfortable", "familiar", "decent", "good",
+        "pretty good", "fairly", "moderate", "working knowledge",
+        "reasonable", "confident", "competent", "skilled",
+        "know", "know well", "worked with", "used",
+    ],
 }
 
 # ── stage enum ─────────────────────────────────────────────────────────────────
@@ -2187,11 +2205,33 @@ class DifficultyScaler:
         (999, DifficultyLevel.EXPERT),
     ]
 
+    # How many q_index positions to skip at the start based on candidate level.
+    # beginner  → start at EASY   (offset 0)
+    # intermediate → start at MEDIUM (offset 2, skips the 2 EASY slots)
+    # advanced  → start at HARD   (offset 4, skips EASY + MEDIUM)
+    _LEVEL_OFFSETS: dict[str, int] = {
+        "beginner":     0,
+        "intermediate": 2,
+        "advanced":     4,
+    }
+
     @classmethod
-    def for_q_index(cls, q_index: int) -> DifficultyLevel:
-        """q_index is 0-based (first question of domain = 0)."""
+    def starting_offset_for_level(cls, candidate_level: str) -> int:
+        """Return the q_index offset so difficulty starts at the right point."""
+        return cls._LEVEL_OFFSETS.get(candidate_level, 0)
+
+    @classmethod
+    def for_q_index(cls, q_index: int, candidate_level: str = "beginner") -> DifficultyLevel:
+        """q_index is 0-based (first question of domain = 0).
+        candidate_level shifts the starting difficulty so that:
+          beginner     → EASY → MEDIUM → HARD → EXPERT
+          intermediate → MEDIUM → HARD → EXPERT
+          advanced     → HARD → EXPERT
+        """
+        offset = cls.starting_offset_for_level(candidate_level)
+        effective_index = q_index + offset
         for threshold, level in cls._CURVE:
-            if q_index < threshold:
+            if effective_index < threshold:
                 return level
         return DifficultyLevel.EXPERT
 
@@ -2776,7 +2816,7 @@ class LLMInputBuilder:
         level = doc.candidate.level
         q_index = doc.questions_in_active_domain
         is_first = (q_index == 0)
-        difficulty = self._scaler.for_q_index(q_index)
+        difficulty = self._scaler.for_q_index(q_index, level)
         domain_label = DOMAIN_REGISTRY.get(domain, {}).get("label", domain)
 
         prev_label = ""

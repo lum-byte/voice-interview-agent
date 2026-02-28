@@ -262,7 +262,7 @@ def get_output_stream() -> PCMOutputStream:
                 converter=get_converter(),
             )
             try:
-                loop = asyncio.get_running_loop()
+                loop = asyncio.get_running_loop() # noqa
             except RuntimeError:
                 asyncio.get_event_loop().run_until_complete(_pcm_output_stream.start())
             else:

@@ -1,11 +1,10 @@
 """
 conversation_memory.py — QA Audit Bus for the structured interview pipeline.
 
-PHILOSOPHY — THIS IS A COMPLETE ARCHITECTURAL INVERSION FROM THE ORIGINAL:
+MENTAL MODEL — THIS IS A COMPLETE ARCHITECTURAL INVERSION FROM THE ORIGINAL:
 ───────────────────────────────────────────────────────────────────────────
 
   The OLD conversation_memory.py fed rolling conversation history to the LLM.
-  That philosophy is DEAD. The LLM is NOT a chatbot. It receives ZERO history.
 
   The NEW conversation_memory.py is the QA Audit Bus. Its sole responsibilities:
 

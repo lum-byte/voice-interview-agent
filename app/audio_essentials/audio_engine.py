@@ -9,8 +9,8 @@ pipeline. It sits between the hardware (mic/speaker) and the application nodes
   PCMChunk        — timestamped PCM payload with format + sequence metadata
   PCMRingBuffer   — lock-free power-of-2 circular buffer for RT producer/consumer
   PCMConverter    — resample, channel coerce, dtype convert between any two PCMFormats
-  PCMInputStream  — async mic stream → PCMChunk async iterator (replaces recorder WAV path)
-  PCMOutputStream — PCMChunk async consumer → sounddevice OutputStream (replaces player WAV decode)
+  PPCMInputStream  — async network Opus → PCMChunk async iterator (FFmpeg/libopus decode)
+  PCMOutputStream — PCMChunk async consumer → Opus bytes egress (FFmpeg/libopus encode)
   PCMVADGate      — energy-based VAD with hangover + pre-roll for gating STT dispatches
   PCMSplitter     — fan-out: one PCM input to N independent async consumers
 
@@ -29,9 +29,10 @@ Design decisions
 ────────────────
   1. PCMFormat is frozen — formats never mutate in-flight; converter creates new chunks.
   2. PCMRingBuffer uses numpy circular indexing, no malloc on the hot path.
-  3. PCMInputStream runs on a dedicated daemon thread (PortAudio callback constraint)
-     and bridges to asyncio via asyncio.Queue + call_soon_threadsafe.
-  4. PCMOutputStream owns its sd.OutputStream exclusively; all writes from one thread.
+  3. PCMInputStream wraps FFmpegPCMInputStream — asyncio-native, no PortAudio threads.
+     Decodes Opus packets through a jitter buffer → libopus → PCMChunk iterator.
+  4. PCMOutputStream wraps FFmpegPCMOutputStream — encodes PCMChunk → Opus bytes via
+     FFmpeg subprocess pool. ABR adjusts bitrate from live network feedback.
   5. VAD uses a two-threshold (onset/hangover) energy model with configurable
      pre-roll so the first 100-200 ms of speech before a voice detection event
      is not lost.
@@ -55,6 +56,7 @@ import io  # noqa
 import logging  # noqa
 import math  # noqa
 import os
+import subprocess
 import queue as _stdlib_queue
 import struct  # noqa
 import threading  # noqa
@@ -85,8 +87,26 @@ from collections import OrderedDict
 
 # ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
-import sounddevice as sd
 from opentelemetry.trace import StatusCode  # noqa
+
+# ── I/O backend selection ─────────────────────────────────────────────────────
+_USE_FFMPEG_IO: bool = os.getenv("USE_FFMPEG_IO", "0") == "1"
+
+if _USE_FFMPEG_IO:
+    from app.audio_essentials.opus_ffmpeg_io import (
+        CodecConfig,
+        FFmpegPCMInputStream,
+        FFmpegPCMOutputStream,
+        PCMFrame, # noqa
+        check_opus_support as _check_opus_support,
+    )
+    if not _check_opus_support():
+        raise RuntimeError(
+            "USE_FFMPEG_IO=1 but FFmpeg/libopus not available. "
+            "Run: sudo apt-get install -y ffmpeg libopus-dev"
+        )
+else:
+    import sounddevice as sd
 
 # ── optional heavy dependencies (lazy / graceful fallback) ────────────────────
 try:
@@ -185,7 +205,7 @@ _convert_latency = make_histogram(
 )
 _output_write_latency = make_histogram(
     "pcm_output_write_latency_seconds",
-    "sd.OutputStream.write() duration",
+    "PCMOutputStream write duration (sounddevice or FFmpeg path)",
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25),
 )
 _chunk_duration = make_histogram(
@@ -438,7 +458,7 @@ class PCMFormat:
         dtype:        NumPy dtype string — controls sample resolution.
                       "int16"   — 16-bit signed integer PCM (Whisper, standard telephony)
                       "int32"   — 32-bit signed integer PCM
-                      "float32" — 32-bit float PCM (sounddevice native, PortAudio preferred)
+                      "float32" — 32-bit float PCM (processing; also used for studio Opus encoding)
                       "float64" — 64-bit float (processing only, never for hardware I/O)
         byte_order:   Byte order for serialisation. "little" for almost all practical use.
     """
@@ -499,7 +519,7 @@ class PCMFormat:
 
     @classmethod
     def portaudio_default(cls) -> PCMFormat:
-        """PortAudio / sounddevice preferred: 48 kHz stereo float32."""
+        """48 kHz stereo float32 — WebRTC / Discord standard; used by codec layer."""
         return cls(sample_rate=48000, channels=2, dtype="float32")
 
 
@@ -806,6 +826,707 @@ def chunk_to_wav_bytes(chunk: PCMChunk) -> bytes:
 
     return buf.getvalue()
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PCMTranscoder — env-gated PCM → any-format transcoding via FFmpeg
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# DROP-IN LOCATION: paste this block into audio_engine.py immediately after
+# the chunk_to_wav_bytes() function (around line 827).
+#
+# ENV VARS
+# ────────
+#   TTS_FORMAT      Target container format.  Default: "pcm" (passthrough).
+#                   Supported values (case-insensitive):
+#                     pcm   — raw bytes, no transcoding  (zero latency)
+#                     wav   — RIFF/WAV via FFmpeg
+#                     mp3   — MPEG layer 3 via libmp3lame
+#                     ogg   — Ogg/Vorbis via libvorbis
+#                     opus  — Ogg/Opus via libopus
+#                     flac  — lossless FLAC
+#                     aac   — raw AAC (ADTS) via native FFmpeg encoder
+#                     webm  — WebM/Opus via libopus
+#                     m4a   — MP4/AAC via native FFmpeg encoder
+#
+#   TTS_FORMAT_BITRATE_KBPS   Target bitrate for lossy codecs. Default: "128"
+#   TTS_FORMAT_SAMPLE_RATE    Force output sample rate.  Default: match source.
+#   TTS_FORMAT_QUALITY        For VBR codecs: 0 (best) – 9 (smallest).
+#                             Default: "4"
+#
+# USAGE
+# ─────
+#   # Simplest — module-level helper reads TTS_FORMAT automatically
+#   encoded: bytes = transcode_pcm_chunk(chunk)
+#
+#   # Explicit format override (ignores TTS_FORMAT)
+#   wav_bytes = transcode_pcm_chunk(chunk, fmt_override="wav")
+#   mp3_bytes = transcode_pcm_chunk(chunk, fmt_override="mp3")
+#
+#   # Async variant — non-blocking, runs FFmpeg in a thread-pool executor
+#   mp3_bytes = await transcode_pcm_chunk_async(chunk)
+#
+#   # Batch: convert a list of chunks into one contiguous encoded blob
+#   blob = transcode_pcm_chunks(chunks)          # sync
+#   blob = await transcode_pcm_chunks_async(chunks)  # async
+#
+#   # Low-level: instantiate the class directly for repeated transcoding
+#   transcoder = PCMTranscoder(target_format="mp3", bitrate_kbps=192)
+#   mp3_bytes   = transcoder.transcode(chunk)
+#   mp3_bytes   = await transcoder.transcode_async(chunk)
+#
+# IMPORTANT NOTES
+# ───────────────
+#   • This module does NOT change any internal wiring.  tts_pcm_to_chunk(),
+#     PCMOutputStream, PCMInputStream, and PCMVADGate are untouched.
+#   • Transcoding adds latency proportional to chunk duration and codec
+#     complexity.  Typical overhead: mp3 ≈ 3-8 ms/s, flac ≈ 1-3 ms/s.
+#   • When TTS_FORMAT="pcm" (default), transcode_pcm_chunk() is a zero-copy
+#     passthrough — it returns chunk.to_bytes() with no subprocess at all.
+#   • All FFmpeg subprocesses are run with communicate() — no pipes left open
+#     between calls.  Safe for concurrent async callers.
+#   • The _PCM_FORMAT_MAP dict from opus_ffmpeg_io is re-implemented here as
+#     _PCM_FFMPEG_FMT so this block works regardless of _USE_FFMPEG_IO flag.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── env config for transcoder ─────────────────────────────────────────────────
+
+_TTS_FORMAT: str = os.getenv("TTS_FORMAT", "pcm").lower().strip()
+_TTS_FORMAT_BITRATE_KBPS: int = int(os.getenv("TTS_FORMAT_BITRATE_KBPS", "128"))
+_TTS_FORMAT_SAMPLE_RATE: int | None = (
+    int(os.getenv("TTS_FORMAT_SAMPLE_RATE"))
+    if os.getenv("TTS_FORMAT_SAMPLE_RATE")
+    else None
+)
+_TTS_FORMAT_QUALITY: int = max(0, min(9, int(os.getenv("TTS_FORMAT_QUALITY", "4"))))
+
+# ── internal format tables ────────────────────────────────────────────────────
+
+# Maps PCM numpy dtype → FFmpeg raw-format flag used as -f <flag> on input side.
+# Mirrors the _PCM_FORMAT_MAP in opus_ffmpeg_io.py without importing it.
+_PCM_FFMPEG_FMT: dict[str, str] = {
+    "int16":   "s16le",
+    "int32":   "s32le",
+    "float32": "f32le",
+    "float64": "f64le",
+}
+
+# Each entry: (ffmpeg_output_format, codec, extra_args_template)
+# extra_args_template is a callable that receives (bitrate_kbps, quality, out_rate)
+# and returns a list of additional FFmpeg args.
+_FORMAT_TABLE: dict[str, tuple[str, str, "Callable[[int, int, int], list[str]]"]] = {
+    "wav":  (
+        "wav",
+        "pcm_s16le",
+        lambda br, q, rate: [],
+    ),
+    "mp3":  (
+        "mp3",
+        "libmp3lame",
+        lambda br, q, rate: ["-b:a", f"{br}k", "-q:a", str(q)],
+    ),
+    "ogg":  (
+        "ogg",
+        "libvorbis",
+        lambda br, q, rate: ["-b:a", f"{br}k", "-q:a", str(q)],
+    ),
+    "opus": (
+        "ogg",
+        "libopus",
+        lambda br, q, rate: ["-b:a", f"{br}k", "-vbr", "on"],
+    ),
+    "flac": (
+        "flac",
+        "flac",
+        lambda br, q, rate: ["-compression_level", str(min(q, 8))],
+    ),
+    "aac":  (
+        "adts",
+        "aac",
+        lambda br, q, rate: ["-b:a", f"{br}k"],
+    ),
+    "webm": (
+        "webm",
+        "libopus",
+        lambda br, q, rate: ["-b:a", f"{br}k"],
+    ),
+    "m4a":  (
+        "mp4",
+        "aac",
+        lambda br, q, rate: ["-b:a", f"{br}k", "-movflags", "frag_keyframe+empty_moov"],
+    ),
+}
+
+# ── Prometheus metrics for transcoder ────────────────────────────────────────
+
+_transcode_calls = make_counter(
+    "pcm_transcode_calls_total",
+    "PCM → encoded-format transcode calls",
+    ["target_format", "status"],
+)
+_transcode_latency = make_histogram(
+    "pcm_transcode_latency_seconds",
+    "Wall-clock duration of FFmpeg transcode subprocess",
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+_transcode_bytes_in = make_counter(
+    "pcm_transcode_bytes_in_total",
+    "Raw PCM bytes fed into the transcoder",
+)
+_transcode_bytes_out = make_counter(
+    "pcm_transcode_bytes_out_total",
+    "Encoded bytes produced by the transcoder",
+)
+
+# ── PCMTranscoder ─────────────────────────────────────────────────────────────
+
+class PCMTranscoder:
+    """
+    Converts PCMChunk objects (or raw PCM bytes) to any FFmpeg-supported
+    container format (mp3, wav, ogg, opus, flac, aac, webm, m4a).
+
+    Instantiate once and call transcode() repeatedly.  Each call spawns an
+    FFmpeg subprocess, pipes in raw PCM, and returns the encoded bytes.
+    When target_format is "pcm", transcode() is a zero-copy passthrough.
+
+    Thread/async safety: each transcode() call is independent.  Multiple
+    callers may call transcode() concurrently — each gets its own subprocess.
+
+    Args:
+        target_format:   One of the keys in _FORMAT_TABLE, or "pcm".
+                         Defaults to the TTS_FORMAT env var.
+        bitrate_kbps:    Bitrate for lossy codecs. Defaults to env value.
+        output_rate:     Force output sample rate.  None = match source.
+        quality:         VBR quality hint (0=best, 9=smallest).
+        ffmpeg_bin:      Path to ffmpeg binary. Default: "ffmpeg".
+        timeout_s:       Max seconds to wait for FFmpeg to finish per chunk.
+                         Default: 30.  Increase for very long TTS segments.
+    """
+
+    def __init__(
+        self,
+        target_format: str | None = None,
+        bitrate_kbps: int | None = None,
+        output_rate: int | None = None,
+        quality: int | None = None,
+        ffmpeg_bin: str = "ffmpeg",
+        timeout_s: float = 30.0,
+    ) -> None:
+        self.target_format: str = (target_format or _TTS_FORMAT).lower().strip()
+        self.bitrate_kbps: int = bitrate_kbps if bitrate_kbps is not None else _TTS_FORMAT_BITRATE_KBPS
+        self.output_rate: int | None = output_rate if output_rate is not None else _TTS_FORMAT_SAMPLE_RATE
+        self.quality: int = quality if quality is not None else _TTS_FORMAT_QUALITY
+        self.ffmpeg_bin: str = ffmpeg_bin
+        self.timeout_s: float = timeout_s
+
+        if self.target_format not in ("pcm", *_FORMAT_TABLE):
+            raise ValueError(
+                f"Unsupported TTS_FORMAT={self.target_format!r}. "
+                f"Valid options: pcm, {', '.join(sorted(_FORMAT_TABLE))}"
+            )
+
+    # ── public interface ──────────────────────────────────────────────────────
+
+    def transcode(self, chunk: "PCMChunk") -> bytes:
+        """
+        Synchronously transcode *chunk* to the configured output format.
+
+        When target_format is "pcm", returns chunk.to_bytes() with no
+        subprocess overhead.
+
+        Args:
+            chunk: A PCMChunk produced by tts_pcm_to_chunk() or any other
+                   pipeline stage.
+
+        Returns:
+            Encoded audio bytes in the target container format.
+
+        Raises:
+            RuntimeError: If FFmpeg exits with a non-zero return code.
+            TimeoutError: If FFmpeg does not finish within timeout_s seconds.
+        """
+        if self.target_format == "pcm":
+            return chunk.to_bytes()
+
+        raw_pcm = self._extract_pcm_bytes(chunk)
+        return self._run_ffmpeg_sync(
+            raw_pcm=raw_pcm,
+            source_fmt=chunk.fmt,
+        )
+
+    async def transcode_async(self, chunk: "PCMChunk") -> bytes:
+        """
+        Asynchronously transcode *chunk* using asyncio.subprocess.
+
+        Runs FFmpeg as an async subprocess — does not block the event loop
+        while waiting for encoding to finish.
+
+        Args:
+            chunk: A PCMChunk to transcode.
+
+        Returns:
+            Encoded audio bytes.
+
+        Raises:
+            RuntimeError: If FFmpeg exits with a non-zero return code.
+            asyncio.TimeoutError: If FFmpeg does not finish within timeout_s.
+        """
+        if self.target_format == "pcm":
+            return chunk.to_bytes()
+
+        raw_pcm = self._extract_pcm_bytes(chunk)
+        return await self._run_ffmpeg_async(
+            raw_pcm=raw_pcm,
+            source_fmt=chunk.fmt,
+        )
+
+    def transcode_raw(
+        self,
+        raw_pcm: bytes,
+        sample_rate: int,
+        channels: int,
+        dtype: str = "int16",
+    ) -> bytes:
+        """
+        Transcode raw PCM bytes without a PCMChunk wrapper.
+
+        Useful when you have a contiguous PCM blob (e.g. from a file or a
+        stitched TTS response) and want to avoid constructing a PCMChunk.
+
+        Args:
+            raw_pcm:     Raw PCM bytes, no header.
+            sample_rate: Source sample rate in Hz.
+            channels:    Number of audio channels.
+            dtype:       PCM dtype string ("int16", "int32", "float32").
+
+        Returns:
+            Encoded audio bytes.
+        """
+        if self.target_format == "pcm":
+            return raw_pcm
+
+        # Construct a minimal stand-in for the PCMFormat duck type
+        src_fmt = _TranscoderFormat(
+            sample_rate=sample_rate,
+            channels=channels,
+            dtype=dtype,
+        )
+        return self._run_ffmpeg_sync(raw_pcm=raw_pcm, source_fmt=src_fmt)  # type: ignore[arg-type]
+
+    async def transcode_raw_async(
+        self,
+        raw_pcm: bytes,
+        sample_rate: int,
+        channels: int,
+        dtype: str = "int16",
+    ) -> bytes:
+        """Async variant of transcode_raw()."""
+        if self.target_format == "pcm":
+            return raw_pcm
+
+        src_fmt = _TranscoderFormat(
+            sample_rate=sample_rate,
+            channels=channels,
+            dtype=dtype,
+        )
+        return await self._run_ffmpeg_async(raw_pcm=raw_pcm, source_fmt=src_fmt)  # type: ignore[arg-type]
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_pcm_bytes(chunk: "PCMChunk") -> bytes:
+        """Return the raw PCM payload of *chunk* as little-endian bytes."""
+        data = chunk.data
+        if data.dtype.byteorder not in ("<", "=", "|"):
+            data = data.astype(data.dtype.newbyteorder("<"), copy=False)
+        return data.astype(f"<{np.dtype(chunk.fmt.dtype).str[1:]}").tobytes()
+
+    def _build_ffmpeg_cmd(self, source_fmt: PCMFormat) -> list[str]:
+        """
+        Build the FFmpeg command line for stdin → stdout transcoding.
+
+        Input:  raw PCM from stdin (-f <pcm_fmt> -ar <rate> -ac <ch> -i pipe:0)
+        Output: encoded audio to stdout (-f <output_fmt> pipe:1)
+        """
+        pcm_flag = _PCM_FFMPEG_FMT.get(source_fmt.dtype, "s16le")
+        out_rate = self.output_rate or source_fmt.sample_rate
+
+        out_fmt, codec, extra_fn = _FORMAT_TABLE[self.target_format]
+        extra_args = extra_fn(self.bitrate_kbps, self.quality, out_rate)
+
+        cmd = [
+            self.ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel", "error",
+            # Input
+            "-f",  pcm_flag,
+            "-ar", str(source_fmt.sample_rate),
+            "-ac", str(source_fmt.channels),
+            "-i",  "pipe:0",
+            # Resample if needed
+            "-ar", str(out_rate),
+            # Codec
+            "-c:a", codec,
+            *extra_args,
+            # Output
+            "-f",  out_fmt,
+            "pipe:1",
+        ]
+        return cmd
+
+    def _run_ffmpeg_sync(
+        self,
+        raw_pcm: bytes,
+        source_fmt: PCMFormat,
+    ) -> bytes:
+        """Spawn FFmpeg synchronously and return encoded bytes."""
+        import signal as _signal  # lazy import; not available on all platforms # noqa
+
+        cmd = self._build_ffmpeg_cmd(source_fmt)
+        t0 = time.monotonic()
+
+        _transcode_bytes_in.inc(len(raw_pcm))
+        log.debug(
+            "pcm_transcode_start",
+            target_format=self.target_format,
+            src_rate=source_fmt.sample_rate,
+            src_ch=source_fmt.channels,
+            pcm_bytes=len(raw_pcm),
+        )
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = proc.communicate(input=raw_pcm, timeout=self.timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()  # drain pipes
+                _transcode_calls.labels(
+                    target_format=self.target_format, status="timeout"
+                ).inc()
+                raise TimeoutError(
+                    f"FFmpeg transcode to {self.target_format!r} "
+                    f"timed out after {self.timeout_s}s"
+                )
+
+            elapsed = time.monotonic() - t0
+            _transcode_latency.observe(elapsed)
+
+            if proc.returncode != 0:
+                _transcode_calls.labels(
+                    target_format=self.target_format, status="error"
+                ).inc()
+                stderr_text = stderr.decode(errors="replace").strip()
+                raise RuntimeError(
+                    f"FFmpeg exited {proc.returncode} transcoding to "
+                    f"{self.target_format!r}: {stderr_text}"
+                )
+
+            _transcode_calls.labels(
+                target_format=self.target_format, status="ok"
+            ).inc()
+            _transcode_bytes_out.inc(len(stdout))
+            log.debug(
+                "pcm_transcode_done",
+                target_format=self.target_format,
+                out_bytes=len(stdout),
+                elapsed_ms=round(elapsed * 1000, 2),
+            )
+            return stdout
+
+        except (OSError, FileNotFoundError) as exc:
+            _transcode_calls.labels(
+                target_format=self.target_format, status="error"
+            ).inc()
+            raise RuntimeError(
+                f"Failed to launch FFmpeg for {self.target_format!r} transcoding. "
+                f"Ensure FFmpeg is installed and on PATH. Original error: {exc}"
+            ) from exc
+
+    async def _run_ffmpeg_async(
+        self,
+        raw_pcm: bytes,
+        source_fmt: PCMFormat,
+    ) -> bytes:
+        """Spawn FFmpeg asynchronously and return encoded bytes."""
+        cmd = self._build_ffmpeg_cmd(source_fmt)
+        t0 = time.monotonic()
+
+        _transcode_bytes_in.inc(len(raw_pcm))
+        log.debug(
+            "pcm_transcode_async_start",
+            target_format=self.target_format,
+            src_rate=source_fmt.sample_rate,
+            src_ch=source_fmt.channels,
+            pcm_bytes=len(raw_pcm),
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(raw_pcm),
+                    timeout=self.timeout_s,
+                )
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                _transcode_calls.labels(
+                    target_format=self.target_format, status="timeout"
+                ).inc()
+                raise asyncio.TimeoutError(
+                    f"FFmpeg async transcode to {self.target_format!r} "
+                    f"timed out after {self.timeout_s}s"
+                )
+
+            elapsed = time.monotonic() - t0
+            _transcode_latency.observe(elapsed)
+
+            if proc.returncode != 0:
+                _transcode_calls.labels(
+                    target_format=self.target_format, status="error"
+                ).inc()
+                stderr_text = stderr.decode(errors="replace").strip()
+                raise RuntimeError(
+                    f"FFmpeg async exited {proc.returncode} transcoding to "
+                    f"{self.target_format!r}: {stderr_text}"
+                )
+
+            _transcode_calls.labels(
+                target_format=self.target_format, status="ok"
+            ).inc()
+            _transcode_bytes_out.inc(len(stdout))
+            log.debug(
+                "pcm_transcode_async_done",
+                target_format=self.target_format,
+                out_bytes=len(stdout),
+                elapsed_ms=round(elapsed * 1000, 2),
+            )
+            return stdout
+
+        except (OSError, FileNotFoundError) as exc:
+            _transcode_calls.labels(
+                target_format=self.target_format, status="error"
+            ).inc()
+            raise RuntimeError(
+                f"Failed to launch FFmpeg for async {self.target_format!r} transcoding. "
+                f"Ensure FFmpeg is installed. Original error: {exc}"
+            ) from exc
+
+    def __repr__(self) -> str:
+        return (
+            f"PCMTranscoder(fmt={self.target_format!r}, "
+            f"br={self.bitrate_kbps}kbps, q={self.quality}, "
+            f"out_rate={self.output_rate or 'src'})"
+        )
+
+
+# ── _TranscoderFormat — minimal duck-type for raw-bytes path ─────────────────
+
+@dataclass(frozen=True, slots=True)
+class _TranscoderFormat:
+    """
+    Minimal stand-in for PCMFormat used by PCMTranscoder.transcode_raw().
+    Avoids creating a full PCMFormat when you only have a bytes blob.
+    """
+    sample_rate: int
+    channels: int
+    dtype: str = "int16"
+
+
+# ── module-level singleton + convenience wrappers ─────────────────────────────
+
+_default_transcoder: PCMTranscoder | None = None
+
+
+def _get_default_transcoder() -> PCMTranscoder:
+    """
+    Return (or lazily create) the module-level singleton PCMTranscoder.
+
+    The singleton is built once using the current TTS_FORMAT env vars.
+    Call reset_transcoder() to rebuild it after changing config at runtime.
+    """
+    global _default_transcoder
+    if _default_transcoder is None:
+        _default_transcoder = PCMTranscoder()
+        log.info(
+            "pcm_transcoder_init",
+            target_format=_default_transcoder.target_format,
+            bitrate_kbps=_default_transcoder.bitrate_kbps,
+            quality=_default_transcoder.quality,
+            output_rate=_default_transcoder.output_rate,
+        )
+    return _default_transcoder
+
+
+def reset_transcoder() -> None:
+    """
+    Force the module-level PCMTranscoder singleton to be rebuilt on next use.
+
+    Call this if you change TTS_FORMAT / TTS_FORMAT_BITRATE_KBPS at runtime
+    (e.g. in tests or when hot-reloading config).
+    """
+    global _default_transcoder
+    _default_transcoder = None
+
+
+def transcode_pcm_chunk(
+    chunk: "PCMChunk",
+    fmt_override: str | None = None,
+) -> bytes:
+    """
+    Convert a PCMChunk to the format specified by TTS_FORMAT (or fmt_override).
+
+    This is the primary entry-point for callers that want "give me TTS audio in
+    whatever format the operator configured."  When TTS_FORMAT="pcm" (default),
+    this is a zero-overhead passthrough.
+
+    Args:
+        chunk:        A PCMChunk, typically from tts_pcm_to_chunk().
+        fmt_override: Override TTS_FORMAT for this call only (e.g. "wav").
+                      Does not affect the singleton or env var.
+
+    Returns:
+        Audio bytes in the target format. For "pcm", these are the raw
+        little-endian PCM samples. For all others, a complete encoded file.
+
+    Example::
+
+        raw = await tts_client.synthesize_pcm(text)
+        chunk = tts_pcm_to_chunk(raw, seq=seq)
+        audio = transcode_pcm_chunk(chunk)        # respects TTS_FORMAT env
+        await websocket.send_bytes(audio)
+    """
+    if fmt_override is not None:
+        tc = PCMTranscoder(target_format=fmt_override)
+        return tc.transcode(chunk)
+    return _get_default_transcoder().transcode(chunk)
+
+
+async def transcode_pcm_chunk_async(
+    chunk: "PCMChunk",
+    fmt_override: str | None = None,
+) -> bytes:
+    """
+    Async variant of transcode_pcm_chunk().
+
+    Uses asyncio.create_subprocess_exec so the event loop is never blocked
+    while FFmpeg is encoding.  Preferred in async contexts (voice_graph,
+    WebSocket handlers, etc.).
+
+    Args:
+        chunk:        A PCMChunk, typically from tts_pcm_to_chunk().
+        fmt_override: Override TTS_FORMAT for this call only.
+
+    Returns:
+        Encoded audio bytes in the configured or overridden format.
+
+    Example::
+
+        chunk = tts_pcm_to_chunk(pcm_bytes, seq=seq, is_final=is_final)
+        mp3_bytes = await transcode_pcm_chunk_async(chunk)
+        await s3.upload(mp3_bytes, key=f"tts/{request_id}.mp3")
+    """
+    if fmt_override is not None:
+        tc = PCMTranscoder(target_format=fmt_override)
+        return await tc.transcode_async(chunk)
+    return await _get_default_transcoder().transcode_async(chunk)
+
+# noinspection PyProtectedMember
+def transcode_pcm_chunks(
+    chunks: "Sequence[PCMChunk]",
+    fmt_override: str | None = None,
+) -> bytes:
+    """
+    Concatenate and transcode a list of PCMChunks into a single encoded blob.
+
+    Joins the raw PCM of all chunks into one contiguous buffer before feeding
+    to FFmpeg.  This is more efficient than transcoding each chunk individually
+    because it avoids repeated subprocess launches and produces better codec
+    decisions (VBR, frame boundaries, etc.).
+
+    Args:
+        chunks:       Ordered sequence of PCMChunks (same fmt assumed).
+        fmt_override: Optional format override.
+
+    Returns:
+        Single encoded audio blob covering all input chunks.
+
+    Raises:
+        ValueError: If chunks is empty.
+    """
+    if not chunks:
+        raise ValueError("transcode_pcm_chunks(): chunks must be non-empty")
+
+    representative_fmt = chunks[0].fmt
+    raw_pcm = b"".join(PCMTranscoder._extract_pcm_bytes(c) for c in chunks) # type: ignore[attr-defined]
+
+    if fmt_override is not None:
+        tc = PCMTranscoder(target_format=fmt_override)
+    else:
+        tc = _get_default_transcoder()
+
+    if tc.target_format == "pcm":
+        return raw_pcm
+
+    src = _TranscoderFormat(
+        sample_rate=representative_fmt.sample_rate,
+        channels=representative_fmt.channels,
+        dtype=representative_fmt.dtype,
+    )
+    return tc._run_ffmpeg_sync(raw_pcm=raw_pcm, source_fmt=src)  # type: ignore[arg-type]
+
+# noinspection PyProtectedMember
+async def transcode_pcm_chunks_async(
+    chunks: "Sequence[PCMChunk]",
+    fmt_override: str | None = None,
+) -> bytes:
+    """Async variant of transcode_pcm_chunks()."""
+    if not chunks:
+        raise ValueError("transcode_pcm_chunks_async(): chunks must be non-empty")
+
+    representative_fmt = chunks[0].fmt
+    raw_pcm = b"".join(PCMTranscoder._extract_pcm_bytes(c) for c in chunks) # type: ignore[attr-defined]
+
+    if fmt_override is not None:
+        tc = PCMTranscoder(target_format=fmt_override)
+    else:
+        tc = _get_default_transcoder()
+
+    if tc.target_format == "pcm":
+        return raw_pcm
+
+    src = _TranscoderFormat(
+        sample_rate=representative_fmt.sample_rate,
+        channels=representative_fmt.channels,
+        dtype=representative_fmt.dtype,
+    )
+    return await tc._run_ffmpeg_async(raw_pcm=raw_pcm, source_fmt=src)  # type: ignore[arg-type]
+
+
+# ── supported_tts_formats() — discovery helper ────────────────────────────────
+
+def supported_tts_formats() -> list[str]:
+    """
+    Return the list of format strings supported by PCMTranscoder.
+
+    Useful for validating TTS_FORMAT at startup or in health checks::
+
+        if os.getenv("TTS_FORMAT", "pcm") not in supported_tts_formats():
+            raise ValueError(f"Bad TTS_FORMAT: {os.getenv('TTS_FORMAT')}")
+    """
+    return ["pcm", *sorted(_FORMAT_TABLE.keys())]
 
 def negotiate_format(
     preferred: Sequence[PCMFormat],
@@ -1084,7 +1805,7 @@ class PCMConverter:
     def _resample_poly(
         data: np.ndarray, src_rate: int, dst_rate: int
     ) -> np.ndarray:
-        from scipy.signal import resample_poly  # type: ignore
+        from scipy.signal import resample_poly  # noqa
         from math import gcd
 
         g = gcd(dst_rate, src_rate)
@@ -1352,25 +2073,32 @@ class PCMBandpassFilter:
 
 class PCMInputStream:
     """
-    Async microphone stream that yields PCMChunks via an async iterator.
+    Async Opus ingress → PCMChunk iterator.
 
-    Architecture
-    ────────────
-    PortAudio callbacks run on a high-priority OS thread. They may not call
-    asyncio APIs. Instead, the callback enqueues raw numpy arrays into a
-    thread-safe ``queue.Queue``, and a separate asyncio task drains that
-    queue and forwards chunks into an ``asyncio.Queue``.
+    When USE_FFMPEG_IO=1 (default for network deployments):
+        Opus packets arrive via push_opus_packet() / push_opus_bytes(), pass
+        through an adaptive jitter buffer and libopus decoder subprocess, and
+        emerge as PCMChunks on the async iterator.  The internal audio_engine
+        pipeline (VAD, converter, AEC) is entirely unaware of the codec layer.
 
-    Usage::
+    When USE_FFMPEG_IO=0 (local mic fallback):
+        Behaves identically to the original PortAudio/sounddevice implementation.
+
+    Usage (network path)::
 
         async with PCMInputStream(fmt=PCMFormat.whisper()) as stream:
-            async for chunk in stream:
-                # chunk is a PCMChunk ready for VAD / STT
-                ...
+            # Feed from WebSocket / RTP:
+            stream.push_opus_bytes(opus_frame)
 
-    Supports context manager protocol for clean acquisition and release.
-    Cancellation-safe: stopping the context manager sets a done event that
-    cleanly exits both the PortAudio stream and the drainer task.
+            async for chunk in stream:   # yields PCMChunk
+                await vad_gate.stream([chunk])
+
+    Usage (mic fallback)::
+
+        # Set USE_FFMPEG_IO=0 in environment, then use identically to before.
+        async with PCMInputStream(fmt=PCMFormat.whisper()) as stream:
+            async for chunk in stream:
+                ...
     """
 
     def __init__(
@@ -1387,15 +2115,30 @@ class PCMInputStream:
         )
         self._blocksize = blocksize
         self._device = device
+        self._seq: int = 0
         self._async_q: asyncio.Queue[PCMChunk | None] = asyncio.Queue(
             maxsize=queue_maxsize
         )
-        self._thread_q: _stdlib_queue.Queue = _stdlib_queue.Queue(maxsize=queue_maxsize * 2)
-        self._stream: sd.InputStream | None = None
-        self._drainer_task: asyncio.Task | None = None
-        self._stop_event = threading.Event()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._seq: int = 0
+
+        if _USE_FFMPEG_IO:
+            # Build a CodecConfig that matches the requested PCMFormat exactly.
+            self._ffmpeg_in = FFmpegPCMInputStream(
+                CodecConfig(
+                    sample_rate=self._fmt.sample_rate,
+                    channels=self._fmt.channels,
+                    dtype=self._fmt.dtype,
+                )
+            )
+            self._bridge_task: asyncio.Task | None = None
+        else:
+            # Sounddevice path — keep all original state
+            self._thread_q: _stdlib_queue.Queue = _stdlib_queue.Queue(
+                maxsize=queue_maxsize * 2
+            )
+            self._stream: sd.InputStream | None = None
+            self._drainer_task: asyncio.Task | None = None
+            self._stop_event = threading.Event()
+            self._loop: asyncio.AbstractEventLoop | None = None
 
     async def __aenter__(self) -> PCMInputStream:
         await self.start()
@@ -1404,7 +2147,37 @@ class PCMInputStream:
     async def __aexit__(self, *_: Any) -> None:
         await self.stop()
 
+    # ── push interface (FFmpeg path only) ─────────────────────────────────────
+
+    def push_opus_packet(
+        self, seq: int, opus_bytes: bytes, duration_ms: int = 20
+    ) -> None:
+        """Feed one Opus packet (with sequence number) from the network layer."""
+        if _USE_FFMPEG_IO:
+            self._ffmpeg_in.push_opus_packet(seq, opus_bytes, duration_ms)
+
+    def push_opus_bytes(self, opus_bytes: bytes) -> None:
+        """Feed one Opus packet (auto-sequenced) from the network layer."""
+        if _USE_FFMPEG_IO:
+            self._ffmpeg_in.push_opus_bytes(opus_bytes)
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
     async def start(self) -> None:
+        if _USE_FFMPEG_IO:
+            await self._ffmpeg_in.start()
+            self._bridge_task = asyncio.create_task(
+                self._ffmpeg_bridge(), name="pcm-input-ffmpeg-bridge"
+            )
+            _input_active.set(1)
+            log.info(
+                "pcm_input_stream_started",
+                fmt=repr(self._fmt),
+                backend="ffmpeg",
+            )
+            return
+
+        # ── Sounddevice path (fallback) ──────────────────────────────────────
         if self._stream is not None:
             raise RuntimeError("PCMInputStream already started")
 
@@ -1413,8 +2186,8 @@ class PCMInputStream:
 
         def _callback(
             indata: np.ndarray,
-            frame_count: int, # noqa
-            time_info: object, # noqa
+            frame_count: int,  # noqa
+            time_info: object,  # noqa
             status: sd.CallbackFlags,
         ) -> None:
             if status.input_overflow:
@@ -1449,9 +2222,28 @@ class PCMInputStream:
             "pcm_input_stream_started",
             fmt=repr(self._fmt),
             blocksize=self._blocksize,
+            backend="sounddevice",
         )
 
     async def stop(self) -> None:
+        if _USE_FFMPEG_IO:
+            if self._bridge_task is not None:
+                self._bridge_task.cancel()
+                try:
+                    await self._bridge_task
+                except asyncio.CancelledError:
+                    pass
+                self._bridge_task = None
+            await self._ffmpeg_in.stop()
+            try:
+                self._async_q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+            _input_active.set(0)
+            log.info("pcm_input_stream_stopped", backend="ffmpeg")
+            return
+
+        # ── Sounddevice path (unchanged) ──────────────────────────────────────
         self._stop_event.set()
 
         if self._stream is not None:
@@ -1464,7 +2256,6 @@ class PCMInputStream:
                 self._stream = None
                 _input_active.set(0)
 
-        # Signal drainer to exit
         try:
             self._thread_q.put_nowait(None)
         except _stdlib_queue.Full:
@@ -1477,19 +2268,61 @@ class PCMInputStream:
                 self._drainer_task.cancel()
             self._drainer_task = None
 
-        # Poison the async queue so pending iterators exit
         try:
             self._async_q.put_nowait(None)
         except asyncio.QueueFull:
             pass
 
-        log.info("pcm_input_stream_stopped")
+        log.info("pcm_input_stream_stopped", backend="sounddevice")
+
+    # ── iteration ─────────────────────────────────────────────────────────────
+
+    def __aiter__(self) -> AsyncIterator[PCMChunk]:
+        return self._chunk_iterator()
+
+    async def _chunk_iterator(self) -> AsyncIterator[PCMChunk]:
+        while True:
+            try:
+                chunk = await self._async_q.get()
+            except asyncio.CancelledError:
+                return
+            if chunk is None:
+                return
+            yield chunk
+
+    # ── FFmpeg bridge (translates PCMFrame → PCMChunk) ────────────────────────
+
+    async def _ffmpeg_bridge(self) -> None:
+        """
+        Drain PCMFrames from FFmpegPCMInputStream and re-emit them as PCMChunks
+        so the rest of audio_engine (VAD, converter, AEC) sees its native type.
+        """
+        try:
+            async for frame in self._ffmpeg_in:
+                chunk = PCMChunk(
+                    data=frame.data,
+                    fmt=self._fmt,
+                    timestamp=frame.ts_us / 1_000_000.0,
+                    seq=self._seq,
+                    source="network",
+                )
+                self._seq += 1
+                _in_chunks.labels(status="ok").inc()
+                _in_bytes.inc(frame.data.nbytes)
+                _chunk_duration.observe(chunk.duration_s)
+                try:
+                    self._async_q.put_nowait(chunk)
+                except asyncio.QueueFull:
+                    _in_dropped.inc()
+                    log.debug("pcm_input_async_queue_full")
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.error("pcm_input_ffmpeg_bridge_error", error=str(exc))
+
+    # ── sounddevice drainer (fallback) ─────────────────────────────
 
     async def _drain_thread_queue(self) -> None:
-        """
-        Background task: moves frames from the thread-safe queue into the
-        asyncio queue so the async iterator can yield them.
-        """
         import queue as _q
 
         loop = self._loop
@@ -1500,12 +2333,12 @@ class PCMInputStream:
                 raw = await loop.run_in_executor(
                     None,
                     self._thread_q.get,
-                    True,  # block
-                    0.1  # timeout
+                    True,
+                    0.1,
                 )
             except _q.Empty:
                 continue
-            except Exception: # noqa
+            except Exception:  # noqa
                 break
 
             if raw is None:
@@ -1527,50 +2360,43 @@ class PCMInputStream:
                 _in_dropped.inc()
                 log.debug("pcm_input_async_queue_full")
 
-    def __aiter__(self) -> AsyncIterator[PCMChunk]:
-        return self._chunk_iterator()
-
-    async def _chunk_iterator(self) -> AsyncIterator[PCMChunk]:
-        while True:
-            try:
-                chunk = await self._async_q.get()
-            except asyncio.CancelledError:
-                return
-            if chunk is None:
-                return
-            yield chunk
-
 # ── PCMOutputStream ───────────────────────────────────────────────────────────
 
 class PCMOutputStream:
     """
-    Async consumer that writes PCMChunks to the speaker with minimal latency.
+    Async PCMChunk consumer.
 
-    Architecture
-    ────────────
-    A dedicated daemon thread owns the ``sd.OutputStream`` exclusively (zero
-    mutex contention on the write path — same design as player.py's writer thread).
-    The async ``write()`` method encodes chunks and posts them to a bounded
-    ``queue.Queue``; the writer thread drains and calls ``stream.write()``.
+    When USE_FFMPEG_IO=1 (default for network deployments):
+        Accepts PCMChunks via write(), encodes them to Opus bytes through an
+        FFmpeg subprocess (libopus), and makes the encoded packets available via
+        read_opus_frame() for the network layer to transmit.  The adaptive
+        bitrate controller adjusts quality to live loss/jitter feedback.
 
-    The stream is kept open between chunks (persistent OutputStream) to avoid
-    the 50–150 ms PortAudio device-open cost on every sentence.
+    When USE_FFMPEG_IO=0 (local speaker fallback):
+        Behaves identically to the original PortAudio/sounddevice implementation.
 
-    Format negotiation
-    ──────────────────
-    On first write, the stream is opened with the chunk's format. Subsequent
-    writes with a *different* format trigger a seamless stream recreation so
-    sample-rate / channel changes (e.g. switching TTS voices) never crash.
+    Usage (network path)::
 
-    Usage::
+        async with PCMOutputStream() as out:
+            async for chunk in tts_stream:
+                await out.write(chunk)           # encodes to Opus
+                frame = out.read_opus_frame()    # bytes ready to send
+                if frame:
+                    await ws.send_bytes(frame)
 
+    Usage (speaker fallback)::
+
+        # Set USE_FFMPEG_IO=0 in environment, then use identically to before.
         async with PCMOutputStream() as out:
             async for chunk in tts_stream:
                 await out.write(chunk)
     """
 
-    class _STOP: pass
-    class _SHUTDOWN: pass
+    class _STOP:
+        pass
+
+    class _SHUTDOWN:
+        pass
 
     def __init__(
         self,
@@ -1579,7 +2405,7 @@ class PCMOutputStream:
         warmup_frames: int = _OUTPUT_WARMUP_FRAMES,
         device: int | str | None = None,
         converter: PCMConverter | None = None,
-        aec: "PCMEchoCanceller | None" = None
+        aec: "PCMEchoCanceller | None" = None,
     ) -> None:
         self._preferred_fmt = preferred_fmt or PCMFormat(
             sample_rate=_DEFAULT_OUTPUT_RATE,
@@ -1590,13 +2416,24 @@ class PCMOutputStream:
         self._device = device
         self._aec = aec
         self._converter = converter or PCMConverter()
-        import queue as _q
-        self._write_q: _q.Queue = _q.Queue(maxsize=queue_maxsize)
-        self._stream: sd.OutputStream | None = None
-        self._stream_fmt: PCMFormat | None = None
-        self._writer_thread: threading.Thread | None = None
-        self._stream_open_event = threading.Event()
         self._started = False
+
+        if _USE_FFMPEG_IO:
+            self._ffmpeg_out = FFmpegPCMOutputStream(
+                CodecConfig(
+                    sample_rate=self._preferred_fmt.sample_rate,
+                    channels=self._preferred_fmt.channels,
+                    dtype=self._preferred_fmt.dtype,
+                )
+            )
+        else:
+            # Sounddevice path — keep all original state
+            import queue as _q
+            self._write_q: _q.Queue = _q.Queue(maxsize=queue_maxsize)
+            self._stream: sd.OutputStream | None = None
+            self._stream_fmt: PCMFormat | None = None
+            self._writer_thread: threading.Thread | None = None
+            self._stream_open_event = threading.Event()
 
     async def __aenter__(self) -> PCMOutputStream:
         await self.start()
@@ -1605,10 +2442,24 @@ class PCMOutputStream:
     async def __aexit__(self, *_: Any) -> None:
         await self.stop()
 
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
     async def start(self) -> None:
         if self._started:
             return
         self._started = True
+
+        if _USE_FFMPEG_IO:
+            await self._ffmpeg_out.start()
+            _output_active.set(1)
+            log.info(
+                "pcm_output_stream_started",
+                preferred_fmt=repr(self._preferred_fmt),
+                backend="ffmpeg",
+            )
+            return
+
+        # ── Sounddevice path (unchanged) ──────────────────────────────────────
         t = threading.Thread(
             target=self._writer_loop,
             name="pcm-output-writer",
@@ -1616,11 +2467,24 @@ class PCMOutputStream:
         )
         t.start()
         self._writer_thread = t
-        log.info("pcm_output_stream_started", preferred_fmt=repr(self._preferred_fmt))
+        log.info(
+            "pcm_output_stream_started",
+            preferred_fmt=repr(self._preferred_fmt),
+            backend="sounddevice",
+        )
 
     async def stop(self) -> None:
         if not self._started:
             return
+
+        if _USE_FFMPEG_IO:
+            await self._ffmpeg_out.stop()
+            self._started = False
+            _output_active.set(0)
+            log.info("pcm_output_stream_stopped", backend="ffmpeg")
+            return
+
+        # ── Sounddevice path (unchanged) ──────────────────────────────────────
         try:
             self._write_q.put_nowait(self._SHUTDOWN)
         except _stdlib_queue.Full:
@@ -1632,19 +2496,35 @@ class PCMOutputStream:
             self._writer_thread = None
         self._started = False
         _output_active.set(0)
-        log.info("pcm_output_stream_stopped")
+        log.info("pcm_output_stream_stopped", backend="sounddevice")
+
+    # ── write ─────────────────────────────────────────────────────────────────
 
     async def write(self, chunk: PCMChunk) -> None:
         """
-        Enqueue a PCMChunk for playback. Returns in microseconds.
-
-        Converts the chunk to the preferred output format if needed.
-        Drops the chunk if the write queue is full (backpressure signal).
+        Enqueue a PCMChunk for encoding (FFmpeg path) or playback (sounddevice path).
+        Returns in microseconds. Drops if queue/encoder is full.
         """
         if not self._started:
             raise RuntimeError("PCMOutputStream.write() called before start()")
 
-        # Convert to float32 for PortAudio
+        if _USE_FFMPEG_IO:
+            # AEC reference must still fire — converter brings to preferred fmt first
+            target = PCMFormat(
+                sample_rate=chunk.fmt.sample_rate,
+                channels=chunk.fmt.channels,
+                dtype=self._preferred_fmt.dtype,
+            )
+            converted = self._converter.convert(chunk, target)
+            if self._aec is not None:
+                self._aec.push_reference(converted)
+
+            _output_queue_depth.set(0)   # depth managed by FFmpegPCMOutputStream
+            _out_chunks.labels(status="enqueued").inc()
+            await self._ffmpeg_out.write(converted)
+            return
+
+        # ── Sounddevice path (unchanged) ──────────────────────────────────────
         target = PCMFormat(
             sample_rate=chunk.fmt.sample_rate,
             channels=chunk.fmt.channels,
@@ -1652,8 +2532,6 @@ class PCMOutputStream:
         )
         converted = self._converter.convert(chunk, target)
 
-        # Feed the AEC reference *before* the chunk hits the speaker so the
-        # canceller sees the reference signal at the same point in time.
         if self._aec is not None:
             self._aec.push_reference(converted)
 
@@ -1665,19 +2543,50 @@ class PCMOutputStream:
             _out_chunks.labels(status="dropped").inc()
             log.debug("pcm_output_queue_full_chunk_dropped", seq=chunk.seq)
 
+    # ── Opus egress (FFmpeg path only) ────────────────────────────────────────
+
+    def read_opus_frame(self) -> bytes | None:
+        """
+        Non-blocking: return the next encoded Opus packet payload, or None.
+        Call this after every write() in the network send loop.
+
+        Only meaningful when USE_FFMPEG_IO=1. Returns None on sounddevice path.
+        """
+        if not _USE_FFMPEG_IO:
+            return None
+        pkt = self._ffmpeg_out.read_opus_packet_nowait()
+        return pkt.payload if pkt else None
+
+    def report_network_stats(
+        self, rtt_ms: float | None = None, lost: bool = False
+    ) -> None:
+        """
+        Feed network round-trip and loss observations into the ABR controller.
+        Call from your ACK/NACK handler or RTCP RR processor.
+
+        Only meaningful when USE_FFMPEG_IO=1.
+        """
+        if _USE_FFMPEG_IO:
+            self._ffmpeg_out.report_network_stats(rtt_ms=rtt_ms, lost=lost)
+
+    # ── stop_playback / is_active ─────────────────────────────────────────────
+
     async def stop_playback(self) -> None:
-        """
-        Insert a stop sentinel — writer thread will close its stream and idle.
-        """
+        """Insert a stop sentinel (sounddevice path). No-op on FFmpeg path."""
+        if _USE_FFMPEG_IO:
+            return
         try:
             self._write_q.put_nowait(self._STOP)
-        except queue.Full: # noqa
+        except _stdlib_queue.Full:
             pass
 
+    # noinspection PyProtectedMember
     def is_active(self) -> bool:
+        if _USE_FFMPEG_IO:
+            return self._started and not self._ffmpeg_out._stopped
         return self._stream is not None and self._stream.active
 
-    # ── writer thread ─────────────────────────────────────────────────────────
+    # ── writer thread + stream management (sounddevice path, unchanged) ───────
 
     def _writer_loop(self) -> None:
         import queue as _q
@@ -1707,7 +2616,7 @@ class PCMOutputStream:
             if needs_open:
                 self._open_stream(chunk.fmt)
                 if self._stream is None:
-                    continue  # device open failed
+                    continue
 
             t0 = time.monotonic()
             try:
@@ -1737,7 +2646,6 @@ class PCMOutputStream:
             )
             self._stream.start()
 
-            # Warmup: write silent frames to prime the driver pipeline
             if self._warmup_frames > 0:
                 shape = (
                     (self._warmup_frames,)
@@ -5257,6 +6165,10 @@ _format_registry.register("cd", PCMFormat(sample_rate=44100, channels=2, dtype="
 _format_registry.register("studio", PCMFormat(sample_rate=48000, channels=2, dtype="float32"))
 _format_registry.register("broadcast", PCMFormat(sample_rate=48000, channels=1, dtype="float32"))
 
+# Opus-targeted presets (used when USE_FFMPEG_IO=1)
+_format_registry.register("opus_voip",    PCMFormat(sample_rate=48000, channels=1, dtype="int16"))
+_format_registry.register("opus_stereo",  PCMFormat(sample_rate=48000, channels=2, dtype="int16"))
+_format_registry.register("opus_hd",      PCMFormat(sample_rate=48000, channels=2, dtype="float32"))
 
 def get_format_registry() -> PCMFormatRegistry:
     """Return the module-level default PCMFormatRegistry."""

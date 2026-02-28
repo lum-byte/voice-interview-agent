@@ -1846,8 +1846,7 @@ class SessionLifecycleManager:
 
             # ── 8. Transcript writer begin ────────────────────────────────────
             try:
-                if _transcript_writer is not None:
-                    await _transcript_writer.begin_session(session_id)
+                await _transcript_open_session(session_id)
             except Exception as exc:
                 log.warning("session_transcript_begin_failed", session_id=session_id[:8], error=str(exc))
 
@@ -1974,8 +1973,7 @@ class SessionLifecycleManager:
 
             # ── 8. Transcript writer flush ────────────────────────────────────
             try:
-                if _transcript_writer is not None:
-                    await _transcript_writer.flush_session(session_id)
+                await _transcript_flush_session(session_id)
             except Exception as exc:
                 log.warning("session_transcript_flush_error", session_id=session_id[:8], error=str(exc))
 
@@ -2897,10 +2895,12 @@ async def _node_llm_qa_path(
     # ══════════════════════════════════════════════════════════════════════
     #  GREETING STAGE
     # ══════════════════════════════════════════════════════════════════════
+
     if current_stage == "greeting":
         log.info("qa_path_greeting", session_id=session_id[:8])
         span.set_attribute("qa_stage", "greeting")
-        return (_GREETING_TEXT, "greeting", "none") # noqa
+        greeting_text = await _qa_controller.get_greeting(session_id)  # advances stage → "intro"
+        return (greeting_text, "greeting", "none") # noqa
 
     # ══════════════════════════════════════════════════════════════════════
     #  INTRO STAGE — ATS extraction + seed
@@ -2912,24 +2912,38 @@ async def _node_llm_qa_path(
 
         try:
             # 1. Get intro input from QA controller
-            intro_input = await _qa_controller.get_intro_input(session_id, candidate_answer)
+            intro_input = await _qa_controller.get_intro_messages(session_id, candidate_answer) # noqa | DO NOT REMOVE as seed from intro will get no intro and it'll crash silently
 
             # 2. ATS extraction — rule-based first, LLM fallback if confidence low
             ats_result = None # noqa
+            rule_result = None  # keep rule result as safety net
             try:
-                ats_result = _ats_rule_extractor.extract(candidate_answer)
-                if ats_result.confidence < _ATS_RULE_CONFIDENCE_THRESHOLD:
+                rule_result = _ats_rule_extractor.extract(candidate_answer)
+                if rule_result.confidence < _ATS_RULE_CONFIDENCE_THRESHOLD:
                     log.info(
                         "qa_path_ats_rule_low_confidence",
                         session_id=session_id[:8],
-                        confidence=round(ats_result.confidence, 2),
+                        confidence=round(rule_result.confidence, 2),
                     )
-                    ats_result = await _ats_llm_extract(intro_input, rid)
+                    ats_result = await _ats_llm_extract(candidate_answer, rid)
+                else:
+                    ats_result = rule_result
             except Exception as exc:
                 log.warning("qa_path_ats_rule_failed", session_id=session_id[:8], error=str(exc))
-                ats_result = await _ats_llm_extract(intro_input, rid)
+                ats_result = await _ats_llm_extract(candidate_answer, rid)
 
-            if ats_result is None:
+            # If LLM failed but rule extractor found domains, use the rule result
+            # rather than blocking the candidate with a "say that again" loop.
+            if ats_result is None and rule_result is not None and rule_result.domains:
+                log.info(
+                    "qa_path_ats_llm_failed_using_rule_fallback",
+                    session_id=session_id[:8],
+                    domains=rule_result.domains,
+                    level=rule_result.level,
+                )
+                ats_result = rule_result
+
+            if ats_result is None or not ats_result.domains:
                 log.error("qa_path_ats_extraction_failed", session_id=session_id[:8])
                 return (
                     "I didn't quite catch all of that. Could you tell me again about "
@@ -2995,9 +3009,7 @@ async def _node_llm_qa_path(
             # 2. Build the next LLM input through the QA controller
             #    This call also handles domain rotation when the current
             #    domain's quota is met.
-            llm_input = await _qa_controller.build_next_llm_input_for_voice_graph(
-                session_id, candidate_answer,
-            )
+            llm_input = await _build_next_llm_input(session_id, candidate_answer)
 
             if llm_input is None:
                 # All domains exhausted — interview is complete
@@ -3446,6 +3458,15 @@ class VoiceGraph:
                 # ── register temp file for cleanup ─────────────────────────
                 if resources and final_state.get("audio_local_path"):
                     resources.temp_files.append(final_state["audio_local_path"])
+
+                # ── write transcript turn ───────────────────────────────────
+                if session_id:
+                    await _transcript_write_turn(
+                        session_id=session_id,
+                        user_text=final_state.get("user_input", ""),
+                        assistant_text=final_state.get("llm_response", ""),
+                        request_id=rid,
+                    )
 
                 return final_state
 
@@ -4740,6 +4761,7 @@ APOLOGY_TTS: str = (
 try:
     from app.interview.qa_controller import (
         qa_controller as _qa_controller,
+        build_next_llm_input_for_voice_graph as _build_next_llm_input,
         QAAnalytics as _QAAnalytics,
         ATSRuleExtractor as _ATSRuleExtractorCls,
         QuestionFingerprintStore as _QuestionFingerprintStoreCls,
@@ -4758,6 +4780,7 @@ try:
 except ImportError:
     log.warning("qa_controller_import_failed — QA features disabled")
     _qa_controller               = None
+    _build_next_llm_input        = None
     _QAAnalytics                 = None
     _ATSRuleExtractorCls         = None
     _QuestionFingerprintStoreCls = None
