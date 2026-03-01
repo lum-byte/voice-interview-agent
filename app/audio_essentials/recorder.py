@@ -494,6 +494,12 @@ async def _record_pcm_async(is_held_fn: Callable[[], bool]) -> str | None:
                 # and increments Prometheus counters in-line. Health status is
                 # available via get_recording_health() at any time.
                 _module_diagnostics.push(chunk)
+                # ── VU meter ──────────────────────────────────────────────
+                try:
+                    from app.monitoring.observability import push_audio_level
+                    push_audio_level(chunk.rms())
+                except Exception: # noqa
+                    pass
 
                 # ── PCMLatencyTracker: per-chunk observation ───────────────────
                 # Measures wall-clock delta from chunk.timestamp (set at capture

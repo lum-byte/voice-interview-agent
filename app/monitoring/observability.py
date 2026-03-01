@@ -57,10 +57,17 @@ Environment variables
 from __future__ import annotations
 
 import asyncio
+import atexit
 import copy
 import json
 import logging
 import os
+import math as _math
+import statistics
+import sys # noqa
+from collections import Counter, defaultdict, deque
+from itertools import islice
+from typing import Deque, Dict, List, Optional, Tuple # noqa
 import queue
 import threading
 import time
@@ -85,8 +92,39 @@ from prometheus_client import (  # type: ignore[unused-import]
     Summary,
     start_http_server,
 )
-from rich.console import Console
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+from rich import box as _rbox
+from rich.align import Align # type: ignore[unused-import]
+from rich.bar import Bar # type: ignore[unused-import]
+from rich.columns import Columns # type: ignore[unused-import]
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn # type: ignore[unused-import]
+from rich.rule import Rule
+from rich.spinner import Spinner # type: ignore[unused-import]
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
 from rich.theme import Theme
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  psutil — optional; dashboard degrades gracefully without it
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import psutil as _psutil
+    _PSUTIL_PROC: Optional[Any] = _psutil.Process()
+    _PSUTIL_OK = True
+except ImportError:
+    _psutil = None
+    _PSUTIL_PROC = None
+    _PSUTIL_OK = False
 
 # OpenTelemetry — all imports are guarded so the file loads cleanly even
 # when the otel packages are absent (OTEL_ENABLED=false never needs them).
@@ -1736,92 +1774,1160 @@ class _OtelLayer:
 _OTEL: _OtelLayer = _OtelLayer()
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  RICH CONSOLE RENDERER
+#  RICH DASHBOARD
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  THEME  —  extended colour vocabulary
 # ═════════════════════════════════════════════════════════════════════════════
 
 _THEME = Theme(
     {
-        "ts": "dim white",
-        "lvl.info": "bold bright_green",
-        "lvl.warn": "bold yellow",
-        "lvl.error": "bold bright_red",
-        "lvl.debug": "dim cyan",
-        "evt": "white",
-        "kv.key": "dim white",
-        "kv.val": "bright_white",
-        "svc.stt": "cyan",
-        "svc.llm": "magenta",
-        "svc.tts": "blue",
-        "svc.session": "yellow",
-        "svc.eval": "bright_yellow",
-        "svc.pipeline": "white",
-        "svc.cb": "bright_red",
-        "svc.rl": "red",
-        "svc.bh": "bright_magenta",
-        "svc.ctrl": "bright_green",
-        "svc.memory": "bright_cyan",
-        "svc.sanitize": "dim green",
-        "svc.redis": "bright_blue",
-        "ok": "bright_green",
-        "warn": "yellow",
-        "err": "bright_red",
+        # ── timestamps ────────────────────────────────────────────────────────
+        "ts":              "dim white",
+        # ── log levels ───────────────────────────────────────────────────────
+        "lvl.info":        "bold bright_green",
+        "lvl.warn":        "bold yellow",
+        "lvl.error":       "bold bright_red",
+        "lvl.debug":       "dim cyan",
+        "lvl.critical":    "bold white on red",
+        # ── event name ───────────────────────────────────────────────────────
+        "evt":             "white",
+        "evt.error":       "bright_red",
+        "evt.warn":        "yellow",
+        # ── kv pairs ─────────────────────────────────────────────────────────
+        "kv.key":          "dim white",
+        "kv.val":          "bright_white",
+        "kv.val.error":    "bright_red",
+        "kv.val.warn":     "yellow",
+        # ── service colours ──────────────────────────────────────────────────
+        "svc.stt":         "cyan",
+        "svc.llm":         "magenta",
+        "svc.tts":         "dodger_blue2",
+        "svc.session":     "yellow",
+        "svc.eval":        "bright_yellow",
+        "svc.pipeline":    "white",
+        "svc.cb":          "bright_red",
+        "svc.rl":          "red",
+        "svc.bh":          "bright_magenta",
+        "svc.ctrl":        "bright_green",
+        "svc.memory":      "bright_cyan",
+        "svc.sanitize":    "dim green",
+        "svc.redis":       "bright_blue",
+        # ── status colours ───────────────────────────────────────────────────
+        "ok":              "bright_green",
+        "warn":            "yellow",
+        "err":             "bright_red",
+        "degraded":        "orange3",
+        "unknown":         "dim white",
+        # ── circuit breaker ──────────────────────────────────────────────────
+        "cb.closed":       "bright_green",
+        "cb.open":         "bright_red",
+        "cb.half":         "yellow",
+        # ── dashboard chrome ─────────────────────────────────────────────────
+        "chrome.border":   "bright_black",
+        "chrome.title":    "bold white",
+        "chrome.subtitle": "dim white",
+        "chrome.label":    "dim white",
+        # ── sparkline colours ────────────────────────────────────────────────
+        "spark.low":       "bright_green",
+        "spark.mid":       "yellow",
+        "spark.high":      "bright_red",
+        # ── vitals bar ───────────────────────────────────────────────────────
+        "vital.label":     "dim white",
+        "vital.val":       "bright_white",
+        "vital.hot":       "bright_red",
+        "vital.warm":      "yellow",
+        # ── alerts ───────────────────────────────────────────────────────────
+        "alert.critical":  "bold white on red",
+        "alert.error":     "bold bright_red",
+        "alert.warn":      "bold yellow",
+        "alert.info":      "dim white",
+        # ── token budget ─────────────────────────────────────────────────────
+        "tok.safe":        "bright_green",
+        "tok.warning":     "yellow",
+        "tok.danger":      "bright_red",
     }
 )
 
 _CONSOLE = Console(theme=_THEME, highlight=False)
 
-_SVC_STYLE: dict[str, tuple[str, str]] = {
-    "stt": ("◈", "svc.stt"),
-    "llm": ("◈", "svc.llm"),
-    "tts": ("♪", "svc.tts"),
-    "session": ("⬡", "svc.session"),
-    "eval": ("⊛", "svc.eval"),
-    "pipeline": ("⚙", "svc.pipeline"),
-    "cb": ("⊗", "svc.cb"),
-    "rl": ("⊘", "svc.rl"),
-    "bh": ("⊕", "svc.bh"),
-    "controller": ("●", "svc.ctrl"),
-    "memory": ("⌘", "svc.memory"),
-    "sanitize": ("⌖", "svc.sanitize"),
-    "redis": ("⬡", "svc.redis"),
-    "transcript": ("≡", "svc.session"),
+# ═════════════════════════════════════════════════════════════════════════════
+#  SERVICE METADATA  —  icon, style tag, human label
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SVC_META: Dict[str, Tuple[str, str, str]] = {
+    # key          icon   style         label
+    "stt":        ("◈",  "svc.stt",     "Speech-to-Text"),
+    "llm":        ("◈",  "svc.llm",     "Language Model"),
+    "tts":        ("♪",  "svc.tts",     "Text-to-Speech"),
+    "session":    ("⬡",  "svc.session", "Session Store"),
+    "eval":       ("⊛",  "svc.eval",    "Evaluator"),
+    "pipeline":   ("⚙",  "svc.pipeline","Pipeline"),
+    "cb":         ("⊗",  "svc.cb",      "Circuit Breaker"),
+    "rl":         ("⊘",  "svc.rl",      "Rate Limiter"),
+    "bh":         ("⊕",  "svc.bh",      "Bulkhead"),
+    "controller": ("●",  "svc.ctrl",    "Controller"),
+    "memory":     ("⌘",  "svc.memory",  "Memory"),
+    "sanitize":   ("⌖",  "svc.sanitize","Sanitizer"),
+    "redis":      ("⬡",  "svc.redis",   "Redis"),
+    "transcript": ("≡",  "svc.session", "Transcript"),
 }
 
-_LEVEL_STYLE: dict[str, str] = {
-    "info": "lvl.info",
-    "warning": "lvl.warn",
-    "warn": "lvl.warn",
-    "error": "lvl.error",
-    "debug": "lvl.debug",
+# Back-compat: _SVC_STYLE kept for code that uses the 2-tuple form
+_SVC_STYLE: Dict[str, Tuple[str, str]] = {
+    k: (v[0], v[1]) for k, v in _SVC_META.items()
+}
+
+_LEVEL_STYLE: Dict[str, str] = {
+    "info":     "lvl.info",
+    "warning":  "lvl.warn",
+    "warn":     "lvl.warn",
+    "error":    "lvl.error",
+    "debug":    "lvl.debug",
+    "critical": "lvl.critical",
 }
 
 _KV_SUPPRESS = {"request_id", "level", "timestamp", "event", "logger"}
-_KV_ALIAS: dict[str, str] = {
-    "session_id": "sid",
-    "latency_ms": "ms",
-    "latency_s": "lat",
-    "total_tokens": "tok",
-    "audio_path": "path",
+_KV_ALIAS: Dict[str, str] = {
+    "session_id":      "sid",
+    "latency_ms":      "ms",
+    "latency_s":       "lat",
+    "total_tokens":    "tok",
+    "audio_path":      "path",
     "lang_confidence": "conf",
-    "circuit_state": "cb",
-    "error_type": "etype",
-    "model_used": "model",
+    "circuit_state":   "cb",
+    "error_type":      "etype",
+    "model_used":      "model",
+    "prompt_tokens":   "p_tok",
+    "completion_tokens":"c_tok",
+    "retry_count":     "retry",
+    "cache_hit":       "cache",
+    "fallback":        "fb",
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BRAILLE SPARKLINE ENGINE
+#  Encodes a sequence of floats into a Unicode braille mini-chart.
+#  Each braille character encodes two columns of 4 dots, giving 8 height levels.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Braille chars for columns 0-7 (bit 0 = top dot, bit 3 = bottom dot)
+_BRAILLE_OFFSETS = [0x2801, 0x2802, 0x2804, 0x2840]  # col 0 bits
+_BRAILLE_OFFSETS_R = [0x2810, 0x2820, 0x2880, 0x28C0]  # col 1 bits (wrong)
+
+# Simpler: map fractional height (0.0–1.0) to one of 8 block chars
+_BLOCK_CHARS = " ▁▂▃▄▅▆▇█"  # 9 levels
+_SPARK_WIDTH_DEFAULT = 12
+
+
+def _sparkline(
+    values: list,
+    width: int = _SPARK_WIDTH_DEFAULT,
+    color_thresholds: Tuple[float, float] = (0.6, 0.85),
+) -> Text:
+    """
+    Render a mini bar-chart using Unicode block chars.
+
+    Args:
+        values:            Sequence of floats (raw; normalised internally).
+        width:             Number of columns in the output.
+        color_thresholds:  (warn_ratio, hot_ratio) — fractions of max value.
+
+    Returns:
+        Rich Text object with colour-coded blocks.
+    """
+    if not values:
+        return Text("─" * width, style="chrome.label")
+
+    # Subsample to `width` points
+    if len(values) > width:
+        step = len(values) / width
+        vals = [values[int(i * step)] for i in range(width)]
+    else:
+        vals = list(values)
+        # left-pad with zeros if shorter than width
+        vals = [0.0] * (width - len(vals)) + vals
+
+    lo, hi = min(vals), max(vals)
+    span = hi - lo or 1.0
+
+    result = Text()
+    warn_th, hot_th = color_thresholds
+    for v in vals:
+        ratio = (v - lo) / span
+        char_idx = min(int(ratio * (len(_BLOCK_CHARS) - 1)), len(_BLOCK_CHARS) - 1)
+        char = _BLOCK_CHARS[char_idx]
+        if ratio >= hot_th:
+            style = "spark.high"
+        elif ratio >= warn_th:
+            style = "spark.mid"
+        else:
+            style = "spark.low"
+        result.append(char, style=style)
+
+    return result
+
+
+def _mini_hbar(ratio: float, width: int = 10) -> Text:
+    """
+    Horizontal bar with fill based on ratio [0.0–1.0].
+    Colour: green → yellow → red based on fill level.
+    """
+    ratio = max(0.0, min(1.0, ratio))
+    filled = round(ratio * width)
+    empty = width - filled
+
+    if ratio < 0.6:
+        fill_style = "bright_green"
+    elif ratio < 0.85:
+        fill_style = "yellow"
+    else:
+        fill_style = "bright_red"
+
+    t = Text()
+    t.append("█" * filled, style=fill_style)
+    t.append("░" * empty, style="dim white")
+    return t
+
+
+def _latency_colour(ms: float) -> str:
+    """Map a latency (ms) to a colour style string."""
+    if ms < 200:
+        return "bright_green"
+    if ms < 800:
+        return "yellow"
+    if ms < 2000:
+        return "orange3"
+    return "bright_red"
+
+
+def _fmt_ms(ms: float) -> str:
+    if ms < 1000:
+        return f"{ms:.0f}ms"
+    return f"{ms / 1000:.2f}s"
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{unit}"
+        n //= 1024
+    return f"{n:.0f}TB"
+
+
+def _fmt_count(n: int) -> str:
+    if n < 1_000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1_000:.1f}k"
+    return f"{n / 1_000_000:.1f}M"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PER-SERVICE ROLLING METRICS
+# ═════════════════════════════════════════════════════════════════════════════
+
+_LATENCY_HISTORY_LEN = 60   # samples per service
+_ERROR_WINDOW_S = 60.0       # error-rate rolling window
+
+
+class _ServiceMetrics:
+    """
+    Rolling statistics for a single service component.
+    All writes happen from _DualSinkRenderer (single thread via GIL).
+    """
+
+    __slots__ = (
+        "latency_deque",
+        "error_timestamps",
+        "request_count",
+        "error_count",
+        "last_event",
+        "last_event_ts",
+        "last_event_level",
+        "tokens_in",
+        "tokens_out",
+        "status",        # "ok" | "degraded" | "down" | "unknown"
+        "model",
+        "voice",
+        "cache_hits",
+        "cache_misses",
+        "retry_total",
+        "fallback_total",
+        "active_since",
+    )
+
+    def __init__(self) -> None:
+        self.latency_deque: Deque[float] = deque(maxlen=_LATENCY_HISTORY_LEN)
+        self.error_timestamps: Deque[float] = deque(maxlen=500)
+        self.request_count = 0
+        self.error_count = 0
+        self.last_event = "—"
+        self.last_event_ts: float = 0.0
+        self.last_event_level = "info"
+        self.tokens_in = 0
+        self.tokens_out = 0
+        self.status = "unknown"
+        self.model = "—"
+        self.voice = "—"
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.retry_total = 0
+        self.fallback_total = 0
+        self.active_since: float = time.monotonic()
+
+    # ── computed properties ───────────────────────────────────────────────────
+
+    @property
+    def p50(self) -> Optional[float]:
+        if not self.latency_deque:
+            return None
+        return statistics.median(self.latency_deque)
+
+    @property
+    def p95(self) -> Optional[float]:
+        d = list(self.latency_deque)
+        if not d:
+            return None
+        d.sort()
+        idx = max(0, int(0.95 * len(d)) - 1)
+        return d[idx]
+
+    @property
+    def p99(self) -> Optional[float]:
+        d = list(self.latency_deque)
+        if not d:
+            return None
+        d.sort()
+        idx = max(0, int(0.99 * len(d)) - 1)
+        return d[idx]
+
+    @property
+    def error_rate_pm(self) -> float:
+        """Errors per minute in the last 60 s."""
+        now = time.monotonic()
+        cutoff = now - _ERROR_WINDOW_S
+        recent = sum(1 for t in self.error_timestamps if t > cutoff)
+        return recent * (60.0 / _ERROR_WINDOW_S)
+
+    @property
+    def cache_hit_rate(self) -> Optional[float]:
+        total = self.cache_hits + self.cache_misses
+        if total == 0:
+            return None
+        return self.cache_hits / total
+
+    def sparkline_text(self, width: int = _SPARK_WIDTH_DEFAULT) -> Text:
+        return _sparkline(list(self.latency_deque), width=width)
+
+    def status_icon(self) -> Tuple[str, str]:
+        mapping = {
+            "ok":       ("✓", "bright_green"),
+            "degraded": ("⚠", "yellow"),
+            "down":     ("✗", "bright_red"),
+            "unknown":  ("○", "dim white"),
+        }
+        return mapping.get(self.status, ("?", "dim white"))
+
+    def record_latency(self, ms: float) -> None:
+        self.latency_deque.append(ms)
+
+    def record_error(self) -> None:
+        self.error_count += 1
+        self.error_timestamps.append(time.monotonic())
+        self.status = "degraded"
+
+    def record_request(self) -> None:
+        self.request_count += 1
+        if self.status == "unknown":
+            self.status = "ok"
+
+    def record_ok(self) -> None:
+        if self.status in ("unknown", "degraded"):
+            self.status = "ok"
+
+
+# Global per-service metrics dict
+_DASH_SVC: Dict[str, "_ServiceMetrics"] = defaultdict(_ServiceMetrics)
+
+# Bootstrap known services so matrix always has all rows
+for _svc_key in _SVC_META:
+    _ = _DASH_SVC[_svc_key]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ALERT BUS
+#  Collects critical events and surfaces them in a sticky alert strip.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ALERT_HISTORY_LEN = 20
+_ALERT_BURST_THRESHOLD = 5   # alerts in _ALERT_BURST_WINDOW_S → banner flash
+_ALERT_BURST_WINDOW_S = 10.0
+
+
+class _AlertBus:
+    """
+    Thread-safe(ish — GIL) alert collector.
+
+    Levels: "critical", "error", "warn", "info"
+    """
+
+    _LEVEL_ORDER = {"critical": 0, "error": 1, "warn": 2, "info": 3}
+    _STYLE_MAP = {
+        "critical": "alert.critical",
+        "error":    "alert.error",
+        "warn":     "alert.warn",
+        "info":     "alert.info",
+    }
+
+    def __init__(self) -> None:
+        self._alerts: Deque[Tuple[float, str, str, str]] = deque(
+            maxlen=_ALERT_HISTORY_LEN
+        )  # (ts, level, service, message)
+        self._burst_window: Deque[float] = deque(maxlen=50)
+
+    def push(self, level: str, service: str, message: str) -> None:
+        now = time.monotonic()
+        self._alerts.append((now, level, service, message))
+        if level in ("critical", "error"):
+            self._burst_window.append(now)
+
+    def is_bursting(self) -> bool:
+        cutoff = time.monotonic() - _ALERT_BURST_WINDOW_S
+        recent = sum(1 for t in self._burst_window if t > cutoff)
+        return recent >= _ALERT_BURST_THRESHOLD
+
+    def recent(self, n: int = 6) -> List[Tuple[float, str, str, str]]:
+        return list(islice(reversed(self._alerts), n))
+
+    def highest_level(self) -> str:
+        if not self._alerts:
+            return "info"
+        levels = [a[1] for a in self._alerts]
+        ordered = sorted(levels, key=lambda l: self._LEVEL_ORDER.get(l, 99))
+        return ordered[0] if ordered else "info"
+
+    def render_row(self, ts: float, level: str, svc: str, msg: str) -> Text:
+        age = time.monotonic() - ts
+        if age < 60:
+            age_str = f"{age:.0f}s ago"
+        else:
+            age_str = f"{age / 60:.0f}m ago"
+        style = self._STYLE_MAP.get(level, "dim white")
+        t = Text()
+        t.append(f"  {age_str:>8}  ", style="dim white")
+        t.append(f"{level.upper():<8}", style=style)
+        t.append(f"[{svc:<10}]  ", style="dim white")
+        t.append(msg[:72], style=style)
+        return t
+
+
+_ALERTS = _AlertBus()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  IN-FLIGHT SPINNER REGISTRY
+#  Tracks long-running ops (e.g. LLM stream, TTS synth) with animated frames.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_MAX_AGE_S = 120.0   # auto-expire stuck spinners
+
+
+class _SpinnerRegistry:
+    """Tracks in-flight operations. Not thread-safe but GIL-protected for us."""
+
+    def __init__(self) -> None:
+        self._ops: Dict[str, float] = {}   # op_key -> start_time (monotonic)
+        self._labels: Dict[str, str] = {}  # op_key -> display label
+        self._frame_idx = 0
+        self._last_tick = time.monotonic()
+
+    def start(self, op_key: str, label: str = "") -> None:
+        self._ops[op_key] = time.monotonic()
+        self._labels[op_key] = label or op_key
+
+    def finish(self, op_key: str) -> None:
+        self._ops.pop(op_key, None)
+        self._labels.pop(op_key, None)
+
+    def _advance_frame(self) -> str:
+        now = time.monotonic()
+        if now - self._last_tick > 0.1:
+            self._frame_idx = (self._frame_idx + 1) % len(_SPINNER_FRAMES)
+            self._last_tick = now
+        return _SPINNER_FRAMES[self._frame_idx]
+
+    def render(self, max_show: int = 4) -> Text:
+        # Prune stale spinners
+        now = time.monotonic()
+        stale = [k for k, t in self._ops.items() if now - t > _SPINNER_MAX_AGE_S]
+        for k in stale:
+            self.finish(k)
+
+        frame = self._advance_frame()
+        t = Text()
+        if not self._ops:
+            t.append("  idle", style="dim white")
+            return t
+
+        for op_key, start in list(self._ops.items())[:max_show]:
+            elapsed = now - start
+            label = self._labels.get(op_key, op_key)
+            t.append(f"  {frame} ", style="yellow")
+            t.append(f"{label}", style="bright_white")
+            t.append(f"  {elapsed:.1f}s", style="dim white")
+            t.append("   ")
+        return t
+
+
+_SPINNERS = _SpinnerRegistry()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  EVENT RATE TRACKER
+#  Counts events/second in a sliding window using 1-second buckets.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_RATE_WINDOW_S = 30
+_RATE_SPARK_WIDTH = 20
+
+
+class _RateTracker:
+    """Rolling events-per-second counter with sparkline history."""
+
+    def __init__(self, window_s: int = _RATE_WINDOW_S) -> None:
+        self._window_s = window_s
+        self._buckets: Deque[Tuple[float, int]] = deque(maxlen=window_s * 2)
+        self._current_second: int = int(time.monotonic())
+        self._current_count: int = 0
+        self._history: Deque[float] = deque(maxlen=_RATE_SPARK_WIDTH)
+        self._total: int = 0
+
+    def tick(self) -> None:
+        now_sec = int(time.monotonic())
+        if now_sec != self._current_second:
+            self._history.append(float(self._current_count))
+            self._buckets.append((float(self._current_second), self._current_count))
+            self._current_second = now_sec
+            self._current_count = 0
+        self._current_count += 1
+        self._total += 1
+
+    @property
+    def eps(self) -> float:
+        """Mean events/sec over the last window_s seconds."""
+        if not self._buckets:
+            return 0.0
+        cutoff = time.monotonic() - self._window_s
+        counts = [c for t, c in self._buckets if t > cutoff]
+        if not counts:
+            return 0.0
+        return sum(counts) / len(counts)
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    def sparkline(self) -> Text:
+        return _sparkline(list(self._history), width=_RATE_SPARK_WIDTH)
+
+
+_RATE = _RateTracker()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TOKEN BUDGET TRACKER
+# ═════════════════════════════════════════════════════════════════════════════
+
+_TOKEN_WARNING_THRESHOLD = 0.70
+_TOKEN_DANGER_THRESHOLD  = 0.90
+_TOKEN_SOFT_LIMIT        = int(os.getenv("TOKEN_BUDGET_LIMIT", "200000"))
+
+
+class _TokenBudget:
+    """Tracks cumulative token usage for the lifetime of the process."""
+
+    def __init__(self, limit: int = _TOKEN_SOFT_LIMIT) -> None:
+        self.limit = limit
+        self.prompt_total: int = 0
+        self.completion_total: int = 0
+        self._history: Deque[int] = deque(maxlen=60)  # total snapshots
+
+    def record(self, prompt: int = 0, completion: int = 0) -> None:
+        self.prompt_total += prompt
+        self.completion_total += completion
+        self._history.append(self.total)
+
+    @property
+    def total(self) -> int:
+        return self.prompt_total + self.completion_total
+
+    @property
+    def ratio(self) -> float:
+        if self.limit <= 0:
+            return 0.0
+        return min(1.0, self.total / self.limit)
+
+    def render_bar(self, width: int = 20) -> Text:
+        r = self.ratio
+        if r >= _TOKEN_DANGER_THRESHOLD:
+            style = "tok.danger"
+        elif r >= _TOKEN_WARNING_THRESHOLD:
+            style = "tok.warning"
+        else:
+            style = "tok.safe"
+
+        filled = round(r * width)
+        empty  = width - filled
+        t = Text()
+        t.append("█" * filled, style=style)
+        t.append("░" * empty,  style="dim white")
+        t.append(
+            f"  {_fmt_count(self.total)}/{_fmt_count(self.limit)}"
+            f"  ({r * 100:.0f}%)",
+            style=style,
+        )
+        return t
+
+    def sparkline(self, width: int = 16) -> Text:
+        return _sparkline(list(self._history), width=width)
+
+
+_TOKEN_BUDGET = _TokenBudget()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CIRCUIT BREAKER BOARD
+# ═════════════════════════════════════════════════════════════════════════════
+
+_CB_TRANSITION_HISTORY_LEN = 8
+
+
+class _CircuitBreakerBoard:
+    """
+    Tracks circuit-breaker state per service and keeps a short transition log.
+    States: "closed" | "open" | "half_open"
+    """
+
+    _STATE_ICONS = {
+        "closed":    ("●", "cb.closed"),
+        "open":      ("○", "cb.open"),
+        "half_open": ("◑", "cb.half"),
+    }
+    _STATE_DISPLAY = {
+        "closed":    "CLOSED",
+        "open":      "OPEN  ",
+        "half_open": "HALF  ",
+    }
+
+    def __init__(self) -> None:
+        self._states: Dict[str, str] = {}   # service -> state
+        self._transitions: Deque[Tuple[float, str, str, str]] = deque(
+            maxlen=_CB_TRANSITION_HISTORY_LEN
+        )  # (ts, service, from_state, to_state)
+
+    def update(self, service: str, new_state: str) -> None:
+        old = self._states.get(service)
+        if old != new_state:
+            self._transitions.append((time.monotonic(), service, old or "?", new_state))
+        self._states[service] = new_state
+
+    def render_state_table(self) -> Table:
+        tbl = Table(box=None, padding=(0, 1), expand=True, show_header=False)
+        tbl.add_column("svc", style="dim white", width=12)
+        tbl.add_column("icon", width=2)
+        tbl.add_column("state", width=8)
+        tbl.add_column("transitions", style="dim white")
+
+        svcs = sorted(self._states.keys()) or ["—"]
+        for svc in svcs:
+            state = self._states.get(svc, "unknown")
+            icon, icon_style = self._STATE_ICONS.get(state, ("?", "dim white"))
+            display = self._STATE_DISPLAY.get(state, state.upper()[:6])
+            transitions_for_svc = [
+                t for t in self._transitions if t[1] == svc
+            ]
+            tcount = len(transitions_for_svc)
+            icon_t = Text()
+            icon_t.append(icon, style=icon_style)
+
+            state_t = Text()
+            state_t.append(display, style=icon_style)
+
+            tc_t = Text(str(tcount) + " transitions", style="dim white")
+            tbl.add_row(svc, icon_t, state_t, tc_t)
+
+        return tbl
+
+    def render_transition_log(self) -> Text:
+        t = Text()
+        for ts, svc, old, new in reversed(self._transitions):
+            age = time.monotonic() - ts
+            _, old_style = self._STATE_ICONS.get(old, ("?", "dim white"))
+            _, new_style = self._STATE_ICONS.get(new, ("?", "dim white"))
+            t.append(f"  {age:>5.0f}s  ", style="dim white")
+            t.append(f"{svc:<12}", style="dim white")
+            t.append(old.upper()[:6],  style=old_style)
+            t.append(" → ", style="dim white")
+            t.append(new.upper()[:6],  style=new_style)
+            t.append("\n")
+        return t
+
+
+_CB_BOARD = _CircuitBreakerBoard()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SYSTEM VITALS  (psutil-backed, graceful no-op if unavailable)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_PROCESS_START = time.monotonic()
+
+
+class _SystemVitals:
+    """Snapshot of process & system resource usage."""
+
+    def __init__(self) -> None:
+        self._proc = _PSUTIL_PROC
+        self._cpu_history: Deque[float] = deque(maxlen=30)
+        self._mem_history: Deque[float] = deque(maxlen=30)
+        self._last_sample = 0.0
+
+    def _maybe_sample(self) -> None:
+        now = time.monotonic()
+        if now - self._last_sample < 2.0:
+            return
+        self._last_sample = now
+        if self._proc is None:
+            return
+        try:
+            cpu = self._proc.cpu_percent(interval=None)
+            mem = self._proc.memory_info().rss / (1024 * 1024)  # MB
+            self._cpu_history.append(cpu)
+            self._mem_history.append(mem)
+        except Exception:  # noqa
+            pass
+
+    @property
+    def cpu_pct(self) -> Optional[float]:
+        self._maybe_sample()
+        return self._cpu_history[-1] if self._cpu_history else None
+
+    @property
+    def mem_mb(self) -> Optional[float]:
+        self._maybe_sample()
+        return self._mem_history[-1] if self._mem_history else None
+
+    @property
+    def fd_count(self) -> Optional[int]:
+        if self._proc is None:
+            return None
+        try:
+            return self._proc.num_fds()
+        except Exception:  # noqa
+            return None
+
+    @property
+    def thread_count(self) -> Optional[int]:
+        if self._proc is None:
+            return None
+        try:
+            return self._proc.num_threads()
+        except Exception:  # noqa
+            return None
+
+    @property
+    def uptime_s(self) -> float:
+        return time.monotonic() - _PROCESS_START
+
+    def cpu_sparkline(self) -> Text:
+        return _sparkline(list(self._cpu_history), width=12)
+
+    def mem_sparkline(self) -> Text:
+        return _sparkline(list(self._mem_history), width=12)
+
+
+_VITALS = _SystemVitals()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PROFESSIONAL AUDIO METER  —  dBFS · LED segments · oscilloscope · SNR
+# ═════════════════════════════════════════════════════════════════════════════
+
+_VU_INT16_MAX      = 32768.0
+_VU_SILENCE_FLOOR  = -60.0      # dBFS below which we call it silence
+_VU_CLIP_THRESHOLD = -0.5       # dBFS above which we count a clip
+_VU_PEAK_HOLD_TTL  = 3.0        # seconds before peak marker drops
+_VU_GATE_OPEN_DB   = -40.0      # noise gate open threshold dBFS
+
+# ── rolling sample stores ─────────────────────────────────────────────────────
+_VU_HISTORY:      Deque[float] = deque(maxlen=120)  # normalised [0,1] RMS history
+_VU_RAW_WAVE:     Deque[float] = deque(maxlen=80)   # for oscilloscope
+_VU_DB_HISTORY:   Deque[float] = deque(maxlen=120)  # dBFS history for sparkline
+_VU_CLIP_HISTORY: Deque[float] = deque(maxlen=60)   # timestamps of clips
+
+# ── peak hold state ───────────────────────────────────────────────────────────
+_VU_PEAK_NORM:    float = 0.0
+_VU_PEAK_DB:      float = _VU_SILENCE_FLOOR
+_VU_PEAK_TS:      float = 0.0   # monotonic time of last peak set
+
+# ── statistics ────────────────────────────────────────────────────────────────
+_VU_CLIP_COUNT:   int   = 0
+_VU_TOTAL_FRAMES: int   = 0
+_VU_GATE_OPEN:    bool  = False
+_VU_SPEECH_STATE: str   = "silence"   # "silence" | "onset" | "speech" | "trail"
+_VU_SPEECH_START: float = 0.0
+_VU_SPEECH_DURATION_S: float = 0.0
+_VU_NOISE_FLOOR_DB: float = -60.0     # adaptive noise floor estimate
+_VU_NOISE_ALPHA:  float = 0.01        # noise floor EMA coefficient
+
+# ── speaking duration accumulator ────────────────────────────────────────────
+_VU_TOTAL_SPEECH_S:   float = 0.0
+_VU_LAST_SPEECH_S:    float = 0.0
+
+
+def _rms_to_dbfs(rms_norm: float) -> float:
+    """Convert normalised RMS [0,1] to dBFS. Returns _VU_SILENCE_FLOOR for silence."""
+    if rms_norm < 1e-9:
+        return _VU_SILENCE_FLOOR
+    return max(_VU_SILENCE_FLOOR, 20.0 * _math.log10(rms_norm))
+
+
+def push_audio_level(rms_int16: float) -> None:
+    """
+    Hot-path entry point — called once per captured PCM chunk from recorder.
+    All updates are O(1). Thread-safe under CPython GIL.
+    """
+    global _VU_PEAK_NORM, _VU_PEAK_DB, _VU_PEAK_TS
+    global _VU_CLIP_COUNT, _VU_TOTAL_FRAMES, _VU_GATE_OPEN
+    global _VU_SPEECH_STATE, _VU_SPEECH_START, _VU_SPEECH_DURATION_S
+    global _VU_NOISE_FLOOR_DB, _VU_TOTAL_SPEECH_S, _VU_LAST_SPEECH_S
+
+    now       = time.monotonic()
+    norm      = min(1.0, rms_int16 / _VU_INT16_MAX)
+    db        = _rms_to_dbfs(norm)
+
+    _VU_HISTORY.append(norm)
+    _VU_DB_HISTORY.append(db)
+    _VU_RAW_WAVE.append(norm)
+    _VU_TOTAL_FRAMES += 1
+
+    # ── adaptive noise floor (EMA on silence frames only) ────────────────────
+    if db < _VU_GATE_OPEN_DB:
+        _VU_NOISE_FLOOR_DB = (
+            _VU_NOISE_ALPHA * db + (1 - _VU_NOISE_ALPHA) * _VU_NOISE_FLOOR_DB
+        )
+
+    # ── noise gate ────────────────────────────────────────────────────────────
+    _VU_GATE_OPEN = db > _VU_GATE_OPEN_DB
+
+    # ── clip detection ────────────────────────────────────────────────────────
+    if db >= _VU_CLIP_THRESHOLD:
+        _VU_CLIP_COUNT += 1
+        _VU_CLIP_HISTORY.append(now)
+
+    # ── peak hold with TTL ────────────────────────────────────────────────────
+    if norm >= _VU_PEAK_NORM:
+        _VU_PEAK_NORM = norm
+        _VU_PEAK_DB   = db
+        _VU_PEAK_TS   = now
+    else:
+        # Decay peak after hold TTL
+        age = now - _VU_PEAK_TS
+        if age > _VU_PEAK_HOLD_TTL:
+            decay = 0.85 ** (1 + (age - _VU_PEAK_HOLD_TTL) * 10)
+            _VU_PEAK_NORM = max(0.0, _VU_PEAK_NORM * decay)
+            _VU_PEAK_DB   = _rms_to_dbfs(_VU_PEAK_NORM)
+
+    # ── speech state machine ──────────────────────────────────────────────────
+    # silence → onset (1 frame above gate) → speech → trail → silence
+    if _VU_SPEECH_STATE == "silence":
+        if _VU_GATE_OPEN:
+            _VU_SPEECH_STATE = "onset"
+            _VU_SPEECH_START = now
+    elif _VU_SPEECH_STATE == "onset":
+        if _VU_GATE_OPEN:
+            _VU_SPEECH_STATE = "speech"
+        else:
+            _VU_SPEECH_STATE = "silence"
+    elif _VU_SPEECH_STATE == "speech":
+        _VU_SPEECH_DURATION_S = now - _VU_SPEECH_START
+        if not _VU_GATE_OPEN:
+            _VU_SPEECH_STATE = "trail"
+    elif _VU_SPEECH_STATE == "trail":
+        if _VU_GATE_OPEN:
+            _VU_SPEECH_STATE = "speech"
+        else:
+            # Commit this utterance
+            _VU_LAST_SPEECH_S    = _VU_SPEECH_DURATION_S
+            _VU_TOTAL_SPEECH_S  += _VU_SPEECH_DURATION_S
+            _VU_SPEECH_DURATION_S = 0.0
+            _VU_SPEECH_STATE     = "silence"
+
+
+def _build_vu_panel() -> Panel:
+    """
+    Full professional audio meter panel:
+      Row 1 — segmented LED bar (dBFS scale, green/yellow/red zones)
+              + peak hold marker + dBFS readout
+      Row 2 — oscilloscope waveform (last 80 samples)
+      Row 3 — stats: SNR · clips · gate · speech state · last utt · total
+      Row 4 — dBFS history sparkline
+    """
+    now = time.monotonic()
+
+    # ── current levels ────────────────────────────────────────────────────────
+    db_cur   = _VU_DB_HISTORY[-1] if _VU_DB_HISTORY else _VU_SILENCE_FLOOR
+    db_peak  = _VU_PEAK_DB
+    snr_db   = db_cur - _VU_NOISE_FLOOR_DB
+
+    # ── clip rate (last 10 s) ─────────────────────────────────────────────────
+    recent_clips = sum(1 for t in _VU_CLIP_HISTORY if t > now - 10.0)
+
+    # ── segmented LED bar (60 segments, dBFS scale -60 → 0) ──────────────────
+    SEG = 54
+    DB_MIN, DB_MAX = -54.0, 0.0
+
+    def _db_to_seg(db: float) -> int:
+        return max(0, min(SEG, int((db - DB_MIN) / (DB_MAX - DB_MIN) * SEG)))
+
+    filled   = _db_to_seg(db_cur)
+    peak_seg = _db_to_seg(db_peak)
+
+    led = Text()
+    led.append("  ")
+    for i in range(SEG):
+        if i < filled:
+            # Zone colours: 0–40 green, 40–50 yellow, 50–54 red
+            if i < 40:
+                led.append("█", style="bright_green")
+            elif i < 50:
+                led.append("█", style="yellow")
+            else:
+                led.append("█", style="bright_red")
+        elif i == peak_seg and peak_seg >= filled:
+            led.append("▌", style="bold bright_white")
+        else:
+            led.append("░", style="dim white")
+
+    # dBFS readout + peak
+    db_style = "bright_red" if db_cur >= _VU_CLIP_THRESHOLD else (
+        "yellow" if db_cur > -12 else "bright_green"
+    )
+    over_str = "  [bold bright_red]▲CLIP[/bold bright_red]" if recent_clips else "" # noqa
+    led.append(f"  ", style="")
+    led.append(f"{db_cur:>+6.1f}dBFS", style=db_style)
+    led.append(f"  pk {db_peak:>+5.1f}", style="dim white")
+    if recent_clips:
+        led.append(f"  ▲CLIP×{recent_clips}", style="bold bright_red")
+
+    # ── dBFS scale ruler ──────────────────────────────────────────────────────
+    ruler = Text()
+    ruler.append("  ")
+    # Labels at -54, -42, -30, -18, -12, -6, 0
+    labels = {0: "-54", 12: "-42", 24: "-30", 36: "-18", 45: "-12", 51: " -6", 53: "0"}
+    pos = 0
+    for i in range(SEG):
+        if i in labels:
+            lbl = labels[i]
+            ruler.append(lbl, style="dim white")
+            pos += len(lbl)
+        elif pos <= i:
+            ruler.append("·", style="dim white")
+            pos += 1
+
+    # ── oscilloscope (80 samples → waveform using block chars) ───────────────
+    wave_chars = " ▁▂▃▄▅▆▇█"
+    wave = Text()
+    wave.append("  ")
+    samples = list(_VU_RAW_WAVE)
+    if not samples:
+        wave.append("─" * 60, style="dim white")
+    else:
+        # Subsample to 58 chars
+        step = max(1, len(samples) // 58)
+        for i in range(0, min(len(samples), 58 * step), step):
+            v = samples[i]
+            idx = min(int(v * (len(wave_chars) - 1)), len(wave_chars) - 1)
+            ch = wave_chars[idx]
+            if v > 0.75:
+                style = "bright_red"
+            elif v > 0.40:
+                style = "yellow"
+            elif v > 0.05:
+                style = "bright_green"
+            else:
+                style = "dim white"
+            wave.append(ch, style=style)
+
+    # ── speech state badge ────────────────────────────────────────────────────
+    state_map = {
+        "silence": ("◌  SILENCE", "dim white"),
+        "onset":   ("◎  ONSET  ", "yellow"),
+        "speech":  ("●  SPEECH ", "bold bright_green"),
+        "trail":   ("◉  TRAIL  ", "dim green"),
+    }
+    state_str, state_style = state_map.get(_VU_SPEECH_STATE, ("?", "dim white"))
+
+    # Gate indicator
+    gate_str   = "OPEN " if _VU_GATE_OPEN else "GATE "
+    gate_style = "bright_green" if _VU_GATE_OPEN else "dim white"
+
+    # SNR colour
+    snr_style = (
+        "bright_green" if snr_db > 20 else
+        "yellow"       if snr_db > 10 else
+        "bright_red"
+    )
+
+    # Format speech durations
+    def _fmt_dur(s: float) -> str:
+        return f"{s:.1f}s" if s < 60 else f"{s/60:.1f}m"
+
+    stats = Text()
+    stats.append("  ")
+    stats.append(state_str,              style=state_style)
+    stats.append("   gate:", style="dim white")
+    stats.append(gate_str,               style=gate_style)
+    stats.append("   snr:",  style="dim white")
+    stats.append(f"{snr_db:>+.0f}dB",   style=snr_style)
+    stats.append("   noise floor:",      style="dim white")
+    stats.append(f"{_VU_NOISE_FLOOR_DB:>+.0f}dBFS", style="dim white")
+    stats.append("   clips:",            style="dim white")
+    clip_style = "bright_red" if _VU_CLIP_COUNT > 0 else "dim white"
+    stats.append(f"{_VU_CLIP_COUNT}",    style=clip_style)
+    if _VU_LAST_SPEECH_S > 0:
+        stats.append(f"   last utt: {_fmt_dur(_VU_LAST_SPEECH_S)}", style="dim white")
+    if _VU_TOTAL_SPEECH_S > 0:
+        stats.append(f"   total speech: {_fmt_dur(_VU_TOTAL_SPEECH_S)}", style="dim white")
+    if _VU_SPEECH_STATE == "speech":
+        stats.append(f"   [{_fmt_dur(_VU_SPEECH_DURATION_S)}]", style="bold bright_green")
+
+    # ── dBFS history sparkline ────────────────────────────────────────────────
+    spark_row = Text()
+    spark_row.append("  hist  ", style="dim white")
+    spark_row.append_text(_sparkline(
+        [max(0.0, db + 60) / 60 for db in list(_VU_DB_HISTORY)],  # normalise to [0,1]
+        width=54,
+    ))
+
+    body = Group(led, ruler, wave, stats, spark_row)
+
+    # Border flashes red on clip
+    border = "bright_red" if recent_clips else (
+        "bright_green" if _VU_SPEECH_STATE == "speech" else "bright_black"
+    )
+
+    title_t = Text()
+    title_t.append("MIC INPUT", style="chrome.title")
+    if _VU_SPEECH_STATE == "speech":
+        title_t.append("  ● LIVE", style="bold bright_green")
+
+    return Panel(
+        body,
+        title=title_t,
+        border_style=border,
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(0, 0),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LOG FILTER STATE
+# ═════════════════════════════════════════════════════════════════════════════
+
+_FILTER_LEVELS = {"debug": 0, "info": 1, "warn": 2, "warning": 2, "error": 3, "critical": 4}
+
+
+class _LogFilter:
+    """
+    Mutable filter applied to every log line before it enters _LOG_BUFFER.
+    Toggle at runtime by patching _FILTER attributes from a control thread.
+    """
+
+    def __init__(self) -> None:
+        self.min_level: str = os.getenv("DASH_MIN_LEVEL", "info")
+        self.service: Optional[str] = os.getenv("DASH_SERVICE_FILTER") or None
+        self.search: Optional[str] = os.getenv("DASH_SEARCH") or None
+
+    def matches(self, level: str, service: str, event: str, kv_str: str) -> bool:
+        min_ord = _FILTER_LEVELS.get(self.min_level, 1)
+        lvl_ord = _FILTER_LEVELS.get(level, 1)
+        if lvl_ord < min_ord:
+            return False
+        if self.service and service != self.service:
+            return False
+        if self.search:
+            needle = self.search.lower()
+            if needle not in event.lower() and needle not in kv_str.lower():
+                return False
+        return True
+
+    def badge(self) -> Text:
+        t = Text()
+        t.append(" filter:", style="chrome.label")
+        t.append(f" ≥{self.min_level}", style="bright_white")
+        if self.service:
+            t.append(f"  svc={self.service}", style="svc.session")
+        if self.search:
+            t.append(f"  q={self.search!r}", style="bright_cyan")
+        return t
+
+
+_FILTER = _LogFilter()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SERVICE STARTUP SNAPSHOT (header quick-view)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SVC_SNAPSHOT: Dict[str, Dict] = {
+    "STT":           {"sub": "—",           "ok": None},
+    "LLM":           {"sub": "—",           "ok": None},
+    "TTS":           {"sub": "—",           "ok": None},
+    "Session Store": {"sub": "redis + lru", "ok": None},
 }
 
 
+def _update_svc_snapshot(event: str, kv: dict) -> None:
+    if "stt" in event and "model" in kv:
+        _SVC_SNAPSHOT["STT"]["sub"] = str(kv["model"])
+        _SVC_SNAPSHOT["STT"]["ok"] = True
+    if "llm" in event and "primary" in kv:
+        _SVC_SNAPSHOT["LLM"]["sub"] = str(kv["primary"])
+        _SVC_SNAPSHOT["LLM"]["ok"] = True
+    if "tts" in event and "model" in kv:
+        m = kv.get("model", "")
+        v = kv.get("voice", "")
+        _SVC_SNAPSHOT["TTS"]["sub"] = f"{m}/{v}" if v else str(m)
+        _SVC_SNAPSHOT["TTS"]["ok"] = True
+    if "redis" in event or "degraded" in event:
+        _SVC_SNAPSHOT["Session Store"]["ok"] = False
+        _SVC_SNAPSHOT["Session Store"]["sub"] = "redis + lru (degraded)"
+    if "session_registered" in event:
+        if _SVC_SNAPSHOT["Session Store"]["ok"] is None:
+            _SVC_SNAPSHOT["Session Store"]["ok"] = True
+    if event.endswith("_failed") or event.endswith("_error"):
+        # feed _ALERTS
+        svc = kv.get("service", "pipeline")
+        _ALERTS.push("error", svc, event)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  KV FORMATTER
+# ═════════════════════════════════════════════════════════════════════════════
+
 def _kv_string(event_dict: dict) -> str:
-    parts: list[str] = []
+    """Format remaining key=value pairs as a Rich-markup string."""
+    parts: List[str] = []
     for raw_key, val in event_dict.items():
         if raw_key in _KV_SUPPRESS:
             continue
-        if (
-            val is None
-            or val == ""
-            or val is False
-            or val == 0
-            or val == {}
-            or val == []
-        ):
+        if val is None or val == "" or val is False or val == {} or val == []:
+            continue
+        if val == 0 and raw_key not in ("retry_count", "prompt_tokens", "completion_tokens"):
             continue
         key = _KV_ALIAS.get(raw_key, raw_key)
         if isinstance(val, float):
@@ -1829,6 +2935,10 @@ def _kv_string(event_dict: dict) -> str:
         parts.append(f"[kv.key]{key}=[/kv.key][kv.val]{val}[/kv.val]")
     return "  ".join(parts)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  JSON FILE SINK
+# ═════════════════════════════════════════════════════════════════════════════
 
 _file_write_lock = threading.Lock()
 
@@ -1845,54 +2955,331 @@ def _write_json_line(doc: dict) -> None:
         pass
 
 
-class _DualSinkRenderer:
-    """
-    Forks every structlog record into Rich console and a JSON file.
-    MongoDB writes happen via the ObsEvent path, not here.
-    """
+# ═════════════════════════════════════════════════════════════════════════════
+#  ROLLING LOG BUFFER
+# ═════════════════════════════════════════════════════════════════════════════
 
-    def __call__(self, _logger: object, _method: str, event_dict: dict) -> str:
-        json_dict = copy.deepcopy(event_dict)
-
-        ts = event_dict.pop("timestamp", "")
-        level = event_dict.pop("level", "info").lower()
-        event = event_dict.pop("event", "")
-        service = event_dict.get("service", "")
-
-        time_str = ts[11:19] if len(ts) >= 19 else ts
-        icon, style = _SVC_STYLE.get(service, ("·", "svc.pipeline"))
-        lvl_style = _LEVEL_STYLE.get(level, "lvl.info")
-        level_label = ("WARN" if level == "warning" else level.upper())[:5]
-        kv = _kv_string(event_dict)
-
-        line = (
-            f"[ts]\\[{time_str}][/ts] "
-            f"[{lvl_style}][{level_label:<4}][/{lvl_style}]  "
-            f"[{style}]{icon}[/{style}]  "
-            f"[evt]{event:<42}[/evt]  "
-            f"{kv}"
-        )
-        _CONSOLE.print(line)
-        _write_json_line(json_dict)
-
-        raise structlog.DropEvent()
+_LOG_BUFFER_MAX = 500
+_LOG_BUFFER: Deque[Text] = deque(maxlen=_LOG_BUFFER_MAX)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STRUCTLOG CONFIGURATION  (replaces log_config.configure_logging)
+#  ██████████████████  DASHBOARD PANEL BUILDERS  ████████████████████████████
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Visible log lines ────────────────────────────────────────────────────────
+_VISIBLE_LOG_LINES = 24
+
+
+def _build_header_strip() -> Panel:
+    """
+    Top strip: four service health cells (STT / LLM / TTS / Session).
+    Each cell shows name, sub-label, and ok/warn/err mark.
+    """
+    grid = Table.grid(expand=True, padding=(0, 2))
+    for _ in _SVC_SNAPSHOT:
+        grid.add_column(ratio=1)
+
+    cells: List[Text] = []
+    for label, state in _SVC_SNAPSHOT.items():
+        ok, sub = state.get("ok"), state.get("sub", "—")
+        if ok is True: # noqa
+            mark, mark_style = "✓  READY", "bold bright_green"
+        elif ok is False:
+            mark, mark_style = "✗  DEGRADED", "bold bright_red"
+        else:
+            mark, mark_style = "○  STARTING", "dim white"
+
+        t = Text(justify="left")
+        t.append(f"  {label}\n", style="bold bright_white")
+        t.append(f"  {sub}\n", style="dim white")
+        t.append(f"  ", style="")
+        t.append(mark, style=mark_style)
+        cells.append(t)
+
+    grid.add_row(*cells)
+    return Panel(
+        grid,
+        title="[chrome.title] ◉  Voice Assistant Pipeline [/chrome.title]",
+        subtitle="[chrome.subtitle]  PTT  Hold [bold]H[/bold] to talk   Exit [bold]ESC[/bold]   Filter [bold]F[/bold][/chrome.subtitle]",
+        border_style="bright_black",
+        box=_rbox.HEAVY_HEAD,
+        padding=(0, 2),
+    )
+
+
+def _build_vitals_strip() -> Table:
+    """
+    Full-width single row: uptime · cpu · mem · fd · threads · eps · total events
+    """
+    grid = Table.grid(expand=True, padding=(0, 3))
+    for _ in range(8):
+        grid.add_column(ratio=1)
+
+    def _vt(label: str, value: str, hot: bool = False, warn: bool = False) -> Text:
+        t = Text()
+        t.append(f"{label}: ", style="vital.label")
+        style = "vital.hot" if hot else ("vital.warm" if warn else "vital.val")
+        t.append(value, style=style)
+        return t
+
+    # uptime
+    up = _VITALS.uptime_s
+    h, rem = divmod(int(up), 3600)
+    m, s = divmod(rem, 60)
+    uptime_str = f"{h:02d}:{m:02d}:{s:02d}"
+
+    cpu = _VITALS.cpu_pct
+    mem = _VITALS.mem_mb
+    fds = _VITALS.fd_count
+    threads = _VITALS.thread_count
+    eps = _RATE.eps
+    total = _RATE.total
+
+    cells = [
+        _vt("UP", uptime_str),
+        _vt("CPU", f"{cpu:.1f}%" if cpu is not None else "n/a",
+            hot=cpu is not None and cpu > 80,
+            warn=cpu is not None and cpu > 50),
+        _vt("MEM", f"{mem:.0f}MB" if mem is not None else "n/a",
+            hot=mem is not None and mem > 1500,
+            warn=mem is not None and mem > 800),
+        _vt("FD", str(fds) if fds is not None else "n/a",
+            hot=fds is not None and fds > 500),
+        _vt("THR", str(threads) if threads is not None else "n/a"),
+        _vt("EPS", f"{eps:.1f}"),
+        _vt("EVENTS", _fmt_count(total)),
+        _vt("TOK", _fmt_count(_TOKEN_BUDGET.total)),
+    ]
+
+    grid.add_row(*cells)
+    return grid
+
+
+def _build_service_matrix() -> Panel:
+    """
+    Two-column grid of all known services.
+    Each cell: [icon] [label] [status] [sparkline] [p50/p95] [last event]
+    """
+    tbl = Table(
+        box=_rbox.SIMPLE,
+        expand=True,
+        padding=(0, 1),
+        show_header=False,
+        row_styles=["", "on grey7"],
+    )
+    tbl.add_column("icon",   width=2,  no_wrap=True)
+    tbl.add_column("name",   width=12, no_wrap=True, style="bright_white")
+    tbl.add_column("status", width=10, no_wrap=True)
+    tbl.add_column("spark",  width=_SPARK_WIDTH_DEFAULT + 2, no_wrap=True)
+    tbl.add_column("p50",    width=8,  no_wrap=True)
+    tbl.add_column("p95",    width=8,  no_wrap=True)
+    tbl.add_column("err/m",  width=6,  no_wrap=True)
+    tbl.add_column("last",   no_wrap=True)
+
+    for svc_key, (icon, style, label) in _SVC_META.items():
+        m = _DASH_SVC[svc_key]
+        s_icon, s_style = m.status_icon()
+
+        icon_t = Text()
+        icon_t.append(icon, style=style)
+
+        status_t = Text()
+        status_t.append(s_icon + " ", style=s_style)
+        status_t.append(m.status[:8], style=s_style)
+
+        spark_t = m.sparkline_text()
+
+        p50 = m.p50
+        p95 = m.p95
+        p50_t = Text(_fmt_ms(p50) if p50 else "—", style=_latency_colour(p50 or 0))
+        p95_t = Text(_fmt_ms(p95) if p95 else "—", style=_latency_colour(p95 or 0))
+
+        epm = m.error_rate_pm
+        epm_style = "bright_red" if epm > 5 else ("yellow" if epm > 1 else "dim white")
+        epm_t = Text(f"{epm:.1f}" if epm else "—", style=epm_style)
+
+        last_t = Text(m.last_event[-42:], style="dim white" if m.last_event_level == "info" else "yellow")
+
+        tbl.add_row(icon_t, label[:12], status_t, spark_t, p50_t, p95_t, epm_t, last_t)
+
+    return Panel(
+        tbl,
+        title="[chrome.title] SERVICE MATRIX [/chrome.title]",
+        border_style="bright_black",
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(0, 1),
+    )
+
+
+def _build_metrics_panel() -> Panel:
+    """
+    Right-side metrics pane:
+      - LLM token budget bar + sparkline
+      - Per-service request & error totals
+      - In-flight spinner row
+    """
+    content = Text()
+
+    # ── Token Budget ─────────────────────────────────────────────────────────
+    content.append("  TOKEN BUDGET\n", style="chrome.title")
+    content.append("  ")
+    content.append_text(_TOKEN_BUDGET.render_bar(width=22))
+    content.append("\n  ")
+    content.append_text(_TOKEN_BUDGET.sparkline(width=22))
+    content.append(f"\n  p={_fmt_count(_TOKEN_BUDGET.prompt_total)}  "
+                   f"c={_fmt_count(_TOKEN_BUDGET.completion_total)}\n",
+                   style="dim white")
+    content.append("\n")
+
+    # ── Request / Error totals ────────────────────────────────────────────────
+    content.append("  SVC TOTALS\n", style="chrome.title")
+    for svc_key in ("stt", "llm", "tts", "session", "eval"):
+        m = _DASH_SVC[svc_key]
+        icon, style, label = _SVC_META.get(svc_key, ("·", "svc.pipeline", svc_key))
+        content.append(f"  {icon} ", style=style)
+        content.append(f"{label:<14}", style="bright_white")
+        content.append(f"  req={_fmt_count(m.request_count)}", style="dim white")
+        err_style = "bright_red" if m.error_count > 0 else "dim white"
+        content.append(f"  err={_fmt_count(m.error_count)}", style=err_style)
+        if m.cache_hit_rate is not None:
+            content.append(f"  hit={m.cache_hit_rate:.0%}", style="bright_cyan")
+        content.append("\n")
+
+    content.append("\n")
+
+    # ── EPS sparkline ─────────────────────────────────────────────────────────
+    content.append("  EVENTS/SEC\n", style="chrome.title")
+    content.append("  ")
+    content.append_text(_RATE.sparkline())
+    content.append(f"  {_RATE.eps:.1f} eps\n", style="bright_white")
+    content.append("\n")
+
+    # ── In-flight operations ───────────────────────────────────────────────────
+    content.append("  IN-FLIGHT\n", style="chrome.title")
+    content.append_text(_SPINNERS.render())
+    content.append("\n")
+
+    return Panel(
+        content,
+        title="[chrome.title] METRICS [/chrome.title]",
+        border_style="bright_black",
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(0, 1),
+    )
+
+
+def _build_cb_panel() -> Panel:
+    """
+    Circuit breaker state + transition log.
+    """
+    inner = Group(
+        _CB_BOARD.render_state_table(),
+        Rule(style="bright_black"),
+        _CB_BOARD.render_transition_log(),
+    )
+    return Panel(
+        inner,
+        title="[chrome.title] CIRCUIT BREAKERS [/chrome.title]",
+        border_style="bright_black",
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(1, 1),
+    )
+
+
+def _build_alert_panel() -> Panel:
+    """
+    Sticky alert strip — last N alerts, border flashes red on burst.
+    """
+    bursting = _ALERTS.is_bursting()
+    border_style = "bright_red" if bursting else "bright_black"
+
+    body = Text()
+    alerts = _ALERTS.recent(6)
+    if not alerts:
+        body.append("  no alerts\n", style="dim white")
+    else:
+        for ts, level, svc, msg in alerts:
+            body.append_text(_ALERTS.render_row(ts, level, svc, msg))
+            body.append("\n")
+
+    title = "[alert.error] ⚡ ALERTS [/alert.error]" if bursting else "[chrome.title] ALERTS [/chrome.title]"
+
+    return Panel(
+        body,
+        title=title,
+        border_style=border_style,
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(0, 0),
+    )
+
+
+def _build_log_panel() -> Panel:
+    """
+    Scrolling log: most recent _VISIBLE_LOG_LINES from _LOG_BUFFER,
+    with a filter badge in the title.
+    """
+    visible = list(_LOG_BUFFER)[-_VISIBLE_LOG_LINES:]
+    body = Text()
+    for line in visible:
+        body.append_text(line)
+        body.append("\n")
+
+    filter_badge = _FILTER.badge()
+    title_t = Text()
+    title_t.append(" ◈ LOG", style="chrome.title")
+    title_t.append_text(filter_badge)
+
+    return Panel(
+        body,
+        title=title_t,
+        border_style="bright_black",
+        box=_rbox.SIMPLE,
+        padding=(0, 1),
+        expand=True,
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LIVE DASHBOARD SINGLETON
+# ═════════════════════════════════════════════════════════════════════════════
+
+_LIVE_REFRESH_HZ = 12    # dashboard redraws per second
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DUAL-SINK RENDERER v2
+#  Feeds every subsystem, then renders a Rich Text log line.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Events whose presence signals the start / end of a long op (for spinners)
+_SPINNER_START_EVENTS = {
+    "llm_stream_started", "tts_synthesis_started",
+    "stt_transcription_started", "pipeline_stage_started",
+}
+_SPINNER_END_EVENTS = {
+    "llm_stream_completed", "llm_stream_failed",
+    "tts_synthesis_completed", "tts_synthesis_failed",
+    "stt_transcription_completed", "stt_transcription_failed",
+    "pipeline_stage_completed", "pipeline_stage_failed",
+}
+
+# Events that carry latency we should record
+_LATENCY_EVENTS = {
+    "stt_transcription_completed", "llm_stream_completed",
+    "tts_synthesis_completed", "eval_scored", "pipeline_stage_completed",
+    "session_registered", "memory_compressed",
+}
+
+# Events that signal CB state changes
+_CB_EVENTS = {"circuit_opened", "circuit_closed", "circuit_half_opened"}
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  STRUCTLOG CONFIGURATION
 # ═════════════════════════════════════════════════════════════════════════════
 
 import contextvars as _cv
 
 # ── ContextVar ownership ──────────────────────────────────────────────────────
-# _request_id_var is imported from shared.py so both layers read and write the
-# same ContextVar instance.  This eliminates the correlation gap where calling
-# shared.new_request_id() wouldn't propagate into observability log/Mongo records.
-#
-# _session_id_var is owned exclusively here because session context is an
-# observability concern — shared.py has no session concept.
-#
-# Fallback: if shared is unavailable (standalone testing), we create a local var.
 try:
     from app.common.shared import _request_id_var  # noqa
 except Exception:  # noqa
@@ -1924,15 +3311,12 @@ def _inject_context(_logger: object, _method: str, event_dict: dict) -> dict:
         event_dict.setdefault("session_id", sid)
     if rid:
         event_dict.setdefault("request_id", rid)
-    # Inject OTel trace/span IDs for log-to-trace correlation in Grafana/Loki.
-    # These fields allow Grafana's "Derived fields" to hyperlink a log line
-    # directly to its parent trace in Tempo.
     trace_id = _OTEL.trace_id()
-    span_id = _OTEL.span_id()
+    span_id  = _OTEL.span_id()
     if trace_id:
         event_dict["trace_id"] = trace_id
     if span_id:
-        event_dict["span_id"] = span_id
+        event_dict["span_id"]  = span_id
     return event_dict
 
 
@@ -1940,8 +3324,9 @@ def configure_logging() -> None:
     """
     Drop-in replacement for log_config.configure_logging().
 
-    Call once at process startup. Configures structlog with context injection,
-    dual-sink rendering (standard mode) or JSON-only (verbose mode).
+    Configures structlog with context injection and dual-sink rendering.
+    In standard mode, starts the Rich Live dashboard before the first log
+    line is printed so every record lands inside the panel from the start.
     """
     base_processors = [
         structlog.contextvars.merge_contextvars,
@@ -1952,11 +3337,12 @@ def configure_logging() -> None:
         structlog.processors.ExceptionRenderer(),
     ]
 
-    final = (
-        _DualSinkRenderer()
-        if LOG_MODE == "standard"
-        else structlog.processors.JSONRenderer()
-    )
+    if LOG_MODE == "standard":
+        final = _DualSinkRenderer()
+        # Boot the dashboard before the very first log line so it's always in-panel.
+        _DASHBOARD.start()
+    else:
+        final = structlog.processors.JSONRenderer()
 
     structlog.configure(
         processors=[*base_processors, final],
@@ -1967,7 +3353,950 @@ def configure_logging() -> None:
 
 
 def get_logger(name: str):
+    """Return a bound structlog logger for `name`. API-identical to original."""
     return structlog.get_logger(name)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PIPELINE WATERFALL TRACKER
+#  Records the stage-by-stage timing of the most recent pipeline turn so the
+#  dashboard can render a horizontal Gantt-style bar.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_WATERFALL_STAGES = ["stt", "eval", "memory", "sanitize", "llm", "tts"]
+_WATERFALL_HISTORY = 5       # keep last N turns
+
+
+@dataclass
+class _WaterfallTurn:
+    turn_id: str
+    session_id: str
+    started_at: float
+    stages: Dict[str, Tuple[float, float]]   # stage -> (start_offset_ms, duration_ms)
+    complete: bool = False
+    total_ms: float = 0.0
+
+
+class _WaterfallTracker:
+    """
+    Ingests stage_started / stage_completed events and builds a per-turn
+    waterfall that can be rendered as a mini bar chart.
+    """
+
+    def __init__(self) -> None:
+        self._turns: Deque[_WaterfallTurn] = deque(maxlen=_WATERFALL_HISTORY)
+        self._active: Dict[str, _WaterfallTurn] = {}          # session_id -> turn
+        self._stage_starts: Dict[str, Dict[str, float]] = {}  # session_id -> {stage: mono_ts}
+
+    def stage_started(self, session_id: str, stage: str, request_id: str) -> None:
+        if session_id not in self._active:
+            turn = _WaterfallTurn(
+                turn_id=request_id,
+                session_id=session_id,
+                started_at=time.monotonic(),
+                stages={},
+            )
+            self._active[session_id] = turn
+            self._stage_starts[session_id] = {}
+        self._stage_starts.setdefault(session_id, {})[stage] = time.monotonic()
+
+    def stage_completed(self, session_id: str, stage: str, latency_ms: float) -> None:
+        turn = self._active.get(session_id)
+        if turn is None:
+            return
+        t0 = self._stage_starts.get(session_id, {}).get(stage)
+        if t0 is None:
+            return
+        start_offset = (t0 - turn.started_at) * 1000
+        turn.stages[stage] = (start_offset, latency_ms)
+
+        if stage == "tts":
+            turn.complete = True
+            turn.total_ms = (time.monotonic() - turn.started_at) * 1000
+            self._turns.append(turn)
+            self._active.pop(session_id, None)
+            self._stage_starts.pop(session_id, None)
+
+    def latest_turn(self) -> Optional[_WaterfallTurn]:
+        return self._turns[-1] if self._turns else None
+
+    def render_waterfall(self, turn: _WaterfallTurn, bar_width: int = 40) -> Text: # noqa
+        """Render a mini Gantt bar for a single turn."""
+        if turn.total_ms == 0:
+            return Text("  no data", style="dim white")
+
+        t = Text()
+        t.append(f"  turn {turn.turn_id[-8:]}\n", style="dim white")
+
+        stage_colours = {
+            "stt":      "cyan",
+            "eval":     "bright_yellow",
+            "memory":   "bright_cyan",
+            "sanitize": "dim green",
+            "llm":      "magenta",
+            "tts":      "dodger_blue2",
+        }
+
+        for stage in _WATERFALL_STAGES:
+            if stage not in turn.stages:
+                t.append(f"  {stage:<10}", style="dim white")
+                t.append("─" * bar_width, style="dim white")
+                t.append("\n")
+                continue
+
+            offset_ms, duration_ms = turn.stages[stage]
+            colour = stage_colours.get(stage, "white")
+
+            # Compute bar position: offset and width scaled to bar_width chars
+            x0 = int((offset_ms / turn.total_ms) * bar_width)
+            bw = max(1, int((duration_ms / turn.total_ms) * bar_width))
+            x0 = min(x0, bar_width - 1)
+            bw = min(bw, bar_width - x0)
+
+            t.append(f"  {stage:<10}", style="dim white")
+            t.append(" " * x0, style="")
+            t.append("█" * bw, style=colour)
+            t.append(" " * (bar_width - x0 - bw), style="")
+            t.append(f"  {_fmt_ms(duration_ms)}", style=colour)
+            t.append("\n")
+
+        t.append(f"  {'total':<10}", style="dim white")
+        t.append(f"  {_fmt_ms(turn.total_ms)}", style="bright_white")
+        return t
+
+    def render_panel(self) -> Panel:
+        turn = self.latest_turn()
+        if turn is None:
+            body = Text("  awaiting first pipeline turn …", style="dim white")
+        else:
+            body = self.render_waterfall(turn)
+
+        # History summary table
+        hist = Table(box=None, padding=(0, 2), show_header=False)
+        hist.add_column("turn", style="dim white", width=12)
+        hist.add_column("total", width=8)
+        hist.add_column("stt", width=8)
+        hist.add_column("llm", width=8)
+        hist.add_column("tts", width=8)
+
+        for t in reversed(self._turns):
+            stt_ms = t.stages.get("stt", (0, 0))[1]
+            llm_ms = t.stages.get("llm", (0, 0))[1]
+            tts_ms = t.stages.get("tts", (0, 0))[1]
+            hist.add_row(
+                t.turn_id[-12:],
+                Text(_fmt_ms(t.total_ms), style=_latency_colour(t.total_ms)),
+                Text(_fmt_ms(stt_ms),     style=_latency_colour(stt_ms)),
+                Text(_fmt_ms(llm_ms),     style=_latency_colour(llm_ms)),
+                Text(_fmt_ms(tts_ms),     style=_latency_colour(tts_ms)),
+            )
+
+        return Panel(
+            Group(body, Rule(style="bright_black"), hist),
+            title="[chrome.title] PIPELINE WATERFALL [/chrome.title]",
+            border_style="bright_black",
+            box=_rbox.MINIMAL_HEAVY_HEAD,
+            padding=(1, 1),
+        )
+
+
+_WATERFALL = _WaterfallTracker()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SESSION ACTIVITY TRACKER
+#  Keeps a rolling register of active sessions with per-session turn count,
+#  last-seen timestamp, and perceived quality (eval score).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SESSION_MAX = 20      # max tracked sessions
+_SESSION_TTL = 1800.0  # prune sessions not seen in 30 min
+
+
+@dataclass
+class _SessionRecord:
+    session_id: str
+    first_seen: float
+    last_seen: float
+    turn_count: int = 0
+    error_count: int = 0
+    last_eval_score: Optional[float] = None
+    avg_latency_ms: float = 0.0
+    _latency_sum: float = field(default=0.0, repr=False)
+    _latency_n: int = field(default=0, repr=False)
+
+    def record_turn(self, latency_ms: float = 0.0) -> None:
+        self.turn_count += 1
+        self.last_seen = time.monotonic()
+        if latency_ms > 0:
+            self._latency_sum += latency_ms
+            self._latency_n += 1
+            self.avg_latency_ms = self._latency_sum / self._latency_n
+
+
+class _SessionTracker:
+    """
+    Registers sessions and tracks their activity.
+    Pruned lazily on each render cycle.
+    """
+
+    def __init__(self) -> None:
+        self._sessions: Dict[str, _SessionRecord] = {}
+
+    def touch(
+        self,
+        session_id: str,
+        *,
+        latency_ms: float = 0.0,
+        error: bool = False,
+        eval_score: Optional[float] = None,
+    ) -> None:
+        if not session_id:
+            return
+        now = time.monotonic()
+        if session_id not in self._sessions:
+            self._sessions[session_id] = _SessionRecord(
+                session_id=session_id,
+                first_seen=now,
+                last_seen=now,
+            )
+        rec = self._sessions[session_id]
+        rec.record_turn(latency_ms)
+        if error:
+            rec.error_count += 1
+        if eval_score is not None:
+            rec.last_eval_score = eval_score
+
+    def _prune(self) -> None:
+        cutoff = time.monotonic() - _SESSION_TTL
+        stale = [sid for sid, r in self._sessions.items() if r.last_seen < cutoff]
+        for sid in stale:
+            del self._sessions[sid]
+        # Cap at max
+        if len(self._sessions) > _SESSION_MAX:
+            oldest = sorted(self._sessions, key=lambda s: self._sessions[s].last_seen)
+            for sid in oldest[: len(self._sessions) - _SESSION_MAX]:
+                del self._sessions[sid]
+
+    @property
+    def active_count(self) -> int:
+        cutoff = time.monotonic() - 300.0  # active = seen in last 5 min
+        return sum(1 for r in self._sessions.values() if r.last_seen > cutoff)
+
+    def render_panel(self) -> Panel:
+        self._prune()
+        now = time.monotonic()
+        active_cutoff = now - 300.0
+
+        tbl = Table(
+            box=_rbox.SIMPLE,
+            padding=(0, 1),
+            expand=True,
+            show_header=True,
+            header_style="dim white",
+        )
+        tbl.add_column("session",  style="dim white",    width=20, no_wrap=True)
+        tbl.add_column("turns",    style="bright_white", width=6,  justify="right")
+        tbl.add_column("errors",   width=6,              justify="right")
+        tbl.add_column("p50 lat",  width=9,              justify="right")
+        tbl.add_column("eval",     width=6,              justify="right")
+        tbl.add_column("last seen", width=10)
+
+        rows = sorted(
+            self._sessions.values(),
+            key=lambda r: r.last_seen,
+            reverse=True,
+        )[:12]
+
+        for rec in rows:
+            age = now - rec.last_seen
+            if age < 60:
+                age_str = f"{age:.0f}s"
+            elif age < 3600:
+                age_str = f"{age / 60:.0f}m"
+            else:
+                age_str = f"{age / 3600:.1f}h"
+
+            is_active = rec.last_seen > active_cutoff
+            sid_style = "bright_white" if is_active else "dim white"
+            sid_prefix = "● " if is_active else "○ "
+
+            err_style = "bright_red" if rec.error_count > 0 else "dim white"
+            lat_style = _latency_colour(rec.avg_latency_ms)
+            eval_str = f"{rec.last_eval_score:.1f}" if rec.last_eval_score else "—"
+            eval_style = (
+                "bright_green" if rec.last_eval_score and rec.last_eval_score >= 4.0 else
+                "yellow"       if rec.last_eval_score and rec.last_eval_score >= 2.5 else
+                "bright_red"   if rec.last_eval_score else
+                "dim white"
+            )
+
+            sid_t = Text()
+            sid_t.append(sid_prefix, style=sid_style)
+            sid_t.append(rec.session_id[:18], style=sid_style)
+
+            tbl.add_row(
+                sid_t,
+                str(rec.turn_count),
+                Text(str(rec.error_count), style=err_style),
+                Text(_fmt_ms(rec.avg_latency_ms), style=lat_style),
+                Text(eval_str, style=eval_style),
+                Text(age_str, style="dim white"),
+            )
+
+        if not rows:
+            tbl.add_row("—", "—", "—", "—", "—", "—")
+
+        footer = Text()
+        footer.append(
+            f"\n  {self.active_count} active   {len(self._sessions)} total",
+            style="dim white",
+        )
+
+        return Panel(
+            Group(tbl, footer),
+            title="[chrome.title] SESSIONS [/chrome.title]",
+            border_style="bright_black",
+            box=_rbox.MINIMAL_HEAVY_HEAD,
+            padding=(0, 0),
+        )
+
+
+_SESSIONS = _SessionTracker()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LATENCY HISTOGRAM RENDERER
+#  Renders a terminal-native ASCII histogram for any list of latency samples.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_HIST_BUCKETS = [0, 50, 100, 200, 400, 800, 1600, 3200, 6400, float("inf")]
+_HIST_BAR_WIDTH = 18
+
+
+def _latency_histogram(samples: List[float], bar_width: int = _HIST_BAR_WIDTH) -> Text:
+    """
+    Build a fixed-bucket ASCII latency histogram as Rich Text.
+
+    Bucket edges (ms): 0 · 50 · 100 · 200 · 400 · 800 · 1600 · 3200 · 6400 · ∞
+    """
+    if not samples:
+        return Text("  no data", style="dim white")
+
+    counts = [0] * (len(_HIST_BUCKETS) - 1)
+    for s in samples:
+        for i in range(len(_HIST_BUCKETS) - 1):
+            if s < _HIST_BUCKETS[i + 1]:
+                counts[i] += 1
+                break
+
+    total = sum(counts) or 1
+    peak  = max(counts) or 1
+
+    t = Text()
+    labels = ["<50ms", "50-100", "100-200", "200-400", "400-800", "0.8-1.6s", "1.6-3.2s", "3.2-6.4s", ">6.4s"]
+    for i, (cnt, label) in enumerate(zip(counts, labels)):
+        frac = cnt / total
+        bar_len = max(0, int((cnt / peak) * bar_width))
+        lo = _HIST_BUCKETS[i]
+        if lo >= 800:
+            bar_style = "bright_red"
+        elif lo >= 200:
+            bar_style = "yellow"
+        else:
+            bar_style = "bright_green"
+
+        t.append(f"  {label:>9}  ", style="dim white")
+        t.append("█" * bar_len, style=bar_style)
+        t.append(" " * (bar_width - bar_len), style="")
+        t.append(f"  {cnt:>4}  {frac:>5.1%}\n", style="dim white")
+
+    # Percentile summary
+    s_sorted = sorted(samples)
+    n = len(s_sorted)
+    p50 = s_sorted[int(0.50 * n)]
+    p95 = s_sorted[min(int(0.95 * n), n - 1)]
+    p99 = s_sorted[min(int(0.99 * n), n - 1)]
+
+    t.append(f"\n  p50={_fmt_ms(p50)}  p95={_fmt_ms(p95)}  p99={_fmt_ms(p99)}"
+             f"  n={_fmt_count(n)}\n",
+             style="dim white")
+    return t
+
+
+def _build_histogram_panel(service: str = "llm") -> Panel:
+    m = _DASH_SVC[service]
+    samples = list(m.latency_deque)
+    icon, svc_style, label = _SVC_META.get(service, ("·", "svc.pipeline", service))
+    title_t = Text()
+    title_t.append(f" ◈ {icon}", style=svc_style)
+    title_t.append(f" ◈ {label} LATENCY HISTOGRAM", style="chrome.title")
+    return Panel(
+        _latency_histogram(samples),
+        title=title_t,
+        border_style="bright_black",
+        box=_rbox.MINIMAL_HEAVY_HEAD,
+        padding=(0, 1),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ERROR PATTERN ANALYZER
+#  Counts error events by (service, event_name) and surfaces the top offenders.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ERROR_PATTERN_WINDOW_S = 300.0  # rolling 5-minute window
+
+
+class _ErrorPatternAnalyzer:
+    """Tracks (service, event) pairs for errors and surfaces top offenders."""
+
+    def __init__(self) -> None:
+        self._events: Deque[Tuple[float, str, str]] = deque(maxlen=2000)
+
+    def record(self, service: str, event: str) -> None:
+        self._events.append((time.monotonic(), service, event))
+
+    def top(self, n: int = 8) -> List[Tuple[str, str, int]]:
+        """Return [(service, event, count)] sorted by count desc, last window."""
+        cutoff = time.monotonic() - _ERROR_PATTERN_WINDOW_S
+        import collections
+        counter = collections.Counter(
+            (svc, evt)
+            for ts, svc, evt in self._events
+            if ts > cutoff
+        )
+        return [(svc, evt, cnt) for (svc, evt), cnt in counter.most_common(n)]
+
+    def render_panel(self) -> Panel:
+        top = self.top()
+        if not top:
+            body = Text("  no errors in last 5 min\n", style="bright_green")
+        else:
+            body = Text()
+            peak = top[0][2] if top else 1
+            for svc, evt, cnt in top:
+                bar_w = max(1, int((cnt / peak) * 20))
+                body.append(f"  {svc:<12}", style="dim white")
+                body.append(f"{evt:<38}", style="bright_red")
+                body.append("█" * bar_w, style="bright_red")
+                body.append(f"  {cnt}\n", style="bright_white")
+
+        return Panel(
+            body,
+            title="[chrome.title] ERROR PATTERNS  (5 min) [/chrome.title]",
+            border_style="bright_black",
+            box=_rbox.MINIMAL_HEAVY_HEAD,
+            padding=(0, 1),
+        )
+
+
+_ERR_PATTERNS = _ErrorPatternAnalyzer()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ENHANCED SVC SNAPSHOT UPDATER  (feeds waterfall + sessions)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _update_svc_snapshot_v2(event: str, kv: dict) -> None:
+    """
+    Extended snapshot updater that also feeds the waterfall tracker,
+    session tracker, and error pattern analyzer.
+    """
+    _update_svc_snapshot(event, kv)
+
+    sid = kv.get("session_id", "")
+    rid = kv.get("request_id", "")
+    lat_ms = float(kv.get("latency_ms") or (kv.get("latency_s", 0) * 1000) or 0)
+    score  = kv.get("eval_score") or kv.get("score")
+    score  = float(score) if score is not None else None
+
+    # Sessions
+    _SESSIONS.touch(sid, latency_ms=lat_ms, eval_score=score)
+
+    # Waterfall
+    stage = kv.get("stage") or kv.get("service", "")
+    if "stage_started" in event or "started" in event:
+        _WATERFALL.stage_started(sid, stage, rid)
+    if "stage_completed" in event or "completed" in event:
+        _WATERFALL.stage_completed(sid, stage, lat_ms)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FULL LAYOUT v2  —  seven-pane dashboard with all new subsystems
+# ═════════════════════════════════════════════════════════════════════════════
+
+_VISIBLE_LOG_LINES_FULL = 20
+
+
+def _build_full_dashboard() -> Layout:
+    """
+    Full seven-pane layout:
+
+    ┌───────────────────────────────────────────────────────────────────┐
+    │  HEADER STRIP (4 service health cells)                            │ 6 rows
+    ├───────────────────────────────────────────────────────────────────┤
+    │  VITALS BAR (cpu · mem · fd · thr · eps · tok · uptime)           │ 3 rows
+    ├──────────────────┬──────────────────┬─────────────────────────────┤
+    │  SERVICE MATRIX  │  LLM HISTOGRAM   │  METRICS + CB + ALERTS      │ ratio 3
+    ├──────────────────┼──────────────────┤                             │
+    │  WATERFALL       │  SESSIONS        │                             │
+    ├──────────────────┴──────────────────┴─────────────────────────────┤
+    │  ERROR PATTERNS                                                   │ ratio 2
+    ├───────────────────────────────────────────────────────────────────┤
+    │  LOG  (24 lines, filter badge)                                    │ ratio 4
+    └───────────────────────────────────────────────────────────────────┘
+    """
+    root = Layout()
+
+    root.split_column(
+        Layout(name="header", size=9),
+        Layout(name="vitals", size=3),
+        Layout(name="upper_middle", ratio=5),
+        Layout(name="errors", ratio=2),
+        Layout(name="log", ratio=4),
+    )
+
+    root["upper_middle"].split_column(
+        Layout(name="row_top", ratio=3),
+        Layout(name="row_bottom", ratio=3),
+    )
+
+    root["row_top"].split_row(
+        Layout(name="matrix", ratio=5),
+        Layout(name="right_top", ratio=3),
+    )
+
+    root["row_bottom"].split_row(
+        Layout(name="lower_left", ratio=5),
+        Layout(name="right_bottom", ratio=3),
+    )
+
+    root["lower_left"].split_row(
+        Layout(name="waterfall", ratio=3),
+        Layout(name="sessions", ratio=2),
+    )
+
+    root["right_top"].split_column(
+        Layout(name="vu", ratio=1),
+        Layout(name="metrics", ratio=2),
+    )
+
+    root["right_bottom"].split_column(
+        Layout(name="cb", ratio=2),
+        Layout(name="alerts", ratio=3),
+    )
+
+    # ── populate ──────────────────────────────────────────────────────────────
+    root["header"].update(_build_header_strip())
+    root["vitals"].update(
+        Panel(
+            _build_vitals_strip(),
+            border_style="bright_black",
+            box=_rbox.SIMPLE,
+            padding=(0, 2),
+        )
+    )
+    root["vu"].update(_build_vu_panel())
+    root["matrix"].update(_build_service_matrix())
+    root["waterfall"].update(_WATERFALL.render_panel())
+    root["sessions"].update(_SESSIONS.render_panel())
+    root["metrics"].update(_build_metrics_panel())
+    root["cb"].update(_build_cb_panel())
+    root["alerts"].update(_build_alert_panel())
+    root["errors"].update(_ERR_PATTERNS.render_panel())
+    root["log"].update(_build_log_panel_v2())
+
+    return root
+
+
+def _build_log_panel_v2() -> Panel:
+    """
+    Enhanced scrolling log: 20 visible lines, colour-tinted rows for errors,
+    filter badge in title, and a right-aligned event counter.
+    """
+    visible = list(_LOG_BUFFER)[-_VISIBLE_LOG_LINES_FULL:]
+    body = Text()
+    for line in visible:
+        body.append_text(line)
+        body.append("\n")
+
+    filter_badge = _FILTER.badge()
+    count_badge = Text(f"  {_fmt_count(len(_LOG_BUFFER))}/{_fmt_count(_LOG_BUFFER_MAX)} buffered", style="dim white")
+
+    title_t = Text()
+    title_t.append(" ◈ LOG", style="chrome.title")
+    title_t.append_text(filter_badge)
+
+    return Panel(
+        body,
+        title=title_t,
+        subtitle=count_badge,
+        border_style="bright_black",
+        box=_rbox.SIMPLE,
+        padding=(0, 1),
+        expand=True,
+    )
+
+class _DashboardRenderable:
+    def __rich_console__(self, console, options): # noqa
+        yield _build_full_dashboard()
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  LIVE DASHBOARD SINGLETON v2  (replaces _LiveDashboard above, upgrades it)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Override the class now that all panel builders exist
+class _LiveDashboard:  # type: ignore[no-redef]  # noqa: F811
+    """
+    Singleton wrapper around rich.live.Live — upgraded for full seven-pane layout.
+
+    start()         — boots the Live display.
+    push(line)      — appends to log buffer, schedules redraw.
+    stop()          — clean terminal exit (atexit registered).
+    """
+
+    def __init__(self) -> None:
+        self._live: Optional[Live] = None
+        self._started = False
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._live = Live(
+                _DashboardRenderable(),  # rebuilt fresh on every tick
+                console=_CONSOLE,
+                refresh_per_second=_LIVE_REFRESH_HZ,
+                screen=True,
+                transient=False,
+            )
+            self._live.start(refresh=True)
+            self._started = True
+        atexit.register(self.stop)
+
+    def push(self, line: Text) -> None: # noqa
+        _LOG_BUFFER.append(line)
+
+    def force_refresh(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._live is not None and self._started:
+                try:
+                    self._live.stop()
+                except Exception:  # noqa
+                    pass
+                self._started = False
+
+
+# Replace the module-level singleton with the v2 class
+_DASHBOARD = _LiveDashboard()  # type: ignore[assignment]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DUAL-SINK RENDERER v3  — fully wired to all subsystems
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _DualSinkRenderer:  # type: ignore[no-redef]  # noqa: F811
+    """
+    Structlog processor chain terminal — v3.
+
+    Order of operations for every record
+    ─────────────────────────────────────
+      1. Deep-copy → json_dict (never mutate the original)
+      2. Pop structlog metadata (timestamp, level, event)
+      3. Rate tracker tick
+      4. Per-service metrics update (latency, errors, cache, tokens, retries)
+      5. Token budget
+      6. Spinner registry (start / finish)
+      7. Circuit breaker board
+      8. Session tracker + waterfall tracker (via _update_svc_snapshot_v2)
+      9. Error pattern analyzer
+     10. Alert bus (error / warn pushes)
+     11. _FILTER — drop if doesn't match
+     12. Build Rich Text log line (with level-gated row tinting)
+     13. Push to live dashboard (or plain console fallback)
+     14. Write JSON line (always)
+     15. raise DropEvent
+    """
+
+    _EVT_WIDTH = 48
+
+    def __call__(self, _logger: object, _method: str, event_dict: dict) -> str:  # noqa
+        # ── 1. JSON copy ──────────────────────────────────────────────────────
+        json_dict = copy.deepcopy(event_dict)
+
+        # ── 2. Pop metadata ───────────────────────────────────────────────────
+        ts      = event_dict.pop("timestamp", "")
+        level   = event_dict.pop("level", "info").lower()
+        event   = event_dict.pop("event", "")
+        service = event_dict.get("service", "pipeline")
+
+        time_str = ts[11:19] if len(ts) >= 19 else ts
+
+        icon, svc_style = _SVC_STYLE.get(service, ("·", "svc.pipeline"))
+        lvl_style       = _LEVEL_STYLE.get(level, "lvl.info")
+        level_label     = ("WARN" if level == "warning" else level.upper())[:5]
+        kv_raw          = _kv_string(event_dict)
+
+        # ── 3. Rate tracker ───────────────────────────────────────────────────
+        _RATE.tick()
+
+        # ── 4. Per-service metrics ─────────────────────────────────────────────
+        m = _DASH_SVC[service]
+        m.last_event       = event
+        m.last_event_ts    = time.monotonic()
+        m.last_event_level = level
+
+        is_error = level in ("error", "critical")
+        is_warn  = level in ("warning", "warn")
+
+        if is_error:
+            m.record_error()
+        elif is_warn:
+            m.status = "degraded" if m.status != "down" else "down"
+        else:
+            m.record_request()
+
+        lat_ms = float(
+            event_dict.get("latency_ms")
+            or (event_dict.get("latency_s", 0) * 1000)
+            or 0
+        )
+        if lat_ms > 0:
+            m.record_latency(lat_ms)
+
+        if event_dict.get("cache_hit") is True: # noqa
+            m.cache_hits += 1
+        elif event_dict.get("cache_hit") is False:
+            m.cache_misses += 1
+
+        retry = event_dict.get("retry_count", 0) or 0
+        if retry:
+            m.retry_total += int(retry)
+        if event_dict.get("fallback") is True: # noqa
+            m.fallback_total += 1
+
+        if event_dict.get("model"):
+            m.model = str(event_dict["model"])
+        if event_dict.get("voice"):
+            m.voice = str(event_dict["voice"])
+
+        # Mark service down if event signals total failure
+        if event.endswith("_unavailable") or "circuit_open" in event:
+            m.status = "down"
+
+        # ── 5. Token budget ───────────────────────────────────────────────────
+        p_tok = int(event_dict.get("prompt_tokens",     0) or 0)
+        c_tok = int(event_dict.get("completion_tokens", 0) or 0)
+        if p_tok or c_tok:
+            _TOKEN_BUDGET.record(p_tok, c_tok)
+            _DASH_SVC["llm"].tokens_in  += p_tok
+            _DASH_SVC["llm"].tokens_out += c_tok
+
+        # ── 6. Spinner registry ───────────────────────────────────────────────
+        rid = event_dict.get("request_id", event)
+        if event in _SPINNER_START_EVENTS:
+            _SPINNERS.start(rid, f"{icon} {service}: {event}")
+        if event in _SPINNER_END_EVENTS:
+            _SPINNERS.finish(rid)
+
+        # ── 7. Circuit breaker board ──────────────────────────────────────────
+        raw_state = event_dict.get("circuit_state")
+        if raw_state or event in _CB_EVENTS:
+            cb_state = raw_state or (
+                "open"      if "open"  in event else
+                "half_open" if "half"  in event else
+                "closed"
+            )
+            _CB_BOARD.update(service, str(cb_state))
+
+        # ── 8. Session + waterfall ────────────────────────────────────────────
+        _update_svc_snapshot_v2(event, {**event_dict, "service": service})
+
+        # ── 9. Error pattern analyzer ─────────────────────────────────────────
+        if is_error or is_warn:
+            _ERR_PATTERNS.record(service, event)
+
+        # ── 10. Alert bus ─────────────────────────────────────────────────────
+        if is_error:
+            _ALERTS.push("error", service, event)
+        elif is_warn:
+            _ALERTS.push("warn", service, event)
+
+        # ── 11. Filter ────────────────────────────────────────────────────────
+        if not _FILTER.matches(level, service, event, kv_raw):
+            _write_json_line(json_dict)
+            raise structlog.DropEvent()
+
+        # ── 12. Build Rich Text log line ──────────────────────────────────────
+        line = Text()
+
+        # Row-level background tint for errors
+        row_style = (
+            Style(bgcolor="rgb(40,0,0)")  if is_error else
+            Style(bgcolor="rgb(35,30,0)") if is_warn  else
+            Style()
+        )
+
+        line.stylize(row_style)
+
+        line.append(f"[{time_str}] ", style="ts")
+        line.append(f"[{level_label:<4}]", style=lvl_style)
+        line.append("  ")
+        line.append(icon, style=svc_style)
+        line.append("  ")
+        evt_style = (
+            "evt.error" if is_error else
+            "evt.warn"  if is_warn  else
+            "evt"
+        )
+        line.append(f"{event:<{self._EVT_WIDTH}}", style=evt_style)
+        line.append("  ")
+        if kv_raw:
+            line.append_text(Text.from_markup(kv_raw))
+
+        # ── 13. Push to dashboard ─────────────────────────────────────────────
+        if _DASHBOARD._started:   # noqa
+            _DASHBOARD.push(line)
+        else:
+            _CONSOLE.print(line)
+
+        # ── 14. Write JSON ────────────────────────────────────────────────────
+        _write_json_line(json_dict)
+        raise structlog.DropEvent()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DASHBOARD METRICS SNAPSHOT  —  export helper for external consumers
+#
+#  Call dump_dashboard_snapshot() from an admin endpoint, health check,
+#  or debug REPL to get a dict of all live dashboard state.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def dump_dashboard_snapshot() -> Dict:
+    """
+    Return a serialisable snapshot of the entire dashboard state.
+
+    Useful for:
+      • /debug/metrics HTTP endpoint
+      • Periodic state dumps to disk / S3
+      • Integration tests that assert on dashboard state
+    """
+    now = time.monotonic()
+    svc_snapshot = {}
+    for svc_key in _SVC_META:
+        m = _DASH_SVC[svc_key]
+        svc_snapshot[svc_key] = {
+            "status":         m.status,
+            "request_count":  m.request_count,
+            "error_count":    m.error_count,
+            "error_rate_pm":  round(m.error_rate_pm, 2),
+            "p50_ms":         round(m.p50, 1) if m.p50 else None,
+            "p95_ms":         round(m.p95, 1) if m.p95 else None,
+            "p99_ms":         round(m.p99, 1) if m.p99 else None,
+            "cache_hit_rate": round(m.cache_hit_rate, 3) if m.cache_hit_rate else None,
+            "tokens_in":      m.tokens_in,
+            "tokens_out":     m.tokens_out,
+            "last_event":     m.last_event,
+            "model":          m.model,
+        }
+
+    return {
+        "timestamp":     time.time(),
+        "uptime_s":      round(now - _PROCESS_START, 1),
+        "services":      svc_snapshot,
+        "rate": {
+            "eps":   round(_RATE.eps, 2),
+            "total": _RATE.total,
+        },
+        "token_budget": {
+            "prompt_total":     _TOKEN_BUDGET.prompt_total,
+            "completion_total": _TOKEN_BUDGET.completion_total,
+            "total":            _TOKEN_BUDGET.total,
+            "limit":            _TOKEN_BUDGET.limit,
+            "ratio":            round(_TOKEN_BUDGET.ratio, 3),
+        },
+        "circuit_breakers": dict(_CB_BOARD._states),   # noqa
+        "alert_bursting":   _ALERTS.is_bursting(),
+        "active_sessions":  _SESSIONS.active_count,
+        "vitals": {
+            "cpu_pct":    _VITALS.cpu_pct,
+            "mem_mb":     _VITALS.mem_mb,
+            "fd_count":   _VITALS.fd_count,
+            "thread_count": _VITALS.thread_count,
+        },
+        "error_patterns": [
+            {"service": svc, "event": evt, "count": cnt}
+            for svc, evt, cnt in _ERR_PATTERNS.top(10)
+        ],
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DASHBOARD CONTROL API
+#  Exposes live filter mutation so operators can narrow the log view at runtime.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def set_log_filter(
+    *,
+    min_level: Optional[str] = None,
+    service: Optional[str] = None,
+    search: Optional[str] = None,
+    reset: bool = False,
+) -> None:
+    """
+    Mutate the live log filter without restarting the process.
+
+    Examples
+    ────────
+        # Show only errors:
+        set_log_filter(min_level="error")
+
+        # Show only LLM events:
+        set_log_filter(service="llm")
+
+        # Full-text search in event name / kv:
+        set_log_filter(search="cache_miss")
+
+        # Reset to show everything:
+        set_log_filter(reset=True)
+    """
+    if reset:
+        _FILTER.min_level = "info"
+        _FILTER.service   = None
+        _FILTER.search    = None
+        return
+    if min_level is not None:
+        _FILTER.min_level = min_level.lower()
+    if service is not None:
+        _FILTER.service = service or None
+    if search is not None:
+        _FILTER.search = search or None
+    _DASHBOARD.force_refresh()
+
+
+def set_token_budget(limit: int) -> None:
+    """Update the soft token budget limit at runtime (in-process only)."""
+    _TOKEN_BUDGET.limit = limit
+    _DASHBOARD.force_refresh()
+
+
+def mark_service_down(service: str) -> None:
+    """Forcibly mark a service as down in the matrix (ops override)."""
+    _DASH_SVC[service].status = "down"
+    _ALERTS.push("error", service, "marked_down_manually")
+    _DASHBOARD.force_refresh()
+
+
+def mark_service_ok(service: str) -> None:
+    """Clear a manually-set service outage."""
+    _DASH_SVC[service].status = "ok"
+    _ALERTS.push("info", service, "marked_ok_manually")
+    _DASHBOARD.force_refresh()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
