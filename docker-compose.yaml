@@ -190,6 +190,7 @@ services:
       --tcp-keepalive 60
       --maxclients 512
     environment:
+      APP_MODE: api   # or any value other than "desktop"
       # Forwarded so redis-cli in the healthcheck can authenticate.
       REDIS_PASSWORD: "${REDIS_PASSWORD}"
     healthcheck:

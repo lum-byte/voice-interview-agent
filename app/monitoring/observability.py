@@ -2935,6 +2935,35 @@ def _kv_string(event_dict: dict) -> str:
         parts.append(f"[kv.key]{key}=[/kv.key][kv.val]{val}[/kv.val]")
     return "  ".join(parts)
 
+_LOGGER_NAME_MAP: Dict[str, str] = {
+    "STT_service":       "stt",
+    "LLM_service":       "llm",
+    "TTS_service":       "tts",
+    "sanitize":          "sanitize",
+    "session_store":     "session",
+    "conversation_memory": "memory",
+    "transcription":     "transcript",
+    "evaluation_engine": "eval",
+    "pipeline":          "pipeline",
+    "controller":        "controller",
+    "voice_graph":       "pipeline",
+    "qa_controller":     "eval",
+    "recorder":          "stt",
+    "audio_engine":      "stt",
+    "shared":            "pipeline",
+    "observability":     "pipeline",
+}
+
+def _resolve_service(event_dict: dict) -> str:
+    """Extract service key from event_dict, falling back to logger name substring match."""
+    explicit = event_dict.get("service")
+    if explicit:
+        return explicit
+    logger_name = event_dict.get("logger", "")
+    for key in _LOGGER_NAME_MAP:
+        if key in logger_name:
+            return _LOGGER_NAME_MAP[key]
+    return "pipeline"
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  JSON FILE SINK
@@ -3770,10 +3799,12 @@ class _ErrorPatternAnalyzer:
 
     def render_panel(self) -> Panel:
         top = self.top()
+        body = Text()
+        body.append("  ERROR PATTERNS  (5 min)\n", style="chrome.title")
+        body.append("  " + "─" * 60 + "\n", style="bright_black")
         if not top:
-            body = Text("  no errors in last 5 min\n", style="bright_green")
+            body.append("  no errors in last 5 min\n", style="bright_green")
         else:
-            body = Text()
             peak = top[0][2] if top else 1
             for svc, evt, cnt in top:
                 bar_w = max(1, int((cnt / peak) * 20))
@@ -3784,7 +3815,6 @@ class _ErrorPatternAnalyzer:
 
         return Panel(
             body,
-            title="[chrome.title] ERROR PATTERNS  (5 min) [/chrome.title]",
             border_style="bright_black",
             box=_rbox.MINIMAL_HEAVY_HEAD,
             padding=(0, 1),
@@ -3826,7 +3856,7 @@ def _update_svc_snapshot_v2(event: str, kv: dict) -> None:
 #  FULL LAYOUT v2  —  seven-pane dashboard with all new subsystems
 # ═════════════════════════════════════════════════════════════════════════════
 
-_VISIBLE_LOG_LINES_FULL = 20
+_VISIBLE_LOG_LINES_FULL = 28
 
 
 def _build_full_dashboard() -> Layout:
@@ -3853,7 +3883,7 @@ def _build_full_dashboard() -> Layout:
         Layout(name="header", size=9),
         Layout(name="vitals", size=3),
         Layout(name="upper_middle", ratio=5),
-        Layout(name="errors", ratio=2),
+        Layout(name="errors", ratio=4),
         Layout(name="log", ratio=4),
     )
 
@@ -4033,7 +4063,7 @@ class _DualSinkRenderer:  # type: ignore[no-redef]  # noqa: F811
         ts      = event_dict.pop("timestamp", "")
         level   = event_dict.pop("level", "info").lower()
         event   = event_dict.pop("event", "")
-        service = event_dict.get("service", "pipeline")
+        service = event_dict.get("service") or event_dict.get("logger", "pipeline")
 
         time_str = ts[11:19] if len(ts) >= 19 else ts
 
@@ -6680,11 +6710,11 @@ def build_grafana_dashboard() -> dict:
     panels.append(row("Overview", y))
     y += 1
     kpis = [
-        ("Active Pipelines", "ai_pipeline_inflight", "short"),
+        ("Active Pipelines", "voice_pipeline_active", "short"),
         ("Active Sessions", "ai_session_active", "short"),
         (
             "Pipeline P99 (s)",
-            "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+            "histogram_quantile(0.99, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
             "s",
         ),
         ("Redis Degraded", "ai_redis_degraded_mode", "short"),
@@ -6709,14 +6739,14 @@ def build_grafana_dashboard() -> dict:
             "Pipeline Requests/min",
             [
                 _target(
-                    'sum(rate(ai_pipeline_requests_total{status="ok"}[1m])) * 60', "ok"
+                    'sum(rate(voice_pipeline_total{status="ok"}[1m])) * 60', "ok"
                 ),
                 _target(
-                    'sum(rate(ai_pipeline_requests_total{status="error"}[1m])) * 60',
+                    'sum(rate(voice_pipeline_total{status="error"}[1m])) * 60',
                     "error",
                 ),
                 _target(
-                    'sum(rate(ai_pipeline_requests_total{status="cache"}[1m])) * 60',
+                    'sum(rate(voice_pipeline_total{status="cache"}[1m])) * 60',
                     "cache",
                 ),
             ],
@@ -6736,15 +6766,15 @@ def build_grafana_dashboard() -> dict:
             "Pipeline Latency Percentiles",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
                     "p90",
                 ),
                 _target(
-                    "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.99, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
                     "p99",
                 ),
             ],
@@ -6764,7 +6794,7 @@ def build_grafana_dashboard() -> dict:
             "Stage Latency P95 (s)",
             [
                 _target(
-                    f'histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{{stage="{s}"}}[5m])) by (le))',
+                    f'histogram_quantile(0.95, sum(rate(voice_pipeline_stage_latency_seconds_bucket{{stage="{s}"}}[5m])) by (le))',
                     s,
                 )
                 for s in ("stt", "llm", "tts", "sanitize")
@@ -6784,7 +6814,7 @@ def build_grafana_dashboard() -> dict:
             "Pipeline Errors by Stage",
             [
                 _target(
-                    "sum(rate(ai_pipeline_stage_errors_total[1m])) by (stage)",
+                    "sum(rate(voice_pipeline_stage_errors_total[1m])) by (stage)",
                     "{{stage}}",
                 ),
             ],
@@ -6803,11 +6833,11 @@ def build_grafana_dashboard() -> dict:
             "Retries & Aborts",
             [
                 _target(
-                    "sum(rate(ai_pipeline_stage_retries_total[5m])) by (stage)",
+                    "sum(rate(voice_pipeline_stage_retries_total[5m])) by (stage)",
                     "retry:{{stage}}",
                 ),
                 _target(
-                    "sum(rate(ai_pipeline_aborted_total[5m])) by (reason)",
+                    "sum(rate(voice_pipeline_cancellations_total[5m])) by (reason)",
                     "abort:{{reason}}",
                 ),
             ],
@@ -6826,15 +6856,15 @@ def build_grafana_dashboard() -> dict:
             "Load Shedding & Degraded",
             [
                 _target(
-                    "sum(rate(ai_pipeline_load_shed_total[5m])) by (tier)",
+                    "sum(rate(voice_pipeline_load_shed_total[5m])) by (tier)",
                     "shed:{{tier}}",
                 ),
                 _target(
-                    "sum(rate(ai_pipeline_degraded_total[5m])) by (stage)",
+                    "sum(rate(voice_pipeline_degraded_total[5m])) by (stage)",
                     "degraded:{{stage}}",
                 ),
                 _target(
-                    "sum(rate(ai_pipeline_cancelled_total[5m])) by (stage)",
+                    "sum(rate(voice_pipeline_cancellations_total[5m]))",
                     "cancelled:{{stage}}",
                 ),
             ],
@@ -6851,7 +6881,7 @@ def build_grafana_dashboard() -> dict:
             pid,
             "Inflight by QoS Tier",
             [
-                _target("ai_pipeline_inflight", "{{tier}}"),
+                _target("voice_pipeline_active", "{{tier}}"),
             ],
             x=12,
             y=y,
@@ -6871,7 +6901,7 @@ def build_grafana_dashboard() -> dict:
             "STT Requests/min",
             [
                 _target(
-                    "sum(rate(ai_stt_requests_total[1m])) by (status) * 60",
+                    "sum(rate(stt_requests_total[1m])) by (status) * 60",
                     "{{status}}",
                 ),
             ],
@@ -6891,15 +6921,15 @@ def build_grafana_dashboard() -> dict:
             "STT Latency Percentiles",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
                     "p90",
                 ),
                 _target(
-                    "histogram_quantile(0.99, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+                    "histogram_quantile(0.99, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
                     "p99",
                 ),
             ],
@@ -7149,7 +7179,7 @@ def build_grafana_dashboard() -> dict:
             "TTS Requests/min",
             [
                 _target(
-                    "sum(rate(ai_tts_requests_total[1m])) by (status, voice) * 60",
+                    "sum(rate(tts_requests_total[1m])) by (status, provider, mode) * 60",
                     "{{status}}:{{voice}}",
                 ),
             ],
@@ -7169,11 +7199,11 @@ def build_grafana_dashboard() -> dict:
             "TTS Latency Percentiles",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+                    "histogram_quantile(0.50, sum(rate(tts_latency_seconds_bucket[5m])) by (le, voice))",
                     "p50 {{voice}}",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+                    "histogram_quantile(0.90, sum(rate(tts_latency_seconds_bucket[5m])) by (le, voice))",
                     "p90 {{voice}}",
                 ),
             ],
@@ -7933,7 +7963,7 @@ def write_grafana_dashboard(out_dir: str = GRAFANA_OUT_DIR) -> Path:
         "            value: stage\n"
         "        queries:\n"
         "          - name: Pipeline latency\n"
-        "            query: histogram_quantile(0.95, sum(rate(ai_pipeline_latency_seconds_bucket{$$__tags}[5m])) by (le))\n"
+        "            query: histogram_quantile(0.95, sum(rate(voice_pipeline_latency_seconds_bucket{$$__tags}[5m])) by (le))\n"
         "          - name: Stage errors\n"
         "            query: sum(rate(ai_pipeline_stage_errors_total{$$__tags}[5m])) by (stage)\n"
     )

@@ -96,6 +96,30 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.outputs import LLMResult
 from langchain_openai import ChatOpenAI
+
+# Exceptions worth retrying for local LLM calls (langchain/openai transport errors).
+# OutputParserException / length-limit parse failures are NOT retryable — they are
+# deterministic: the same prompt + same max_tokens will always produce the same failure.
+try:
+    from langchain_core.exceptions import OutputParserException as _LCOutputParserException
+except ImportError:
+    _LCOutputParserException = None  # type: ignore[assignment,misc]
+
+_LLM_RETRYABLE_LOCAL: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+    TimeoutError,
+    ConnectionError,
+)
+# Remote HTTP client: only retry on network/transient errors, not 4xx.
+_LLM_RETRYABLE_REMOTE: tuple[type[Exception], ...] = (
+    httpx.ConnectError,
+    httpx.TimeoutException,
+    httpx.RemoteProtocolError,
+    TimeoutError,
+    ConnectionError,
+)
 from opentelemetry.trace import StatusCode
 from pydantic import SecretStr  # noqa
 
@@ -165,7 +189,7 @@ ATS_TEMPERATURE:         float = float(os.getenv("LLM_ATS_TEMPERATURE",         
 
 # Max tokens per mode — interviewer is tightly capped
 INTERVIEWER_MAX_TOKENS: int = int(os.getenv("LLM_INTERVIEWER_MAX_TOKENS", "120"))
-ATS_MAX_TOKENS:         int = int(os.getenv("LLM_ATS_MAX_TOKENS",         "350"))
+ATS_MAX_TOKENS:         int = int(os.getenv("LLM_ATS_MAX_TOKENS",         "1500"))
 
 # Redis
 REDIS_URL:      str | None = os.getenv("REDIS_URL")
@@ -1486,7 +1510,7 @@ class LLMNode:
         async def _call() -> str:
             return await chain.ainvoke(messages, config={"callbacks": [counter]})
 
-        return await breaker.call(backoff_retry, _call, attempts=2, base_delay=0.8, exceptions=(Exception,))
+        return await breaker.call(backoff_retry, _call, attempts=2, base_delay=0.8, exceptions=_LLM_RETRYABLE_LOCAL)
 
     # ── warmup / probe / lifecycle ─────────────────────────────────────────────
 
@@ -2708,7 +2732,7 @@ class RemoteLLMClient:
                         _open_stream,
                         attempts=2,
                         base_delay=1.0,
-                        exceptions=(Exception,),
+                        exceptions=_LLM_RETRYABLE_REMOTE,
                     )
 
                     async with stream_ctx as resp:
@@ -2871,7 +2895,7 @@ class RemoteLLMClient:
                         _call,
                         attempts=3,
                         base_delay=1.5,
-                        exceptions=(Exception,),
+                        exceptions=_LLM_RETRYABLE_REMOTE,
                     )
 
                     if not raw or not raw.strip():
@@ -3012,7 +3036,7 @@ class RemoteLLMClient:
                         _open_stream,
                         attempts=2,
                         base_delay=1.0,
-                        exceptions=(Exception,),
+                        exceptions=_LLM_RETRYABLE_REMOTE,
                     )
 
                     async with stream_ctx as resp:

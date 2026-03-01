@@ -19,12 +19,16 @@ WORKDIR /build
 #   libsndfile1-dev   — soundfile (audio file I/O)
 #   portaudio19-dev   — sounddevice (requires PortAudio headers to compile)
 #   espeak-ng         — phonemizer, espeakng-loader, kokoro-onnx (text-to-phoneme engine)
+#   ffmpeg            — opus_ffmpeg_io.py (USE_FFMPEG_IO=1 path)
+#   libopus-dev       — FFmpeg Opus codec support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     libsndfile1-dev \
     portaudio19-dev \
     espeak-ng \
+    ffmpeg \
+    libopus-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -45,10 +49,14 @@ FROM python:3.11-slim AS runtime
 #   libsndfile1     — soundfile
 #   libportaudio2   — sounddevice
 #   espeak-ng       — phonemizer, espeakng-loader, kokoro-onnx
+#   ffmpeg          — opus_ffmpeg_io.py subprocess pool (USE_FFMPEG_IO=1)
+#   libopus-dev     — FFmpeg Opus codec support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     libportaudio2 \
     espeak-ng \
+    ffmpeg \
+    libopus-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

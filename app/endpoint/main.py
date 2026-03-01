@@ -85,7 +85,7 @@ from app.orchestration.voice_graph import (
     reset_integrations,
 )
 
-log = get_logger(__name__)
+log = get_logger(__name__).bind(service="api")
 tracer = get_tracer(__name__)
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -371,6 +371,8 @@ async def _lifespan(app: FastAPI):  # noqa
     from app.orchestration.voice_graph import on_shutdown
     await asyncio.gather(
         on_shutdown(),
+        voice_graph_realtime.shutdown() if hasattr(voice_graph_realtime, "shutdown") else asyncio.sleep(0),
+        voice_graph_low_latency.shutdown() if hasattr(voice_graph_low_latency, "shutdown") else asyncio.sleep(0),
         return_exceptions=True,
     )
     log.info("api_shutdown_complete")
@@ -692,6 +694,10 @@ async def voice_chat(
             ),
             timeout=PIPELINE_TIMEOUT,
         )
+
+    except asyncio.TimeoutError:
+        log.warning("voice_request_timeout", request_id=rid, timeout_s=PIPELINE_TIMEOUT)
+        return _error_response(rid, f"Pipeline timed out after {PIPELINE_TIMEOUT}s.", 504)
 
     except asyncio.CancelledError:
         log.warning("voice_request_cancelled", request_id=rid)

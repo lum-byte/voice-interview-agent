@@ -172,6 +172,7 @@ from app.common.shared import ( # noqa
 )
 from app.monitoring.observability import get_logger
 from app.monitoring.observability import ( # noqa
+    bootstrap,
     session_context,
     pipeline_span,
     stt_span,
@@ -183,6 +184,16 @@ from app.monitoring.observability import ( # noqa
     LLMEmitter,
     TTSEmitter,
     SanitizeEmitter,
+    ControllerEmitter,
+    SessionEmitter,
+    MemoryEmitter,
+    SanitizeEmitter,
+    RateLimitEmitter,
+    BulkheadEmitter,
+    CBEmitter,
+    RedisEmitter,
+    TranscriptEmitter,
+    EvalEmitter,
 )
 from app.nodes.sanitize import sanitize
 from app.nodes.STT_service import STTNodeProtocol, get_stt_node, stt_node as _stt_singleton  # noqa
@@ -2527,7 +2538,7 @@ def _build_graph_for_instance(
                 if not text.strip():
                     raise ValueError("Empty text after sanitize — nothing to synthesize.")
 
-                result = await _with_timeout(
+                local_path, s3_uri, _duration_s = await _with_timeout(
                     tts.synthesize(
                         text=text,
                         voice=state.get("tts_voice"),
@@ -2538,9 +2549,7 @@ def _build_graph_for_instance(
                     stage="TTS",
                 )
 
-                audio_output  = result.get("audio_url", "")
-                local_path    = result.get("local_path", "")
-                s3_uri        = result.get("s3_uri", "")
+                audio_output = local_path
 
                 latency = time.monotonic() - t0
                 _stage_latency.labels(stage="tts").observe(latency)
@@ -2558,11 +2567,11 @@ def _build_graph_for_instance(
                     session_id=state.get("session_id", ""),
                     request_id=rid,
                     latency_ms=latency * 1000,
-                    audio_duration_s=result.get("duration_s", 0.0),
-                    audio_size_bytes=result.get("size_bytes", 0),
+                    audio_duration_s=_duration_s,
+                    audio_size_bytes=0,
                     voice=state.get("tts_voice", ""),
                     input_chars=len(text),  # text_chars
-                    audio_output=state.get("audio_output", ""),
+                    audio_output=audio_output,
                     s3_uri=s3_uri if s3_uri else "",  # s3_uploaded (bool → str)
                 )
 
@@ -2686,7 +2695,11 @@ def _build_graph_for_instance(
 
         t0 = time.monotonic()
         try:
-            await asyncio.to_thread(play_audio, local_path)
+            # play_audio has async internals — call directly in the event loop,
+            # not via to_thread (which runs in a worker thread with no event loop).
+            result = play_audio(local_path)
+            if asyncio.iscoroutine(result):
+                await result
             latency = time.monotonic() - t0
             log.info("graph_dev_playback_ok", request_id=rid, latency_s=round(latency, 3))
         except Exception as exc:
@@ -6113,63 +6126,84 @@ async def on_startup() -> None:
       7. Prometheus metrics registration
       8. Feature flag logging
     """
+    bootstrap()
     log.info("voice_graph_startup_begin", version=GRAPH_VERSION)
     t0 = time.monotonic()
 
     # ── 1. STT warm-up ───────────────────────────────────────────────────
-    # STT warm-up
     try:
         stt_node = voice_graph._stt # noqa
         if hasattr(stt_node, "warmup"):
             await stt_node.warmup()
-        log.info("startup_stt_warmup_ok")
+        log.info("startup_stt_warmup_ok", service="stt")
     except Exception as exc:
-        log.error("startup_stt_warmup_failed", error=str(exc))
+        log.error("startup_stt_warmup_failed", service="stt", error=str(exc))
 
     # ── 2. TTS warm-up ───────────────────────────────────────────────────
-    # TTS warm-up
     try:
         tts_node = voice_graph._tts # noqa
         if hasattr(tts_node, "warmup"):
             await tts_node.warmup()
-        log.info("startup_tts_warmup_ok")
+        log.info("startup_tts_warmup_ok", service="tts")
     except Exception as exc:
-        log.error("startup_tts_warmup_failed", error=str(exc))
+        log.error("startup_tts_warmup_failed", service="tts", error=str(exc))
 
     # ── 3. QA controller init ────────────────────────────────────────────
     try:
         if _qa_controller is not None:
             qa_health = await _qa_controller.health()
-            log.info("startup_qa_controller_ok", health=qa_health)
+            log.info("startup_qa_controller_ok", service="controller", health=qa_health)
+        else:
+            log.info("startup_qa_controller_skipped", service="controller")
     except Exception as exc:
-        log.error("startup_qa_controller_failed", error=str(exc))
+        log.error("startup_qa_controller_failed", service="controller", error=str(exc))
 
     # ── 4. Evaluation engine init ────────────────────────────────────────
     try:
         if _eval_engine is not None:
             eval_health = await _eval_engine.health()
-            log.info("startup_eval_engine_ok", health=eval_health)
+            log.info("startup_eval_engine_ok", service="eval", health=eval_health)
+        else:
+            log.info("startup_eval_engine_skipped", service="eval")
     except Exception as exc:
-        log.error("startup_eval_engine_failed", error=str(exc))
+        log.error("startup_eval_engine_failed", service="eval", error=str(exc))
 
     # ── 5. Recording health check ────────────────────────────────────────
-    try:
-        rec_ok = await run_recorder_health_check()
-        log.info("startup_recorder_health", ok=rec_ok)
-    except Exception as exc:
-        log.warning("startup_recorder_health_failed", error=str(exc))
+    # Skip mic/speaker probing in non-desktop environments (Docker, CI).
+    # PortAudio blocks indefinitely if no audio device is present — a timeout
+    # prevents the lifespan from hanging and blocking health checks.
+    _app_mode = os.getenv("APP_MODE", "production").lower()
+    if _app_mode == "desktop":
+        try:
+            rec_ok = await asyncio.wait_for(run_recorder_health_check(), timeout=5.0)
+            log.info("startup_recorder_health", service="pipeline", ok=rec_ok)
+        except asyncio.TimeoutError:
+            log.warning("startup_recorder_health_skipped", service="pipeline",
+                        reason="timeout — no audio device (non-desktop env)")
+        except Exception as exc:
+            log.warning("startup_recorder_health_failed", service="pipeline", error=str(exc))
+    else:
+        log.info("startup_recorder_health_skipped", service="pipeline",
+                 reason=f"APP_MODE={_app_mode} — audio hardware not expected")
 
     # ── 6. PCM chunk pool pre-allocation ─────────────────────────────────
     try:
         pool = get_chunk_pool()
         pool.preallocate(count=64)
-        log.info("startup_chunk_pool_preallocated", count=64)
+        log.info("startup_chunk_pool_preallocated", service="pipeline", count=64)
     except Exception as exc:
-        log.warning("startup_chunk_pool_failed", error=str(exc))
+        log.warning("startup_chunk_pool_failed", service="pipeline", error=str(exc))
 
-    # ── 7. Feature flag state ────────────────────────────────────────────
+    # ── 7. Heartbeat — services with no warmup step ───────────────────────
+    # These services are passive at startup (no init to run) but we still want
+    # them to show "ok" in the dashboard instead of "unknown".
+    for _svc in ("llm", "session", "memory", "sanitize", "rl", "bh", "cb", "redis", "transcript"):
+        log.info("service_ready", service=_svc)
+
+    # ── 8. Feature flag state ────────────────────────────────────────────
     log.info(
         "startup_feature_flags",
+        service="pipeline",
         pcm_pipeline=FF_PCM_PIPELINE,
         barge_in=FF_BARGE_IN,
         audio_diagnostics=FF_AUDIO_DIAGNOSTICS,
@@ -6181,6 +6215,7 @@ async def on_startup() -> None:
     startup_latency = time.monotonic() - t0
     log.info(
         "voice_graph_startup_complete",
+        service="pipeline",
         version=GRAPH_VERSION,
         latency_s=round(startup_latency, 2),
     )

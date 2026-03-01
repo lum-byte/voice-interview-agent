@@ -96,6 +96,15 @@ import aiofiles
 import httpx
 import numpy as np
 from openai import AsyncOpenAI
+from openai import (
+    APIConnectionError as _OAIConnectionError,
+    APITimeoutError   as _OAITimeoutError,
+    RateLimitError    as _OAIRateLimitError,
+    InternalServerError as _OAIInternalError,
+)
+# Errors worth retrying — 400 BadRequest is NOT here (invalid voice, bad input,
+# etc. will never succeed on retry and just burn time + circuit-breaker budget).
+_TTS_RETRYABLE = (_OAIConnectionError, _OAITimeoutError, _OAIRateLimitError, _OAIInternalError)
 from opentelemetry.trace import StatusCode
 
 # ── internal — shared infrastructure ─────────────────────────────────────────
@@ -169,8 +178,14 @@ tracer = get_tracer(__name__)
 # 1. TYPE ALIASES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VoiceType = Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+VoiceType = Literal["alloy", "echo", "fable", "onyx", "nova", "shimmer", "ash", "sage", "coral"]
 FormatType = Literal["mp3", "opus", "aac", "flac", "wav", "pcm"]
+
+# Canonical set used for runtime validation — keeps VoiceType and the guard in sync.
+_OPENAI_VALID_VOICES: frozenset[str] = frozenset(
+    {"alloy", "echo", "fable", "onyx", "nova", "shimmer", "ash", "sage", "coral"}
+)
+_TTS_VOICE_DEFAULT = "nova"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 2. CONFIGURATION
@@ -192,6 +207,28 @@ LOCAL_FILE_TTL: float = float(os.getenv("TTS_LOCAL_FILE_TTL", "3600"))
 # down. Generate it once with: `tts_node.synthesize(APOLOGY_TEXT)` and set
 # TTS_APOLOGY_AUDIO_PATH to the result. If not set, the fallback is silent.
 TTS_APOLOGY_AUDIO_PATH: str = os.getenv("TTS_APOLOGY_AUDIO_PATH", "")
+
+# ── voice validation helper ───────────────────────────────────────────────────
+
+def _resolve_voice(voice: str | None, log_source: str = "") -> VoiceType:
+    """
+    Validate and normalize a voice string before it reaches the OpenAI API.
+
+    If the requested voice is not in _OPENAI_VALID_VOICES (e.g. a Kokoro voice
+    name leaking in after a refactor, an empty string, or a stale value), fall
+    back to _TTS_VOICE_DEFAULT and log a warning so the misconfiguration is
+    visible without crashing the pipeline.
+    """
+    if voice and voice in _OPENAI_VALID_VOICES:
+        return voice  # type: ignore[return-value]
+    if voice:
+        get_logger(__name__).warning(
+            "tts_invalid_voice_fallback",
+            requested=voice,
+            fallback=_TTS_VOICE_DEFAULT,
+            source=log_source,
+        )
+    return _TTS_VOICE_DEFAULT  # type: ignore[return-value]
 
 # S3 — all optional
 S3_BUCKET: str | None = os.getenv("TTS_S3_BUCKET")
@@ -1346,7 +1383,7 @@ class TTSNode:
                 return await response.read()
 
         return await breaker.call(
-            backoff_retry, _call, attempts=3, base_delay=1.0, exceptions=(Exception,)
+            backoff_retry, _call, attempts=3, base_delay=1.0, exceptions=_TTS_RETRYABLE
         )
 
     # ── stitching validation ──────────────────────────────────────────────────
@@ -1402,7 +1439,7 @@ class TTSNode:
                 _budget_exceeded.inc()
                 raise
 
-        active_voice: VoiceType = voice if voice is not None else self._voice
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else self._voice, log_source="synthesize")
         san = sanitize(text, request_id=rid)
 
         if not san:
@@ -1552,7 +1589,7 @@ class TTSNode:
 
         rid = request_id or new_request_id()
         pipeline = await self._ensure_pcm_pipeline(rid)
-        active_voice: VoiceType = voice if voice is not None else self._voice
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else self._voice, log_source="synthesize")
 
         san = sanitize(text, request_id=rid)
         if not san:
@@ -1595,7 +1632,7 @@ class TTSNode:
                             _call_pcm,
                             attempts=3,
                             base_delay=1.0,
-                            exceptions=(Exception,),
+                            exceptions=_TTS_RETRYABLE,
                         )
                         self._validate_chunk(raw_bytes, 0)
 
@@ -1715,7 +1752,7 @@ class TTSNode:
                 _budget_exceeded.inc()
                 raise
 
-        active_voice: VoiceType = voice if voice is not None else self._voice
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else self._voice, log_source="synthesize")
 
         with tracer.start_as_current_span("tts.synthesize_pcm_stream") as span:
             span.set_attribute("request_id", rid)
@@ -1947,7 +1984,7 @@ class TTSNode:
                 _budget_exceeded.inc()
                 raise
 
-        active_voice: VoiceType = voice if voice is not None else self._voice
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else self._voice, log_source="synthesize")
 
         with tracer.start_as_current_span("tts.synthesize_stream") as span:
             span.set_attribute("request_id", rid)
@@ -2073,7 +2110,7 @@ class TTSNode:
         """
         rid = request_id or new_request_id()
         base_stem = stem or f"tts_{uuid.uuid4().hex[:8]}"
-        active_voice: VoiceType = voice if voice is not None else self._voice
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else self._voice, log_source="synthesize")
 
         with tracer.start_as_current_span("tts.synthesize_stream_to_files") as span:
             span.set_attribute("request_id", rid)
@@ -2514,7 +2551,7 @@ class RemoteTTSClient:
         if not san:
             raise ValueError("Sanitizer returned empty TTS text.")
         safe_text    = san.text
-        active_voice = voice if voice is not None else TTS_VOICE
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else TTS_VOICE, log_source="node.__call__")
 
         headers = self._request_headers(rid)
 
@@ -2551,7 +2588,7 @@ class RemoteTTSClient:
                     _call,
                     attempts=3,
                     base_delay=1.0,
-                    exceptions=(Exception,),
+                    exceptions=_TTS_RETRYABLE,
                 )
 
                 local_path, s3_uri, duration_s = self._validate_synthesize_result(raw, rid)
@@ -2667,7 +2704,7 @@ class RemoteTTSClient:
             log.warning("remote_tts_stream_budget_exceeded_entry", request_id=rid)
             raise
 
-        active_voice = voice if voice is not None else TTS_VOICE
+        active_voice: VoiceType = _resolve_voice(voice if voice is not None else TTS_VOICE, log_source="node.__call__")
         headers      = self._request_headers(rid)
 
         with tracer.start_as_current_span("tts.remote.stream") as span:
@@ -2733,7 +2770,7 @@ class RemoteTTSClient:
                             _open_stream,
                             attempts=3,
                             base_delay=1.0,
-                            exceptions=(Exception,),
+                            exceptions=_TTS_RETRYABLE,
                         )
 
                         async with stream_ctx as resp:
