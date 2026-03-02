@@ -1,122 +1,197 @@
-# Voice Assistant Pipeline — Complete Technical Reference
+# 🎙️ Voice Interview Pipeline
 
-> A production-grade, real-time voice interview assistant built on OpenAI Whisper (STT), GPT (LLM), and OpenAI TTS, orchestrated with LangGraph, backed by Redis and MongoDB, and observed via Prometheus, Grafana, Loki, Tempo, and OpenTelemetry. Supports both a desktop push-to-talk mode and a fully stateless HTTP/WebSocket API mode.
+<div align="center">
+
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue?style=for-the-badge&logo=python)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-orange?style=for-the-badge)](https://github.com/langchain-ai/langgraph)
+[![OpenAI](https://img.shields.io/badge/OpenAI-Whisper%20%7C%20GPT%20%7C%20TTS-412991?style=for-the-badge&logo=openai)](https://openai.com)
+[![Redis](https://img.shields.io/badge/Redis-Session%20%7C%20Cache-DC382D?style=for-the-badge&logo=redis)](https://redis.io)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Observability-47A248?style=for-the-badge&logo=mongodb)](https://mongodb.com)
+[![Prometheus](https://img.shields.io/badge/Prometheus-Metrics-E6522C?style=for-the-badge&logo=prometheus)](https://prometheus.io)
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Tracing-000000?style=for-the-badge&logo=opentelemetry)](https://opentelemetry.io)
+
+**A production-grade, real-time voice interview system with PCM-native audio processing, structured QA state management, adaptive evaluation, and three-layer observability.**
+
+</div>
 
 ---
 
 ## Table of Contents
 
-1. [System Overview](#1-system-overview)
-2. [High-Level Architecture](#2-high-level-architecture)
+1. [Overview](#1-overview)
+2. [System Architecture](#2-system-architecture)
 3. [Repository Layout](#3-repository-layout)
-4. [Configuration & Settings](#4-configuration--settings)
-5. [Shared Infrastructure (`shared.py`)](#5-shared-infrastructure-sharedpy)
-6. [Logging (`log_config.py`)](#6-logging-log_configpy)
-7. [Pipeline Orchestration (`voice_graph.py`)](#7-pipeline-orchestration-voice_graphpy)
-8. [STT Node (`STT_service.py`)](#8-stt-node-stt_servicepy)
-9. [LLM Node (`LLM_service.py`)](#9-llm-node-llm_servicepy)
-10. [TTS Node (`TTS_service.py`)](#10-tts-node-tts_servicepy)
-11. [Sanitize Node (`sanitize.py`)](#11-sanitize-node-sanitizepy)
-12. [Session Store (`session_store.py`)](#12-session-store-session_storepy)
-13. [Conversation Memory (`conversation_memory.py`)](#13-conversation-memory-conversation_memorypy)
-14. [Evaluation Engine (`evaluation_engine.py`)](#14-evaluation-engine-evaluation_enginepy)
-15. [Transcript Writer (`transcription.py`)](#15-transcript-writer-transcriptionpy)
-16. [FastAPI Gateway (`main.py`)](#16-fastapi-gateway-mainpy)
-17. [Desktop Controller (`controller.py`)](#17-desktop-controller-controllerpy)
-18. [Audio Recorder (`recorder.py`)](#18-audio-recorder-recorderpy)
-19. [Audio Player (`player.py`)](#19-audio-player-playerpy)
-20. [Observability Stack (`observability.py`)](#20-observability-stack-observabilitypy)
-21. [Pipeline Wrapper (`pipeline.py`)](#21-pipeline-wrapper-pipelinepy)
-22. [Startup Display (`startup_display.py`)](#22-startup-display-startup_displaypy)
-23. [Docker Compose & Infrastructure](#23-docker-compose--infrastructure)
-24. [Execution Modes](#24-execution-modes)
-25. [Data Flow: End-to-End Walkthrough](#25-data-flow-end-to-end-walkthrough)
-26. [Resilience Patterns](#26-resilience-patterns)
-27. [QoS Tiers & Graph Variants](#27-qos-tiers--graph-variants)
-28. [Session Lifecycle](#28-session-lifecycle)
-29. [Environment Variables Reference](#29-environment-variables-reference)
-30. [Running the System](#30-running-the-system)
-31. [Dependency Map](#31-dependency-map)
+4. [Installation & Environment Setup](#4-installation--environment-setup)
+5. [Configuration Reference](#5-configuration-reference)
+6. [Execution Modes](#6-execution-modes)
+7. [Pipeline Deep Dive](#7-pipeline-deep-dive)
+   - [Graph Topology](#71-graph-topology)
+   - [STT Node](#72-stt-node-stt_servicepy)
+   - [LLM Node](#73-llm-node-llm_servicepy)
+   - [Sanitize Node](#74-sanitize-node-sanitizepy)
+   - [TTS Node](#75-tts-node-tts_servicepy)
+8. [PCM Audio Engine](#8-pcm-audio-engine)
+   - [Format Negotiation](#81-format-negotiation)
+   - [PCM-Native Realtime Path](#82-pcm-native-realtime-path)
+   - [Audio Components](#83-audio-components)
+9. [QA Interview Engine](#9-qa-interview-engine)
+   - [Session State Machine](#91-session-state-machine)
+   - [QA Data Schema](#92-qa-data-schema)
+   - [LLM Modes](#93-llm-modes)
+10. [Evaluation Engine](#10-evaluation-engine)
+11. [Session Management](#11-session-management)
+    - [Session Store](#111-session-store)
+    - [Session Lifecycle Manager](#112-session-lifecycle-manager)
+12. [Transcript Writer](#12-transcript-writer)
+13. [QA Audit Bus](#13-qa-audit-bus)
+14. [Observability Stack](#14-observability-stack)
+    - [Three-Layer Architecture](#141-three-layer-architecture)
+    - [Metrics Reference](#142-metrics-reference)
+    - [Grafana Dashboards](#143-grafana-dashboards)
+15. [Resilience Patterns](#15-resilience-patterns)
+    - [Circuit Breakers](#151-circuit-breakers)
+    - [Rate Limiting & Bulkheads](#152-rate-limiting--bulkheads)
+    - [Load Shedding](#153-load-shedding)
+    - [Latency Budget](#154-latency-budget)
+16. [Distributed Service Mode](#16-distributed-service-mode)
+17. [Feature Flags](#17-feature-flags)
+18. [API Reference](#18-api-reference)
+19. [Desktop Controller (PTT)](#19-desktop-controller-ptt)
+20. [Kafka Integration](#20-kafka-integration)
+21. [Deployment](#21-deployment)
+22. [Performance Tuning](#22-performance-tuning)
+23. [Troubleshooting](#23-troubleshooting)
+24. [Development Guide](#24-development-guide)
 
 ---
 
-## 1. System Overview
+## 1. Overview
 
-This system is a real-time voice interview assistant. A user speaks into a microphone (or uploads an audio file via HTTP); the audio is transcribed to text, passed to an LLM that maintains full conversation history, and the LLM's response is synthesised back to speech and played or returned to the caller. The entire pipeline — transcription, reasoning, synthesis — completes in under 15 seconds end-to-end under normal conditions, and in under 7 seconds on the low-latency graph variant.
+The Voice Interview Pipeline is a **production-grade AI interviewer** that conducts structured technical interviews entirely over voice. A candidate speaks; the system listens, understands, evaluates, and responds — all in near-real-time.
 
-The pipeline is designed to handle two very different operating contexts simultaneously:
-
-**Desktop mode** (`APP_MODE=desktop`): A researcher or interviewer runs the server locally. They hold a configurable push-to-talk key on their keyboard, speak, release the key, and hear the AI response through their speakers within seconds. The entire interaction is local and keyboard-driven. No browser required.
-
-**API mode** (`APP_MODE=api`): The server exposes a FastAPI HTTP interface. A web frontend, mobile app, or automation tool sends a session registration request, then POST requests with audio files. The pipeline runs and returns a JSON payload containing the transcript, LLM response text, and audio output path. A WebSocket endpoint (`/voice/stream`) supports token-level streaming for lower perceived latency.
-
-Both modes run the same `VoiceGraph` pipeline under the hood. The only difference is how audio gets in and how results get back out.
-
----
-
-## 2. High-Level Architecture
+### What It Does
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          INPUT LAYER                                  │
-│                                                                       │
-│  Desktop Mode                         API Mode                        │
-│  ┌──────────────┐                    ┌────────────────────────────┐   │
-│  │ controller.py│ ← keyboard (PTT)   │ main.py (FastAPI)          │   │
-│  │ recorder.py  │ ← microphone       │  POST /voice               │   │
-│  └──────┬───────┘                    │  WebSocket /voice/stream   │   │
-│         │                            └────────────┬───────────────┘   │
-└─────────┼──────────────────────────────────────────┼──────────────────┘
-          │ audio file path                          │ audio file path
-          ▼                                          ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                      ORCHESTRATION LAYER                              │
-│                                                                       │
-│   voice_graph.py  (LangGraph StateGraph)                             │
-│                                                                       │
-│   START → [stt] → [llm] → [sanitize] → [tts] → END                  │
-│               ↓       ↓                   ↓                           │
-│          [stt_err] [llm_err]         [tts_err]                       │
-│               ↓       ↓                   ↓                           │
-│          [retry?]  [retry?]         [error_terminal]                  │
-│                                                                       │
-│   Three graph variants: voice_graph / voice_graph_realtime           │
-│                         / voice_graph_low_latency                    │
-└──────┬───────────────────┬──────────────────────┬────────────────────┘
-       │                   │                      │
-       ▼                   ▼                      ▼
-┌────────────┐    ┌─────────────────┐    ┌──────────────────┐
-│ STT_service│    │  LLM_service    │    │  TTS_service     │
-│ (Whisper)  │    │  (GPT via       │    │  (OpenAI TTS)    │
-│            │    │   LangChain)    │    │                  │
-│ CircuitBkr │    │ Redis cache     │    │ CircuitBkr       │
-│ RateLimiter│    │ Stampede lock   │    │ RateLimiter      │
-│ Bulkhead   │    │ Fallback model  │    │ S3 upload        │
-│ S3 support │    │ Circuit breaker │    │ Local file TTL   │
-│ Streaming  │    │ Streaming       │    │                  │
-└────────────┘    └────────┬────────┘    └──────────────────┘
-                           │
-              ┌────────────┼───────────────┐
-              │            │               │
-              ▼            ▼               ▼
-     ┌──────────────┐ ┌─────────┐ ┌───────────────────┐
-     │session_store │ │conv_mem │ │evaluation_engine  │
-     │  (Redis +    │ │ory.py   │ │ (async, off-path) │
-     │   LRU fallbk)│ │         │ │                   │
-     └──────────────┘ └─────────┘ └───────────────────┘
+Candidate speaks → Mic capture → VAD gate → Speech enhancement
+   → Whisper STT → QA state machine → GPT question engine
+   → TTS synthesis → Speaker output
 
-┌──────────────────────────────────────────────────────────────────────┐
-│                    OBSERVABILITY LAYER                                │
-│                                                                       │
-│  observability.py → structlog → Rich console + JSON file             │
-│                   → Prometheus metrics (/metrics endpoint)            │
-│                   → MongoDB event documents                           │
-│                   → OpenTelemetry spans → OTel Collector → Tempo     │
-│                                                                       │
-│  docker-compose.yaml provisions:                                     │
-│  Redis · MongoDB · Prometheus · Grafana · Tempo · Loki · Promtail    │
-│  OTel Collector · node-exporter · cAdvisor · redis-exporter         │
-└──────────────────────────────────────────────────────────────────────┘
+Meanwhile (off critical path):
+   → Evaluation scoring per answer
+   → Dual-sink transcript (txt + observability)
+   → MongoDB audit log
+```
+
+### Key Capabilities
+
+| Capability | Details |
+|---|---|
+| **Voice-first** | Push-to-talk (desktop) or HTTP/WebSocket (cloud) |
+| **Structured interviews** | Domain rotation, level-adaptive questions, ATS intro extraction |
+| **PCM-native audio** | Zero file I/O between stages, 300–600 ms latency reduction |
+| **Barge-in detection** | Candidate can interrupt AI mid-sentence |
+| **Real-time evaluation** | Off-path scoring with adaptive sampling, budget caps, circuit breaker |
+| **Dual-sink transcripts** | Human .txt + structured MongoDB/observability |
+| **Three graph instances** | Standard, Realtime (tight SLA), Low-latency (balanced) |
+| **IP-locked sessions** | Redis-backed, HMAC-derived session fingerprints |
+| **50k LOC codebase** | 19 core modules, 7,555 lines in voice_graph alone |
+
+---
+
+## 2. System Architecture
+
+### High-Level System Diagram
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         VOICE INTERVIEW PIPELINE                              │
+│                                                                               │
+│  ┌──────────────┐         ┌───────────────────────────────────────────────┐   │
+│  │   CLIENT     │         │              FastAPI Gateway (main.py)        │   │
+│  │              │─HTTP───▶│  POST /voice        POST /session/register    │   │
+│  │  Web / App   │─WS─────▶│  WS   /voice/stream POST /session/end         │   │
+│  │  Desktop PTT │         │  GET  /health       GET  /metrics             │   │
+│  └──────────────┘         │  DEL  /cancel/{id}  POST /session/refresh     │   │
+│                           └────────────────┬──────────────────────────────┘   │
+│                                            │                                  │
+│                           ┌────────────────▼──────────────────────────────┐   │
+│                           │          voice_graph.py (Orchestration)       │   │
+│                           │                                               │   │
+│                           │  ┌─────────┐   ┌─────────┐   ┌─────────┐      │   │
+│                           │  │voice_   │   │voice_   │   │voice_   │      │   │
+│                           │  │graph    │   │graph_   │   │graph_   │      │   │
+│                           │  │(balanced│   │realtime │   │low_lat  │      │   │
+│                           │  │1 retry) │   │(0 retry │   │ency     │      │   │
+│                           │  │         │   │tight SLA│   │         │      │   │
+│                           │  └────┬────┘   └────┬────┘   └────┬────┘      │   │
+│                           │       └─────────────┴─────────────┘           │   │
+│                           │                    │                          │   │
+│  ┌─────────────────────────────────────────────┼───────────────────────┐  │   │
+│  │                PIPELINE STAGES              │                       │  │   │
+│  │                                             ▼                       │  │   │
+│  │   ┌──────────┐    ┌──────────┐    ┌──────────────┐    ┌────────┐    │  │   │
+│  │   │  node_   │───▶│  node_   │───▶│  node_       │───▶│node_   │    │  │   │
+│  │   │  stt     │    │  llm     │    │  sanitize    │    │tts     │    │  │   │
+│  │   │          │    │          │    │              │    │        │    │  │   │
+│  │   │Whisper   │    │GPT-5/4o  │    │27-step clean │    │tts-1-  │    │  │   │
+│  │   │Faster-W  │    │QA engine │    │TTS-safe text │    │hd      │    │  │   │
+│  │   └──────────┘    └──────────┘    └──────────────┘    └────────┘    │  │   │
+│  │         │               │                                  │        │  │   │
+│  │    ┌────▼────┐    ┌─────▼─────┐                      ┌─────▼───┐    │  │   │
+│  │    │stt_error│    │llm_error  │                      │tts_error│    │  │   │
+│  │    │(retry / │    │(retry /   │                      │(apology │    │  │   │
+│  │    │ abort)  │    │  abort)   │                      │  audio) │    │  │   │
+│  │    └─────────┘    └───────────┘                      └─────────┘    │  │   │
+│  └─────────────────────────────────────────────────────────────────────┘  │   │
+│                                                                               │
+│  ┌──────────────┐  ┌─────────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │  QA Engine   │  │  Eval Engine    │  │  Transcript  │  │  Session     │    │
+│  │              │  │                 │  │  Writer      │  │  Store       │    │
+│  │ qa_controller│  │ evaluation_     │  │              │  │              │    │
+│  │ .py          │  │ engine.py       │  │transcription │  │session_store │    │
+│  │              │  │                 │  │.py           │  │.py           │    │
+│  │ 4 stages:    │  │ Off-path scoring│  │ .txt + obs   │  │ Redis/LRU    │    │
+│  │ greeting     │  │ adaptive sample │  │ dual sink    │  │ IP-locked    │    │
+│  │ intro (ATS)  │  │ budget cap      │  │ async queue  │  │ HMAC hash    │    │
+│  │ interview    │  │ circuit breaker │  │              │  │              │    │
+│  │ complete     │  │                 │  │              │  │              │    │
+│  └──────────────┘  └─────────────────┘  └──────────────┘  └──────────────┘    │
+│                                                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │                        OBSERVABILITY STACK                               │ │
+│  │                                                                          │ │
+│  │   structlog (console+JSON)   Prometheus (:9090)   MongoDB (90-day TTL)   │ │
+│  │   OTel spans (OTLP/gRPC)    Grafana dashboards    Rich TUI (live)        │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Module Dependency Graph
+
+```
+                           main.py
+                          /       \
+                    controller.py  FastAPI routes
+                         |              |
+                   voice_graph.py ◄─────┘
+                  /     |      \
+           STT_   LLM_  TTS_   audio_engine.py
+           service service service     |
+              |      |      |    ┌─────┴──────┐
+              └──────┴──────┘    recorder.py  player.py
+                     |           opus_ffmpeg_io.py
+               sanitize.py
+                     |
+            ┌────────┼────────┐
+      qa_controller  │   evaluation_engine.py
+            │   session_store │
+     conversation_  │         │
+       memory.py  transcription.py
+                     │
+               observability.py
+                     │
+               shared.py ◄── settings.py
 ```
 
 ---
@@ -125,2205 +200,2387 @@ Both modes run the same `VoiceGraph` pipeline under the hood. The only differenc
 
 ```
 .
-├── .env                          # Environment configuration (never commit secrets)
-├── docker-compose.yaml           # Full observability stack
-│
 ├── app/
+│   ├── audio_essentials/
+│   │   ├── audio_engine.py          # PCM format, VAD, ring buffer, streams (7,141 LOC)
+│   │   ├── opus_ffmpeg_io.py        # FFmpeg Opus encode/decode (2,619 LOC)
+│   │   ├── recorder.py              # Microphone capture, PTT recording (998 LOC)
+│   │   └── player.py                # Audio playback, PCM-native path (900 LOC)
+│   │
 │   ├── common/
-│   │   ├── settings.py           # Pydantic Settings — validated at import time
-│   │   ├── shared.py             # Circuit breaker, rate limiter, OTel, logging
-│   │   └── log_config.py         # Dual-sink structured logging (Rich + JSON)
-│   │
-│   ├── orchestration/
-│   │   ├── voice_graph.py        # LangGraph pipeline engine (the core)
-│   │   └── pipeline.py           # Thin OO wrapper around voice_graph
-│   │
-│   ├── nodes/
-│   │   ├── STT_service.py        # Whisper transcription node
-│   │   ├── LLM_service.py        # GPT chat node with Redis cache
-│   │   ├── TTS_service.py        # OpenAI TTS synthesis node
-│   │   └── sanitize.py           # Output sanitizer and size limiter
-│   │
-│   ├── user_tracking/
-│   │   ├── session_service/
-│   │   │   ├── session_store.py        # IP-locked Redis session store
-│   │   │   └── conversation_memory.py  # History injection + topic tracking
-│   │   └── transcript/
-│   │       └── transcription.py        # Dual-sink transcript writer
+│   │   ├── settings.py              # Central config, startup validation (1,000 LOC)
+│   │   └── shared.py                # Circuit breakers, bulkheads, OTel, LRU (1,047 LOC)
 │   │
 │   ├── eval/
-│   │   └── evaluation_engine.py  # Off-path turn scoring engine
+│   │   └── evaluation_engine.py     # Off-path answer scoring (1,206 LOC)
+│   │
+│   ├── interview/
+│   │   └── qa_controller.py         # QA state machine, domain rotation (3,661 LOC)
 │   │
 │   ├── monitoring/
-│   │   └── observability.py      # Event taxonomy, emitters, Prometheus, OTel, Mongo
+│   │   └── observability.py         # 3-layer observability stack (8,178 LOC)
 │   │
-│   ├── audio_essentials/
-│   │   ├── player.py             # Low-latency local audio playback
-│   │   └── recorder.py           # Microphone capture (push-to-talk)
+│   ├── nodes/
+│   │   ├── STT_service.py           # Whisper node + PCM integration (3,046 LOC)
+│   │   ├── LLM_service.py           # GPT node, ATS + Interviewer modes (3,336 LOC)
+│   │   ├── TTS_service.py           # TTS node + PCM synthesis (3,056 LOC)
+│   │   └── sanitize.py              # 27-step TTS sanitizer (951 LOC)
 │   │
-│   ├── startup/
-│   │   └── startup_display.py    # Animated Rich boot banner
+│   ├── orchestration/
+│   │   └── voice_graph.py           # LangGraph pipeline orchestrator (7,555 LOC)
 │   │
-│   └── endpoint/
-│       └── main.py               # FastAPI gateway
+│   └── user_tracking/
+│       ├── session_service/
+│       │   └── session_store.py     # IP-locked Redis sessions (1,209 LOC)
+│       └── transcript/
+│           ├── transcription.py     # Dual-sink transcript writer (350 LOC)
+│           └── conversation_memory.py # QA audit bus (2,011 LOC)
 │
-├── app/orchestration/controller.py   # Desktop PTT controller
-│
+├── controller.py                    # Desktop PTT keyboard controller (615 LOC)
+├── main.py                          # FastAPI gateway (1,029 LOC)
+├── transcripts/                     # Per-session .txt transcripts (auto-created)
 ├── audio/
-│   ├── audio_INPUT/              # Uploaded/recorded audio (cleaned after each run)
-│   └── audio_OUTPUT/             # TTS synthesised audio files
-│
-├── transcripts/                  # Per-session .txt transcript files
-├── logs/                         # JSON structured log files
-└── infra/                        # Config files for Docker services
-    ├── redis/
-    ├── prometheus/
-    ├── loki/
-    ├── otel-collector/
-    └── grafana/
+│   ├── temp_IN/                     # Uploaded audio uploads
+│   └── temp_OUT/                    # TTS output files
+├── grafana/                         # Auto-generated dashboard JSON
+├── .env.example
+└── README.md
 ```
+
+**Total codebase: ~49,908 lines across 19 core modules.**
 
 ---
 
-## 4. Configuration & Settings
+## 4. Installation & Environment Setup
 
-**File:** `app/common/settings.py`
+### Prerequisites
 
-The `Settings` class is a Pydantic `BaseSettings` singleton that reads every environment variable the entire system uses, validates them at import time, and exits immediately with a clean error message if anything is wrong. No module in the system reads `os.environ` directly (except for a handful of bootstrap-time constants) — everything goes through `settings`.
-
-```python
-from app.common.settings import settings
-
-api_key   = settings.openai_api_key.get_secret_value()
-redis_url = settings.redis_url
-llm_model = settings.llm_model
-```
-
-**Why this matters:** A fat-fingered env var (e.g., `LLM_TEMPERATURE=abc`) is caught the instant the process starts, not three minutes later when the first request hits the LLM node. The error message is human-readable, not a raw Python traceback.
-
-### Key Validation Rules
-
-| What is checked | Behaviour on failure |
-|---|---|
-| `OPENAI_API_KEY` missing | Hard exit |
-| `SESSION_SECRET_KEY` missing in non-desktop mode | Hard exit |
-| `LLM_TEMPERATURE` outside 0.0–2.0 | Hard exit |
-| `STT_MAX_FILE_MB` > 25.0 | Hard exit (Whisper API ceiling) |
-| `TTS_VOICE` not in valid set | Hard exit |
-| `PIPELINE_TIMEOUT` < sum of stage timeouts | Hard exit (cross-field validator) |
-| `REDIS_MAX_CONN` < `LLM_MAX_CONCURRENT` | Hard exit (pool starvation check) |
-| `CORS_ORIGINS=*` in production | Warning, not exit |
-| `HOST=localhost` in production | Warning, not exit |
-| Unknown LLM model name | Warning, not exit |
-
-### Cross-Field Validators
-
-```python
-# pipeline_timeout must exceed the sum of all three stage timeouts
-# otherwise the outer wall-clock guard always fires before the per-stage guards
-if self.pipeline_timeout <= stage_sum:
-    raise ValueError(
-        f"PIPELINE_TIMEOUT ({self.pipeline_timeout}s) must be greater than "
-        f"GRAPH_STT_TIMEOUT + GRAPH_LLM_TIMEOUT + GRAPH_TTS_TIMEOUT ({stage_sum}s)."
-    )
-```
-
-### Derived Properties
-
-Settings exposes computed properties so callers never need to duplicate the calculation:
-
-```python
-settings.is_production            # True when ENV=production
-settings.s3_enabled               # True when either STT or TTS S3 bucket is set
-settings.graph_stage_timeout_sum  # STT + LLM + TTS timeout sum
-settings.node_bottleneck_concurrency  # min(stt, llm, tts) concurrent caps
-settings.uvicorn_reload           # True only in development
-```
-
-### Startup Checks
-
-```python
-await settings.check_redis()    # Ping Redis; raise if unreachable
-await settings.check_openai()   # Call models.list(); raise if key invalid
-settings.ensure_directories()  # Create audio_INPUT, audio_OUTPUT dirs
-```
-
-Call these from the FastAPI lifespan hook or `__main__` before accepting traffic.
-
-### Secret Handling
-
-`OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY` are declared as `SecretStr`. This means they never appear in logs, `repr()`, or any auto-generated API schema. Accessing them requires an explicit `.get_secret_value()` call.
-
----
-
-## 5. Shared Infrastructure (`shared.py`)
-
-**File:** `app/common/shared.py`
-
-This module is the plumbing that every other module imports. It provides structured logging, OpenTelemetry, Prometheus, a circuit breaker, a token-bucket rate limiter, a bounded LRU cache, a latency budget, a load shedding guard, a bulkhead pool, and QoS tier definitions — all in one place so no module reaches into multiple utility modules for these fundamentals.
-
-### Request ID Propagation
-
-Every request is assigned a UUID hex string that flows through the entire pipeline via a `contextvars.ContextVar`:
-
-```python
-from app.common.shared import new_request_id, current_request_id
-
-rid = new_request_id()          # generates and stores in contextvar
-rid = current_request_id()      # reads from contextvar (generates if missing)
-```
-
-This means any log line emitted from any node during a request automatically carries the request ID without being explicitly passed everywhere.
-
-### Circuit Breaker
-
-The `CircuitBreaker` class wraps any async callable. It tracks consecutive failures. After `failure_threshold` failures it opens the circuit and raises `CircuitBreakerOpen` immediately for `recovery_timeout` seconds, giving the downstream service time to recover.
-
-```python
-cb = CircuitBreaker(
-    name="openai_llm",
-    failure_threshold=5,
-    recovery_timeout=30.0,
-)
-
-# In the LLM node:
-result = await cb.call(llm_client.generate, prompt)
-```
-
-State transitions:
-- `CLOSED` → `OPEN`: after `failure_threshold` consecutive failures
-- `OPEN` → `HALF_OPEN`: after `recovery_timeout` seconds
-- `HALF_OPEN` → `CLOSED`: on first success
-- `HALF_OPEN` → `OPEN`: on failure in probe call
-
-### Token-Bucket Rate Limiter
-
-```python
-rl = RateLimiter(rate=10.0, burst=20.0)
-await rl.acquire()   # blocks until a token is available
-```
-
-`rate` is sustained tokens per second. `burst` is the maximum number of tokens that can accumulate when the limiter is idle (short-term surge capacity). This prevents accidental quota exhaustion under load spikes.
-
-### `LatencyBudget`
-
-The single most important voice-UX mechanism in the system. A `LatencyBudget` is created at the start of each request with an SLA deadline. It is stored in a `contextvars.ContextVar` so every node can check it without being explicitly passed a deadline object.
-
-```python
-with LatencyBudget.start(budget_ms=10_000, tier=QoSTier.STANDARD):
-    # Every node call inside here can check:
-    budget = LatencyBudget.current()
-    budget.check(stage="stt")   # raises LatencyBudgetExceeded if time is up
-```
-
-When `LatencyBudgetExceeded` is raised inside a node, the graph routes immediately to `error_terminal` without retrying — a retry after a blown SLA budget only makes things worse. This is fundamentally different from a transient exception, which the retry router handles.
-
-### `LoadSheddingGuard`
-
-Each `VoiceGraph` instance owns a `LoadSheddingGuard` with its own `max_inflight` counter. When a new `run()` call arrives and inflight requests already equal `max_inflight`, the guard raises `LoadSheddingRejected` immediately. This is a deliberate design decision: it's better to tell a caller "try again later" fast than to queue them into a multi-minute backlog.
-
-```python
-guard = LoadSheddingGuard(max_inflight=20)
-async with guard:
-    result = await pipeline.run(...)
-# LoadSheddingRejected raised instantly if at capacity
-```
-
-Because each of the three graph singletons (`voice_graph`, `voice_graph_realtime`, `voice_graph_low_latency`) has its own guard, a burst of standard requests cannot crowd out the realtime pool.
-
-### `BulkheadPool`
-
-A named-semaphore registry. Different node types each claim their own semaphore so a flood of STT requests cannot exhaust the LLM concurrency budget:
-
-```python
-bulkheads.acquire("stt_batch", limit=20)
-bulkheads.acquire("llm_stream", limit=10)
-```
-
-### `InMemoryLRU`
-
-A bounded async-safe LRU dictionary. Used as an automatic fallback when Redis is unreachable. Declared explicitly in `session_store.py` and `LLM_service.py`. When the Redis circuit breaker opens, reads and writes fall through to the LRU and a `degraded_mode` context manager reduces accepted concurrency to avoid overloading the model APIs.
-
-```python
-lru = InMemoryLRU(maxsize=1024)
-await lru.set("key", "value")
-value = await lru.get("key")   # None if evicted
-```
-
-### `QoSTier`
-
-```python
-class QoSTier(Enum):
-    REALTIME = "realtime"   # tightest timeouts, zero retries
-    STANDARD = "standard"   # balanced defaults
-    BATCH    = "batch"       # relaxed timeouts, higher retry budget
-```
-
-Used by `LatencyBudget` to set the SLA deadline and by `LoadSheddingGuard` to decide shed priority.
-
-### OpenTelemetry Setup
-
-Three-layer approach to prevent the "Failed to detach context" error that commonly plagues asyncio + OTel integrations:
-
-**Layer 1 — NoOp tracer when `OTEL_ENABLED=false`:** `get_tracer()` returns `_NOOP_TRACER`. Its `start_as_current_span()` is a plain `contextmanager` that yields without ever calling `otel_ctx.attach()` or `detach()`. The error is structurally impossible on this path.
-
-**Layer 2 — Patch `ContextVarsRuntimeContext.detach`:** Swallows `ValueError` before OTel's own error logger fires. This fixes the rare cross-task context mismatch when `OTEL_ENABLED=true` and a span is started inside a task copied from another context (which is what `run_coroutine_threadsafe()` does in the desktop controller).
-
-**Layer 3 — `logging.Filter` on `opentelemetry.context`:** The absolute backstop. Suppresses the specific "Failed to detach context" log message at the stdlib level regardless of whether layers 1 or 2 fired.
-
----
-
-## 6. Logging (`log_config.py`)
-
-**File:** `app/common/log_config.py`
-
-Two logging modes controlled by `LOG_MODE` env var:
-
-### `LOG_MODE=standard` (human-readable)
-
-Activates the `_DualSinkRenderer` which forks each log event into two independent sinks:
-
-**Sink A — Rich console:**
-```
-[10:33:49] [INFO]  ◈  stt_ok                    language=english  lat=3.301  size_mb=0.060
-[10:33:53] [INFO]  ◈  llm_ok                    model=gpt-5-mini  lat=3.278  cached=False
-[10:33:57] [INFO]  ♪  tts_ok                    voice=nova  chars=261  lat=4.706
-```
-
-Each event gets an icon and colour based on its prefix. STT events get `◈` in cyan, TTS events get `♪` in blue, pipeline events get `⚙` in white, session events get `⬡` in yellow, and so on. Key-value pairs are rendered compactly with aliases (`latency_s` → `lat`, `session_id` → `sid`, etc.).
-
-**Sink B — JSON file (`LOG_FILE`):** One JSON object per line, identical to the verbose/structlog format. Safe for Datadog, Loki, CloudWatch.
-
-The event dict is deep-copied before either sink mutates it, so both sinks always see the complete original record.
-
-### `LOG_MODE=verbose` (default)
-
-Pure JSON to stdout. Safe for CI pipelines and log aggregators. No Rich dependency at runtime.
-
-### Usage
-
-```python
-from app.common.shared import get_logger
-log = get_logger(__name__)
-
-log.info("stt_ok", language="english", latency_s=3.3)
-log.warning("session_ip_rebound", change_number=2)
-log.error("graph_llm_failed", error=str(exc))
-```
-
----
-
-## 7. Pipeline Orchestration (`voice_graph.py`)
-
-**File:** `app/orchestration/voice_graph.py`
-
-This is the heart of the system. It implements the STT → LLM → TTS pipeline as a LangGraph `StateGraph`, wiring nodes, error handlers, retry loops, routing functions, timeout guards, observability hooks, load shedding, and cancellation support into a single cohesive engine.
-
-### Graph Topology
-
-```
-START
-  └─► stt
-        ├── [ok]     → llm
-        └── [error]  → stt_error
-              ├── [retries remain, no abort] → stt   ← retry cycle
-              └── [exhausted / abort]        → error_terminal → END
-
-      llm
-        ├── [ok]     → sanitize → tts
-        │                         ├── [ok, IS_DEV]  → audio_sink_dev → END
-        │                         ├── [ok, !IS_DEV] → END
-        │                         └── [error]       → tts_error → error_terminal → END
-        └── [error]  → llm_error
-              ├── [retries remain, no abort] → llm   ← retry cycle
-              └── [exhausted / abort]        → error_terminal → END
-```
-
-**Two graph cycles exist:** `stt → stt_error → stt` and `llm → llm_error → llm`. LangGraph handles cycles natively. Each cycle terminates when the retry router returns `error_terminal` (retries exhausted) or succeeds.
-
-**`audio_sink_dev`** is only wired into the graph when `ENV=development`. The node object does not exist in production compiled graphs at all — zero overhead, no conditional check at request time.
-
-### `VoiceState` — Shared State Schema
-
-Every node in the graph reads from and writes to a `VoiceState` `TypedDict`. All fields are optional (except `audio_path`) so any node can safely call `.get()` without `KeyError`:
-
-```python
-class VoiceState(TypedDict, total=False):
-    audio_path:           str    # Required input
-    request_id:           str    # UUID hex, injected by _prepare_state
-    session_id:           str    # From caller; links to session_store
-    client_ip:            str    # For session IP-lock validation
-    mode:                 str    # "api" | "stream" | "realtime"
-    user_input:           str    # Whisper transcript
-    llm_response:         str    # Raw LLM output
-    cleaned_response:     str    # Post-sanitize output
-    audio_output:         str    # Local path or S3 URI to TTS audio
-    stt_retries:          int    # Retry counter for STT stage
-    llm_retries:          int    # Retry counter for LLM stage
-    abort_reason:         str    # Non-empty → skip retry, go to terminal
-    session_turn_appended: bool  # Guard against double turn persistence
-    degraded:             bool   # True if any stage failed gracefully
-    stage_latencies:      dict   # {"stt": 3.3, "llm": 3.2, "tts": 4.7}
-```
-
-### `VoicePipelineResult` — Stable Output Contract
-
-Every field is always present. Callers never need to guard against `KeyError`:
-
-```python
-class VoicePipelineResult(TypedDict):
-    request_id:          str
-    transcript:          str
-    llm_response:        str
-    cleaned_response:    str
-    audio_output:        str    # local file path
-    audio_s3_uri:        str    # empty when S3 not configured
-    error:               str
-    error_stage:         str
-    degraded:            bool
-    stage_latencies:     dict
-    pipeline_latency_s:  float
-    graph_version:       str
-    metadata:            dict   # stt_retries, llm_retries, etc.
-```
-
-### `VoiceGraphConfig` — Per-Instance Tuning
-
-Each `VoiceGraph` instance carries its own config, resolved from the settings singleton at construction time:
-
-```python
-@dataclass
-class VoiceGraphConfig:
-    stt_timeout:            float  # Per-stage wall-clock guard
-    llm_timeout:            float
-    tts_timeout:            float
-    max_inflight:           int    # LoadSheddingGuard capacity
-    default_tier:           QoSTier
-    max_stt_retries:        int
-    max_llm_retries:        int
-    min_prompt_chars:       int    # Gate: don't call LLM on "uh"
-    max_transcript_chars:   int    # Truncate before LLM call
-    max_llm_response_chars: int    # Cap before sanitize
-    max_tts_chars:          int    # Cap before TTS (OpenAI: 4096)
-    stt_llm_queue_depth:    int    # For stream_full() concurrent pipeline
-    llm_tts_queue_depth:    int
-```
-
-### Graph Construction: `_build_graph_for_instance()`
-
-The graph is built **once per `VoiceGraph` instance** inside `__init__`. Every node function is a closure over the instance's `stt`, `llm`, `tts`, and `cfg` — not module-level globals. This is what makes the three singletons genuinely independent: injecting test doubles or custom node implementations works correctly across all execution paths.
-
-```python
-def _build_graph_for_instance(
-    self,
-    stt: STTNodeProtocol,
-    llm: LLMNodeProtocol,
-    tts: TTSNodeProtocol,
-    cfg: VoiceGraphConfig,
-    is_dev: bool,
-) -> RunnableSerializable:
-    # All node functions defined as closures here
-    async def node_stt(state: VoiceState) -> VoiceState:
-        # uses stt (closed over), cfg (closed over)
-        ...
-    # ... node_llm, node_tts, node_sanitize, routing functions ...
-    builder = StateGraph(VoiceState)
-    builder.add_node("stt", node_stt)
-    # ... wire all edges ...
-    return builder.compile()
-```
-
-### Execution Modes
-
-**`run(state, timeout)`** — Standard batch execution. Awaits the full graph. Returns `VoicePipelineResult`. Used for `/voice` HTTP endpoint and desktop controller.
-
-```python
-result = await voice_graph.run(
-    {"audio_path": "/tmp/input.m4a", "session_id": "abc123", "mode": "api"},
-    timeout=120.0,
-)
-```
-
-**`stream(state)`** — Token streaming. Runs STT → LLM as streaming, yields LLM tokens as they arrive. Does not run TTS. Used for the WebSocket endpoint.
-
-```python
-async for token in voice_graph.stream(state):
-    await ws.send_json({"type": "token", "data": token})
-```
-
-**`stream_full(state)`** — Concurrent pipeline. STT runs first; as soon as the transcript is ready, LLM streams tokens into a `BoundedPipelineQueue`; as each sentence-boundary chunk accumulates, TTS synthesises it and yields audio bytes — all concurrently. This is the lowest-latency path to first audio.
-
-```python
-async for audio_bytes in voice_graph_realtime.stream_full(state):
-    await ws.send_bytes(audio_bytes)
-```
-
-### Per-Stage Retry Logic
-
-Each stage has a dedicated error handler node and routing function:
-
-```
-node_stt fails
-    → node_stt_error: increments state["stt_retries"]
-    → route_after_stt_error:
-        if abort_reason set:  → "error_terminal"
-        if retries <= max:    → "stt"          (retry loop)
-        if retries > max:     → "error_terminal"
-```
-
-The comparison is `retries <= max_retries` (not `<`) because `node_stt_error` has already incremented before the router runs:
-- 1st failure → `stt_retries` = 1, `max_stt_retries` = 1 → 1 ≤ 1 → retry
-- 2nd failure → `stt_retries` = 2, `max_stt_retries` = 1 → 2 > 1 → terminal
-
-### Graceful Degradation
-
-No stage failure surfaces a raw exception to the caller. Every error path eventually reaches `node_error_terminal`, which:
-
-1. Logs the failure with full context
-2. Sets `degraded = True`
-3. Fills `llm_response` and `cleaned_response` with a stage-appropriate apology string if they are empty
-4. Returns a complete `VoicePipelineResult` with the apology
-
-```python
-APOLOGY_STT = "I couldn't catch that. Could you try again?"
-APOLOGY_LLM = "I'm having trouble thinking right now. Please try again in a moment."
-APOLOGY_TTS = "I have a response but couldn't convert it to audio right now."
-```
-
-This means callers always get a well-formed response. They check `degraded` and `error_stage` to decide whether to show an error UI.
-
-### Cancellation
-
-Each in-flight `run()` call is tracked in `self._active_tasks: dict[str, asyncio.Task]`. External cancellation by `request_id`:
-
-```python
-cancelled = voice_graph.cancel(
-    request_id="abc123",
-    reason="user_interrupt",
-    source="controller",
-)
-```
-
-The cancellation context (`reason`, `source`, `requested_at`) is attached to the task object so any downstream `CancelledError` handler can inspect why the task was cancelled.
-
-### Prometheus Metrics
-
-```
-voice_pipeline_total                    — total runs by version/status/tier
-voice_pipeline_stage_errors_total       — errors by stage
-voice_pipeline_stage_retries_total      — retries by stage
-voice_pipeline_stage_latency_seconds    — per-stage latency histogram
-voice_pipeline_latency_seconds          — total pipeline latency histogram
-voice_pipeline_cancellations_total      — by stage
-voice_pipeline_active                   — currently in-flight gauge
-voice_pipeline_degraded_total           — graceful fallback counter
-voice_pipeline_load_shed_total          — requests rejected by shedder
-voice_pipeline_budget_breached_total    — SLA budget violations by stage
-voice_pipeline_stream_full_active       — concurrent stream_full sessions
-```
-
-### Three Singletons
-
-```python
-# Balanced defaults — one retry per stage
-voice_graph = VoiceGraph(version="v2")
-
-# Tight: 10s STT / 15s LLM / 8s TTS, zero retries, REALTIME tier
-voice_graph_realtime = VoiceGraph(
-    version="realtime",
-    config=VoiceGraphConfig(
-        stt_timeout=10.0, llm_timeout=15.0, tts_timeout=8.0,
-        max_inflight=30, default_tier=QoSTier.REALTIME,
-        max_stt_retries=0, max_llm_retries=0,
-    ),
-)
-
-# Medium: 15s / 20s / 12s, one retry, 50 inflight
-voice_graph_low_latency = VoiceGraph(
-    version="low_latency",
-    config=VoiceGraphConfig(
-        stt_timeout=15.0, llm_timeout=20.0, tts_timeout=12.0,
-        max_inflight=50, default_tier=QoSTier.STANDARD,
-        max_stt_retries=1, max_llm_retries=1,
-    ),
-)
-```
-
----
-
-## 8. STT Node (`STT_service.py`)
-
-**File:** `app/nodes/STT_service.py`
-
-Wraps the OpenAI Whisper API with every production resilience layer. The graph only ever calls the `STTNodeProtocol` interface — whether that resolves to a local node or a remote HTTP client is determined at startup by `get_stt_node()`.
-
-### `STTNodeProtocol`
-
-```python
-@runtime_checkable
-class STTNodeProtocol(Protocol):
-    async def transcribe(
-        self,
-        audio_path: str,
-        language: str | None = None,
-        prompt: str | None = None,
-        request_id: str | None = None,
-    ) -> STTResult: ...
-
-    def transcribe_stream(
-        self,
-        audio_path: str,
-        ...
-    ) -> AsyncIterator[STTSegment]: ...
-
-    async def health(self) -> ServiceHealthState: ...
-    async def close(self) -> None: ...
-```
-
-### `STTNode` — Local Implementation
-
-**Validation:** Before any API call, the node validates that the audio file exists, has a supported extension, is not empty, and does not exceed `STT_MAX_FILE_MB`. Path traversal attempts (`../`) are rejected.
-
-**Concurrency:** `asyncio.Semaphore(STT_MAX_CONCURRENT)` prevents more than N simultaneous Whisper calls. Combined with the token-bucket `RateLimiter`, this gives two-layer burst protection.
-
-**Circuit breaker:** Wraps the Whisper API call. Three consecutive failures open the breaker for 30 seconds.
-
-**Retries with jitter:** `backoff_retry()` wraps the underlying API call with exponential backoff and random jitter to prevent retry storms.
-
-**Confidence logging:** After transcription, `avg_logprob` across all segments is logged. Values below -1.0 indicate very low confidence (background noise, heavily accented speech, wrong language hint).
-
-**S3 integration:** If `STT_S3_BUCKET` is set, the source audio is downloaded from S3 rather than read from local disk. The completed transcript is uploaded back to S3 under `STT_S3_TRANSCRIPT_PREFIX`.
-
-**Streaming (`transcribe_stream`):** Splits the audio file into overlapping N-second `.wav` chunks, submits them to Whisper in parallel (bounded by `STT_STREAM_MAX_PARALLEL`), and yields `STTSegment` objects as each chunk completes. For files shorter than `STT_STREAM_SINGLE_PASS_THRESHOLD_S` (default 12s), it falls back to a single-pass non-streamed call — chunking overhead outweighs the latency benefit for short inputs.
-
-**Fast path (`transcribe_fast`):** Uses `response_format="text"` which skips segment metadata and returns plain text faster.
-
-**Local Whisper fallback:** If `STT_LOCAL_FALLBACK_URL` is set and the primary OpenAI endpoint fails, the node tries the local endpoint before the circuit breaker opens.
-
-### `RemoteSTTClient` — Distributed Mode
-
-When `STT_SERVICE_URL` is set, `get_stt_node()` returns a `RemoteSTTClient` instead of `STTNode`. The client calls the remote service over HTTPS using `httpx`:
-
-- Binary audio posted as `multipart/form-data`
-- W3C `traceparent` header injected for distributed trace continuity
-- `X-Latency-Budget-Ms` header forwarded so the remote service can self-abort if the SLA is already blown
-- Streaming uses SSE (`text/event-stream`), each event a JSON-serialised `STTSegment`
-- Circuit breaker wraps all remote calls
-- `backoff_retry` with 3 attempts and 1.5s base delay
-
-### `STTResult`
-
-```python
-class STTResult(TypedDict):
-    text:               str    # Full transcript
-    language:           str    # Detected language
-    duration_s:         float  # Audio duration
-    processing_s:       float  # Wall-clock Whisper latency
-    source:             str    # "local" or "s3"
-    s3_transcript_key:  str    # S3 key if uploaded, else ""
-```
-
-### `STTSegment` (streaming)
-
-```python
-class STTSegment(TypedDict):
-    text:        str
-    language:    str
-    start:       float   # Seconds from audio start
-    end:         float
-    avg_logprob: float   # Confidence indicator
-    chunk_index: int
-    is_final:    bool    # True on the last segment
-```
-
-### Prometheus Metrics
-
-```
-stt_requests_total              — by status/mode/provider
-stt_latency_seconds             — end-to-end latency histogram
-stt_time_to_first_segment_seconds  — stream TTFS
-stt_file_size_mb                — upload size distribution
-stt_chunks_per_stream           — chunks per streaming call
-stt_active_requests             — in-flight gauge
-stt_circuit_breaker_open        — 1 when breaker OPEN
-stt_latency_budget_exceeded_total
-```
-
----
-
-## 9. LLM Node (`LLM_service.py`)
-
-**File:** `app/nodes/LLM_service.py`
-
-Wraps OpenAI chat completions via LangChain, with a Redis response cache, stampede locks, dual circuit breakers (stream and batch), token-bucket rate limiting, fallback model, and `InMemoryLRU` fallback when Redis is down.
-
-### `LLMNodeProtocol`
-
-```python
-@runtime_checkable
-class LLMNodeProtocol(Protocol):
-    async def generate(
-        self,
-        prompt: str,
-        request_id: str | None = None,
-    ) -> dict[str, Any]: ...
-
-    async def stream(
-        self,
-        prompt: str,
-        request_id: str | None = None,
-    ) -> AsyncIterator[str]: ...
-
-    async def health(self) -> ServiceHealthState: ...
-    async def close(self) -> None: ...
-```
-
-### `LLMNode` — Local Implementation
-
-**System prompt:** `SYSTEM_PROMPT` is a module-level constant injected into every call as a `SystemMessage`. The graph's `node_llm` prepends conversation history and the current `user_input` as a `HumanMessage`. The LLM node itself never builds the full message list — that is the graph's responsibility.
-
-**Versioned cache key:** The Redis cache key encodes the model name, temperature, a hash of the system prompt, and a hash of the full prompt:
-
-```python
-key = make_versioned_cache_key(
-    prefix="llm:v3",
-    model=PRIMARY_MODEL,
-    temperature=TEMPERATURE,
-    system_hash=sha256(SYSTEM_PROMPT),
-    prompt_hash=sha256(prompt),
-)
-```
-
-Config changes (model switch, temperature change, system prompt edit) automatically bust all cached entries — no manual cache flush required.
-
-**Cache stampede lock:** When two concurrent requests arrive with identical prompts and neither is cached yet, without locking both would call the OpenAI API. The node uses a Redis `SETNX` lock keyed on the prompt hash:
-
-```python
-# Acquire lock → call API → store result → release lock
-# Second caller: waits on lock → reads cached result → returns
-```
-
-**Fallback model:** When the primary model's circuit breaker opens (3 consecutive failures), requests are rerouted to `LLM_FALLBACK_MODEL` automatically. The response carries `model_used` so callers can see which model actually answered.
-
-**Dual circuit breakers:** `_batch_breaker` and `_stream_breaker` are independent. A slow or failing streaming endpoint does not trip the batch breaker that serves synchronous `/voice` requests.
-
-**`InMemoryLRU` fallback:** If the Redis circuit breaker opens, cache reads fall through to an in-process LRU (bounded at 512 entries). `degraded_mode` is entered, which halves admitted concurrency to avoid flooding the model APIs during the Redis outage window.
-
-**Token usage logging:** Every response logs `prompt_tokens`, `completion_tokens`, and `total_tokens`. These feed the Prometheus histogram `llm_tokens_total` and the MongoDB event document.
-
-**`generate()` return shape:**
-
-```python
-{
-    "response":           str,    # LLM output text
-    "model_used":         str,    # actual model that answered
-    "cached":             bool,   # True if served from Redis/LRU
-    "prompt_tokens":      int,
-    "completion_tokens":  int,
-    "latency_s":          float,
-}
-```
-
-### `RemoteLLMClient` — Distributed Mode
-
-When `LLM_SERVICE_URL` is set, `get_llm_node()` returns a `RemoteLLMClient`. The client posts to the remote service's `/generate` endpoint. Streaming uses SSE. OTel headers and `X-Latency-Budget-Ms` are forwarded. The response shape is identical to the local node.
-
-### `stream_with_metadata()`
-
-Wraps `stream()` and emits a final `{"type": "metadata", ...}` dict after the last token. Used by WebSocket handlers that need both the token stream and final usage stats.
-
-### Prometheus Metrics
-
-```
-llm_requests_total                  — by status/mode/model
-llm_latency_seconds                 — histogram
-llm_time_to_first_token_seconds     — streaming TTFT
-llm_tokens_total                    — prompt + completion tokens
-llm_cache_hits_total
-llm_cache_misses_total
-llm_fallback_total                  — primary → fallback switches
-llm_circuit_open                    — gauge
-llm_active_requests                 — gauge
-llm_latency_budget_exceeded_total
-```
-
----
-
-## 10. TTS Node (`TTS_service.py`)
-
-**File:** `app/nodes/TTS_service.py`
-
-Wraps the OpenAI TTS API. Synthesises text to audio and writes the result to a local file. Optionally uploads to S3. Implements a background cleanup task that removes old local files based on `TTS_LOCAL_FILE_TTL`.
-
-### `TTSNodeProtocol`
-
-```python
-@runtime_checkable
-class TTSNodeProtocol(Protocol):
-    async def synthesise(
-        self,
-        text: str,
-        voice: str | None = None,
-        request_id: str | None = None,
-    ) -> TTSResult: ...
-
-    async def stream_synthesis(
-        self,
-        text: str,
-        voice: str | None = None,
-        request_id: str | None = None,
-    ) -> AsyncIterator[bytes]: ...
-
-    async def health(self) -> ServiceHealthState: ...
-    async def close(self) -> None: ...
-```
-
-### `TTSNode` — Local Implementation
-
-**Chunking:** OpenAI TTS accepts a maximum of 4096 characters per call. `GRAPH_MAX_TTS_CHARS` (default 4000) keeps the total below this ceiling. If the response exceeds the node's per-chunk limit, it is split on sentence boundaries and synthesised in parallel calls, then the chunks are concatenated in order.
-
-**Output file naming:** Each file is named `tts_{uuid_hex[:8]}.{format}` and written to `TTS_OUTPUT_DIR`. The full path is stored in `TTSResult.local_path` and returned to the graph as `audio_local_path`.
-
-**S3 upload:** If `TTS_S3_BUCKET` is set, the synthesised file is uploaded after local write. `TTSResult.s3_uri` carries the `s3://bucket/prefix/filename` URI.
-
-**Background file cleanup:** A `threading.Timer` schedules deletion of each file after `TTS_LOCAL_FILE_TTL` seconds. If S3 is enabled, local files are short-lived working copies that can be cleaned up quickly.
-
-**Circuit breaker + rate limiter:** Same pattern as STT. Three failures open the breaker for 30 seconds. The token-bucket limiter prevents accidental API quota exhaustion.
-
-**`TTSResult`:**
-
-```python
-class TTSResult(TypedDict):
-    local_path:   str     # Absolute path to the generated audio file
-    s3_uri:       str     # S3 URI or "" if not uploaded
-    voice:        str     # Voice used (nova, alloy, etc.)
-    chars:        int     # Characters synthesised
-    chunks:       int     # Number of API calls made
-    latency_s:    float
-```
-
-### `RemoteTTSClient` — Distributed Mode
-
-When `TTS_SERVICE_URL` is set, `get_tts_node()` returns a `RemoteTTSClient`. The client posts text to the remote service and receives audio bytes in the response body. Streaming synthesis uses SSE with binary chunks.
-
-### Prometheus Metrics
-
-```
-tts_requests_total
-tts_latency_seconds
-tts_chars_total
-tts_chunks_per_request
-tts_file_size_bytes
-tts_active_requests
-tts_circuit_open
-tts_s3_uploads_total
-tts_latency_budget_exceeded_total
-```
-
----
-
-## 11. Sanitize Node (`sanitize.py`)
-
-**File:** `app/nodes/sanitize.py`
-
-A pure function that runs between LLM and TTS. It never hard-fails — worst case it returns the input unchanged. Its jobs:
-
-1. **Size cap:** Truncates text to `max_chars` on a sentence boundary where possible (so TTS doesn't synthesise a mid-sentence cut). Sets `truncated=True` in the result if truncation occurred.
-
-2. **Prompt injection detection:** Scans for known injection patterns (`ignore previous instructions`, `you are now`, `[SYSTEM]`, etc.). Logs a warning and strips or neutralises the offending content.
-
-3. **Control character stripping:** Removes null bytes, form feeds, vertical tabs, and other non-printable characters that confuse TTS.
-
-4. **Length normalisation:** Collapses runs of whitespace and trims.
-
-```python
-from app.nodes.sanitize import sanitize
-
-result = sanitize(raw_text, max_chars=4000, request_id=rid)
-print(result.text)      # cleaned text
-print(result.truncated) # True if it was cut
-print(result.warnings)  # list of detected issues
-```
-
-The graph uses `node_sanitize` which wraps this function, logs via `SanitizeEmitter`, and records the OTel span.
-
----
-
-## 12. Session Store (`session_store.py`)
-
-**File:** `app/user_tracking/session_service/session_store.py`
-
-An IP-locked, Redis-backed session store. One active session per IP address at any given time. Raw IPs are never stored — only an HMAC-SHA256 derived fingerprint.
-
-### Security Design
-
-```
-client_ip  →  canonical_ip()  →  ip_hash = HMAC-SHA256(SESSION_SECRET_KEY, canonical_ip)
-                                  session_id = SHA256(ip_hash + urandom(16))
-```
-
-- `ip_hash` is one-way: given the hash, you cannot recover the IP without the secret key
-- `session_id` is non-reversible: it does not encode the IP
-- `SESSION_SECRET_KEY` rotation invalidates all existing sessions automatically (hashes no longer match)
-- Raw IPs never appear in Redis, logs, or API responses — only partially masked display strings (`127.0.*.*`)
-
-### Redis Key Layout
-
-```
-session:lock:v1:{ip_hash}      NX sentinel — only one session per IP
-session:data:v1:{session_id}   JSON blob — conversation state
-session:meta:v1:{ip_hash}      Maps ip_hash → session_id for lookup
-```
-
-All keys carry `TTL = SESSION_TTL_S + SESSION_GRACE_S`. The grace period ensures an in-flight request that arrives just as the TTL expires still sees the session data.
-
-### IP Change Handling
-
-Sessions allow up to `SESSION_MAX_IP_CHANGES` (default 3) IP address changes. This accommodates legitimate network changes (WiFi → mobile, NAT reassignment) while flagging actual session hijacking attempts:
-
-```
-change 1 → WARN: session_ip_rebound (changes_remaining=2)
-change 2 → WARN: session_ip_rebound (changes_remaining=1)
-change 3 → ERROR: session_suspended_ip_limit
-           → session ended, session_id invalidated
-           → next request gets SessionIPChangeLimitExceeded
-```
-
-### `SessionData`
-
-```python
-@dataclass
-class SessionData:
-    session_id:      str
-    ip_hash:         str
-    created_at:      float
-    last_active:     float
-    turns:           list[ConversationTurn]   # rolling window
-    suspended:       bool
-    ip_change_count: int
-    ip_change_log:   list[IPChangeEntry]
-    metadata:        dict
-```
-
-`ConversationTurn` holds `(user: str, assistant: str, ts: float)`. The rolling window is capped at `SESSION_MAX_TURNS` (default 20). Oldest turns are pruned first. `to_langchain_messages()` serialises the window to `[HumanMessage, AIMessage, ...]` pairs for LLM injection.
-
-### `InMemoryLRU` Fallback
-
-If Redis is unreachable, `session_store` falls back to an in-process LRU (bounded at `SESSION_LRU_SIZE`). Cross-process session uniqueness cannot be maintained in this mode — it is clearly documented as a degraded operating mode. The LRU fallback is logged as a warning and the `session_active` Prometheus gauge is updated.
-
-### FastAPI Routes
-
-Mounted at `/session` prefix in `main.py`:
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/session/register` | None | Register new session, returns `session_id` |
-| `POST` | `/session/end` | `X-Session-ID` | End session, release IP lock |
-| `GET` | `/session/status` | `X-Session-ID` | Turn count, elapsed time, IP change log |
-| `GET` | `/session/health` | None | Session store health |
-
-### `require_session` Dependency
-
-```python
-from app.user_tracking.session_service.session_store import require_session
-
-@app.post("/voice")
-async def voice_chat(session: SessionData = Depends(require_session)):
-    ...
-```
-
-This FastAPI dependency extracts `X-Session-ID` from the request header, resolves it against the session store, validates that the caller's IP matches, and returns the `SessionData`. On any failure it raises the appropriate `HTTPException` (401, 403, 404, or 409).
-
-### Prometheus Metrics
-
-```
-session_created_total
-session_ended_total       — by reason (explicit_end, ip_change_limit, ttl_expiry)
-session_rejected_total    — by reason (locked, ip_unresolvable)
-session_turns_total
-session_lru_hits_total
-session_lock_conflicts_total
-session_active            — gauge
-session_history_turns     — histogram of turn count at LLM call time
-```
-
----
-
-## 13. Conversation Memory (`conversation_memory.py`)
-
-**File:** `app/user_tracking/session_service/conversation_memory.py`
-
-Sits between `voice_graph.py` and `session_store.py`. Every pipeline call goes through two operations: `resolve()` before the LLM call, and `commit()` after the LLM response.
-
-### `resolve(session_id, user_text)`
-
-1. Loads `SessionData` from `session_store` (or LRU fallback)
-2. Builds the `InterviewState` snapshot (topics covered, current topic, question history, hint budget)
-3. Constructs the context prefix string that summarises interview progress
-4. Returns `MemoryContext` containing the full message list and the interview state
-
-```python
-memory_ctx = await conversation_memory.resolve(
-    session_id=session_id,
-    user_text=transcript,
-)
-# memory_ctx.messages         — LangChain message list
-# memory_ctx.interview_state  — InterviewState snapshot
-# memory_ctx.turn_index       — how many turns so far
-```
-
-### `commit(session_id, user_text, assistant_text)`
-
-1. Appends the completed turn to `session_store`
-2. Updates `InterviewState` (marks topic as covered, increments question/hint counters)
-3. Checks if history is approaching the rolling window cap → if so, triggers compression
-4. Writes to `transcript_writer`
-
-### History Compression
-
-When the session's turn count approaches `SESSION_MAX_TURNS`, older turns are collapsed into a summary injected as a `SystemMessage`. This means nothing is truly lost to pruning — the LLM always has context about what was discussed early in the interview, just in compressed form rather than verbatim.
-
-### `InterviewState`
-
-```python
-@dataclass
-class InterviewState:
-    current_topic:    str
-    topics_covered:   list[str]
-    questions_asked:  set[str]        # fingerprints for dedup
-    hint_budget:      dict[str, int]  # hints remaining per topic
-    follow_up_depth:  int             # consecutive follow-ups on same topic
-```
-
-### Question Dedup
-
-Each question the AI asks is fingerprinted (SHA256 of lowercased, punctuation-stripped text). The fingerprint is stored in `InterviewState.questions_asked`. Before the context prefix is built, these fingerprints are checked to prevent the interviewer from asking the same question twice in a session.
-
-### Prometheus Metrics
-
-```
-memory_resolves_total
-memory_commits_total
-memory_fallback_total        — LRU fallback activations
-memory_compressions_total    — history compression events
-memory_history_depth         — histogram of turn count at resolve() time
-```
-
----
-
-## 14. Evaluation Engine (`evaluation_engine.py`)
-
-**File:** `app/eval/evaluation_engine.py`
-
-Scores each candidate answer against a structured rubric using a dedicated reasoning model. Runs **entirely off the critical path** — all scoring is `asyncio.create_task()` fire-and-forget. TTS latency is never affected.
-
-### Off-Path Design
-
-```python
-# In voice_graph.py, after session_store.append_turn():
-evaluation_engine.schedule_turn(
-    session_id=session_id,
-    question=_question,
-    candidate_ans=transcript,
-    turn_index=len(_reloaded.turns) - 1,
-    request_id=rid,
-)
-# Returns immediately. Scoring happens in background.
-```
-
-The `schedule_turn()` method uses a `weakref` to the engine to avoid preventing garbage collection, creates a background task, and returns. If the event loop is shut down, in-flight evaluations are cancelled cleanly.
-
-### Cost Controls
-
-Every mechanism exists to cut token cost without degrading signal quality:
-
-**Adaptive sampling:** Full evaluation for the first `EVAL_ALWAYS_EVALUATE_TURNS` turns (default 3), then `1-in-EVAL_SAMPLE_RATE` sampling. Chatty candidates don't burn 10× the budget.
-
-**Per-session token budget:** A hard cap stored in Redis (`eval:budget:v1:{session_id}`). Once a session exhausts its budget, evaluation stops silently with a log warning.
-
-**Minimum answer gate:** Answers shorter than `EVAL_MIN_ANSWER_CHARS` (default 40 characters) are skipped. "Yes", "I don't know", and one-liners don't need scoring.
-
-**Prompt truncation:** Transcripts and LLM responses are capped at `EVAL_MAX_PROMPT_CHARS` before the scoring API call.
-
-**Tight completion cap:** `max_tokens` on the scoring chain constrains output size. Structured JSON scores don't need paragraphs.
-
-**Token-bucket rate limiter:** Separate from the main LLM limiter so evaluation cannot consume the interview quota.
-
-**Dedicated bulkhead:** Max `EVAL_MAX_CONCURRENT` parallel scoring calls.
-
-**Circuit breaker:** Three consecutive scoring failures open the breaker and pause evaluation until recovery.
-
-**Content-hash dedup:** Identical `(question, answer)` pairs return cached scores from Redis (`eval:dedup:v1:{session_id}:{turn_index}`).
-
-### Scoring Schema
-
-```python
-@dataclass
-class TurnScore:
-    turn_index:       int
-    technical:        float    # 0.0–1.0
-    communication:    float
-    problem_solving:  float
-    overall:          float
-    strengths:        list[str]
-    improvements:     list[str]
-    model_used:       str
-    tokens_used:      int
-    eval_latency_s:   float
-    skipped:          bool
-    skip_reason:      str
-```
-
-Scores are stored in Redis (`eval:score:v1:{session_id}:{turn_index}`) and can be retrieved at any time during or after the session.
-
-### Prometheus Metrics
-
-```
-eval_scheduled_total
-eval_completed_total
-eval_skipped_total          — by reason
-eval_failed_total
-eval_latency_seconds
-eval_tokens_total
-eval_budget_exhausted_total
-eval_circuit_open
-eval_active
-```
-
----
-
-## 15. Transcript Writer (`transcription.py`)
-
-**File:** `app/user_tracking/transcript/transcription.py`
-
-An async dual-sink transcript writer. All public methods are fire-and-forget coroutines — they enqueue the write and return immediately. A single background task drains the queue and does the actual I/O.
-
-### Two Sinks
-
-**Sink A — Human-readable `.txt` file (per session):**
-```
-────────────────────────────────────────────────────────────
-Session  : 7aab4993867a2f04c64a36fd51875b12...
-Started  : 2026-02-22 10:33:43 UTC
-────────────────────────────────────────────────────────────
-[10:33:49] [7aab4993]   Tell me about system design.
-[10:33:53] [AI]         System design involves...
-
-```
-
-Named `session_{sid[:16]}.txt` and written to `TRANSCRIPT_DIR`. Simple, grep-able, shareable with candidates for review.
-
-**Sink B — Observability (`emit()`):**
-
-Each turn emits an `ObsEvent` with `EventKind.TRANSCRIPT_TURN`. This fans out to structlog (JSON log), Prometheus (`ai_transcript_turns_total`), MongoDB, and OTel simultaneously.
-
-### Usage
-
-```python
-from app.user_tracking.transcript.transcription import transcript_writer
-
-await transcript_writer.open_session(session_id)     # writes header
-await transcript_writer.write_turn(
-    session_id=session_id,
-    user_text="Tell me about system design.",
-    assistant_text="System design involves...",
-    request_id=rid,
-)
-await transcript_writer.close_session(session_id)    # writes footer
-await transcript_writer.flush(timeout=5.0)           # graceful shutdown drain
-```
-
-### Queue and Backpressure
-
-The internal `asyncio.Queue` has a depth of `TRANSCRIPT_QUEUE_DEPTH` (default 512). If the queue fills up (e.g., disk I/O is blocked), `_enqueue()` drops the entry and calls `TranscriptEmitter.queue_drop()` — the pipeline is never back-pressured by transcript I/O.
-
----
-
-## 16. FastAPI Gateway (`main.py`)
-
-**File:** `app/endpoint/main.py`
-
-The HTTP boundary. Handles upload validation, session auth, request routing, timeout, and response shaping. All pipeline logic stays in `voice_graph.py`.
-
-### Application Setup
-
-```python
-app = FastAPI(
-    title="Voice Assistant API",
-    docs_url=None,       # self-hosted at /docs
-    redoc_url=None,
-    openapi_url=None,    # self-hosted at /openapi.json
-    lifespan=_lifespan,
-)
-```
-
-The OpenAPI schema is built lazily on the first `/openapi.json` request (not at import time) to avoid a race with uvicorn's reloader process. The schema is patched to include the `X-Session-ID` `apiKey` security scheme.
-
-### Lifespan
-
-```python
-@asynccontextmanager
-async def _lifespan(app):
-    _obs_bootstrap(start_prometheus=False, start_mongo=True, write_grafana=True, start_otel=True)
-    log.info("api_startup", version=GRAPH_VERSION)
-    yield
-    # On shutdown: drain all three graph instances concurrently
-    await asyncio.gather(*(g.shutdown() for g in _ALL_GRAPHS), return_exceptions=True)
-```
-
-`start_prometheus=False` because `shared.py` already bound its own registry to `prom_registry`. Both registries are served together on `/metrics`.
-
-### Upload Validation (`_validate_upload`)
-
-Before the pipeline runs, every audio upload is validated:
-1. File extension must be in `SUPPORTED_EXTENSIONS` (`.wav`, `.mp3`, `.mp4`, `.m4a`, `.webm`, `.mpeg`, `.mpga`)
-2. MIME type checked against `SUPPORTED_MIME_TYPES`
-3. File size must be nonzero and ≤ `MAX_UPLOAD_MB`
-
-### Endpoints
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `POST` | `/voice` | `X-Session-ID` | Full pipeline, returns JSON with audio path |
-| `WS` | `/voice/stream` | `X-Session-ID` header | WebSocket token streaming |
-| `POST` | `/session/register` | None | Register new session |
-| `POST` | `/session/end` | `X-Session-ID` | End session |
-| `GET` | `/session/status` | `X-Session-ID` | Session status |
-| `POST` | `/ping` | `X-Session-ID` | Auth smoke-test |
-| `POST` | `/cancel/{request_id}` | None | Cancel in-flight pipeline |
-| `POST` | `/interrupt` | None | Cancel most recent pipeline |
-| `GET` | `/health` | None | Aggregate node health |
-| `GET` | `/metrics` | None | Prometheus metrics |
-| `GET` | `/docs` | None | Swagger UI |
-| `GET` | `/openapi.json` | None | OpenAPI schema |
-
-### `_ok_response` — Stable Response Contract
-
-```python
-{
-    "request_id":         "ed175235780f19ee...",
-    "transcript":         "Tell me about system design.",
-    "response":           "System design involves...",
-    "cleaned_response":   "System design involves...",
-    "audio":              "audio/audio_OUTPUT/tts_ebaa5613.mp3",
-    "audio_s3_uri":       "",
-    "degraded":           false,
-    "error":              "",
-    "error_stage":        "",
-    "stage_latencies":    {"stt": 3.3, "llm": 3.3, "tts": 4.7},
-    "pipeline_latency_s": 11.3,
-    "graph_version":      "v2",
-    "metadata":           {"stt_retries": 0, "llm_retries": 0}
-}
-```
-
-All fields are always present. `degraded=true` with a non-empty `error` field signals a graceful fallback.
-
-### WebSocket Protocol (`/voice/stream`)
-
-```
-Client → Server:
-  Message 1: binary audio bytes
-  Message 2 (optional): JSON {"language": "en", "tts_voice": "nova"}
-
-Server → Client:
-  {"type": "token",    "data": "System"}
-  {"type": "token",    "data": " design"}
-  ...
-  {"type": "done",     "request_id": "...", "full_response": "..."}
-  {"type": "error",    "error": "..."} on failure
-```
-
-### Observability Middleware
-
-Every HTTP request passes through `_observability_middleware`:
-1. Assigns or reads `X-Request-ID`
-2. Extracts W3C `traceparent`/`tracestate` from upstream callers
-3. Starts an OTel span for the HTTP request
-4. Records `api_requests_total`, `api_request_latency_seconds`
-5. Adds `X-Request-ID` and `X-Trace-ID` to every response header
-
----
-
-## 17. Desktop Controller (`controller.py`)
-
-**File:** `app/orchestration/controller.py`
-
-The desktop input layer. Handles keyboard events, audio recording, session management, and pipeline dispatch. All pipeline logic stays in `voice_graph.py`.
-
-### Architecture
-
-A single asyncio event loop runs on a **background thread** for the lifetime of the process. The main thread runs the keyboard polling loop synchronously. Pipeline dispatches use `run_coroutine_threadsafe()` — one loop, zero teardown overhead per PTT press, clean cancellation semantics.
-
-```
-Main thread (synchronous):
-  keyboard.is_pressed(PTT_KEY) loop
-    ↓ PTT held
-    record_audio_until_released()   ← blocks main thread during recording
-    ↓ PTT released
-    run_coroutine_threadsafe(_dispatch(path), loop)
-
-Background asyncio loop thread:
-  _dispatch(path):
-    session = await session_store.register(local_ip)
-    result  = await voice_graph.run(state)
-    if result["audio_output"]:
-        play_audio(result["audio_output"])
-```
-
-### PTT Flow
-
-1. `keyboard.is_pressed(PTT_KEY)` detects the press
-2. Any in-flight pipeline is cancelled (`voice_graph.cancel()`)
-3. Any audio currently playing is stopped (`stop_all()`)
-4. `record_audio_until_released()` captures microphone audio until the key is released
-5. If the recording is non-empty, it is saved to `audio_INPUT/` and dispatched
-6. `_dispatch()` runs the full pipeline asynchronously and plays the result
-
-### Session Registration
-
-The controller registers a new session using the machine's outbound IP:
-
-```python
-def _get_local_ip() -> str:
-    """UDP connect trick — no packet sent, but OS selects correct source interface."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-```
-
-The session is re-registered per dispatch if the existing session has expired. The session ID is carried in all pipeline state so conversation history persists across PTT presses within a session.
-
-### Startup Display
-
-In `LOG_MODE=standard`, the controller renders an animated boot banner before entering the PTT loop:
-
-```
-  Voice Assistant
-  ───────────────────────────────────────────
-  STT             ████████████████████████  whisper-1               ✓
-  LLM             ████████████████████████  gpt-5-mini              ✓
-  TTS             ████████████████████████  tts-1 / nova            ✓
-  Session Store   ████████████████████████  redis + lru             ✓
-  ───────────────────────────────────────────
-          PTT   Hold H to talk
-          Exit  ESC
-  ───────────────────────────────────────────
-```
-
-### Graceful Shutdown
-
-`EXIT_KEY` press or `SIGTERM`/`SIGINT`:
-1. Sets `_shutdown_event`
-2. Cancels active pipeline task
-3. Drains active audio playback
-4. Calls `evaluation_engine.shutdown()` to flush pending scores
-5. Calls `transcript_writer.flush()` to drain pending writes
-6. Calls `voice_graph.shutdown()` to cancel all tasks and close node connections
-7. Calls `loop.stop()`; joins the loop thread with `LOOP_JOIN_TIMEOUT`
-
-### Config
-
-```
-PTT_KEY               = h       (hold to talk)
-EXIT_KEY              = esc
-POLL_INTERVAL_S       = 0.03    (~33 Hz key polling)
-DEBOUNCE_S            = 0.35    (prevents key bounce double-trigger)
-INTERRUPT_DRAIN_S     = 0.05    (drain window after cancel signal)
-LOOP_DRAIN_S          = 0.10    (drain window before loop.stop())
-LOOP_JOIN_TIMEOUT     = 3.0     (thread join timeout)
-```
-
----
-
-## 18. Audio Recorder (`recorder.py`)
-
-**File:** `app/audio_essentials/recorder.py`
-
-Captures microphone audio while the PTT key is held. Returns raw `.wav` bytes.
-
-**Implementation:** Uses `sounddevice.InputStream` with a callback that appends PCM frames to a thread-safe buffer. Recording stops when the PTT key is released. The buffer is assembled into a `.wav` file via the `wave` module.
-
-**Empty recording detection:** If the total recorded duration is below a threshold (e.g., 0.2 seconds), the recording is considered empty (accidental key tap) and the pipeline is not dispatched. `ControllerEmitter.empty_recording()` fires to increment the `ai_controller_empty_recordings_total` counter.
-
-**Silence detection (optional):** If `RECORDER_SILENCE_THRESHOLD_DB` is set, the recorder tracks RMS power and stops early if prolonged silence is detected (user finished speaking but forgot to release the key).
-
----
-
-## 19. Audio Player (`player.py`)
-
-**File:** `app/audio_essentials/player.py`
-
-Two playback paths sharing the physical device. Mutually exclusive by design.
-
-### File Path: `play_audio(path)`
-
-Decodes the audio file (MP3, WAV, etc.) using `soundfile` and plays it via `sounddevice.play()` on a worker thread. `on_complete` callback is called when playback finishes. Supports `gain_db` adjustment.
-
-### Stream Path: `play_audio_bytes(buf)`
-
-For `stream_full()` partial-TTS streaming. Each call receives a chunk of PCM audio bytes and enqueues them onto a bounded queue. A persistent `sounddevice.OutputStream` is opened once and kept alive between chunks, eliminating the 50–150 ms PortAudio device-open cost on every sentence.
-
-**Latency optimisations:**
-
-1. **Persistent OutputStream** — opened once per streaming session, not per chunk. Eliminates device-open cost.
-2. **Dedicated writer thread + bounded queue** — `play_audio_bytes()` decodes bytes → PCM (~1–5 ms) then enqueues and returns in ~μs. The 20–50 ms `write()` call happens on the writer thread, off the async event loop.
-3. **`latency='low'`** — asks PortAudio for its minimum safe hardware buffer, saving 10–30 ms of output-buffer depth.
-4. **Silent warmup chunk** — written immediately after stream open to prime the driver pipeline so the first real audio chunk doesn't pay the cold-start penalty.
-5. **No lock on the write path** — the writer thread owns the `OutputStream` exclusively.
-
-### Control
-
-```python
-stop_audio()      # stops file-path playback
-stop_stream()     # drains queue, stops stream-path playback
-stop_all()        # both paths
-is_playing()      # True if file-path playback active
-is_streaming()    # True if stream-path active
-```
-
----
-
-## 20. Observability Stack (`observability.py`)
-
-**File:** `app/monitoring/observability.py`
-
-The single observability kernel that every component in the system uses to emit events. A single `emit()` call fans out simultaneously to four independent sinks.
-
-### Four Sinks
-
-1. **structlog** → Rich console + JSON file (via `log_config.py`)
-2. **Prometheus** → counters, histograms, gauges on `/metrics`
-3. **MongoDB** → one structured document per event for historical analysis
-4. **OpenTelemetry** → span attributes/events for trace correlation
-
-### `ObsEvent`
-
-```python
-@dataclass
-class ObsEvent:
-    kind:           str | EventKind   # event type
-    service:        str               # "stt" | "llm" | "tts" | ...
-    session_id:     str = ""
-    request_id:     str = ""
-    ts:             float = 0.0       # defaults to time.time()
-    transcript:     str = ""
-    transcript_chars: int = 0
-    latency_ms:     float = 0.0
-    model:          str = ""
-    error:          str = ""
-    extra:          dict = field(default_factory=dict)
-```
-
-### `EventKind` Taxonomy
-
-```python
-class EventKind(str, Enum):
-    # Pipeline lifecycle
-    PIPELINE_START  = "pipeline_start"
-    PIPELINE_DONE   = "pipeline_done"
-    PIPELINE_RETRY  = "pipeline_retry"
-
-    # Stage events
-    STT_START = "stt_start";  STT_OK = "stt_ok";  STT_FAILED = "stt_failed"
-    LLM_START = "llm_start";  LLM_OK = "llm_ok";  LLM_FAILED = "llm_failed"
-    TTS_START = "tts_start";  TTS_OK = "tts_ok";  TTS_FAILED = "tts_failed"
-
-    # Session
-    SESSION_REGISTERED = "session_registered"
-    SESSION_ENDED      = "session_ended"
-
-    # Evaluation
-    EVAL_SCORED = "eval_scored"
-    EVAL_SKIPPED = "eval_skipped"
-
-    # Transcript
-    TRANSCRIPT_TURN = "transcript_turn"
-    # ... etc.
-```
-
-### Emitter Classes
-
-Each service has a typed emitter class with static methods:
-
-```python
-STTEmitter.start(session_id, request_id, model, ...)
-STTEmitter.ok(session_id, request_id, latency_ms, language, ...)
-STTEmitter.failed(session_id, request_id, error, error_type)
-
-LLMEmitter.start(...)
-LLMEmitter.ok(..., cache_hit, model_used, prompt_tokens, ...)
-LLMEmitter.failed(...)
-
-TTSEmitter.start(...)
-TTSEmitter.ok(..., voice, chars, chunks, ...)
-TTSEmitter.failed(...)
-
-PipelineEmitter.start(...)
-PipelineEmitter.done(...)
-PipelineEmitter.retry(...)
-
-SessionEmitter.registered(...)
-SessionEmitter.ended(...)
-SessionEmitter.ip_rebound(...)
-
-ControllerEmitter.ptt_pressed(...)
-ControllerEmitter.ptt_released(...)
-ControllerEmitter.empty_recording(...)
-```
-
-### MongoDB Sink
-
-The MongoDB writer runs on a **background thread** with an `asyncio.Queue`. Every `emit()` call puts a document on the queue without blocking. The writer thread drains the queue and inserts documents into `MONGO_DB.MONGO_COLLECTION`. Documents are full `ObsEvent` serialisations plus timestamp, session, and request IDs.
-
-### OTel Span Context Managers
-
-```python
-async with pipeline_span(session_id, request_id) as span:
-    span.set_attribute("version", GRAPH_VERSION)
-
-async with stt_span(session_id, request_id, model) as span:
-    result = await stt_node.transcribe(audio_path)
-    span.set_attribute("language", result["language"])
-    span.set_attribute("latency_s", result["processing_s"])
-```
-
-### Bootstrap
-
-```python
-from app.monitoring.observability import bootstrap
-
-bootstrap(
-    start_prometheus=True,   # bind /metrics HTTP server
-    start_mongo=True,        # start MongoDB writer thread
-    write_grafana=True,      # write provisioning YAML + dashboard JSON
-    start_otel=True,         # initialize TracerProvider + MeterProvider
-)
-```
-
-Protected by `_bootstrap_lock` and `_bootstrapped` flag — idempotent, safe to call multiple times. The `_bootstrapped` flag is module-level and resets on process restart, so each new process bootstraps exactly once.
-
-### Grafana Dashboard Auto-Provisioning
-
-`write_grafana_dashboard()` writes all required files to the paths that Grafana's file provisioner watches:
-
-```
-infra/grafana/dashboards/ai_pipeline.json        — main dashboard
-infra/grafana/provisioning/datasources/
-    prometheus.yaml
-    tempo.yaml
-    loki.yaml
-infra/grafana/provisioning/dashboards/ai_pipeline.yaml
-```
-
-The dashboard includes panels for active pipelines, active sessions, pipeline P99 latency, stage latency percentiles, load shedding and degraded rates, STT edge cases, audio duration distribution, LLM latency, TTS latency, circuit breaker states, rate limiter events, evaluation scores, and session IP change events.
-
----
-
-## 21. Pipeline Wrapper (`pipeline.py`)
-
-**File:** `app/orchestration/pipeline.py`
-
-A thin object-oriented wrapper around `voice_graph` for callers that prefer an OO interface or need a simple integration point for testing:
-
-```python
-from app.orchestration.pipeline import VoicePipeline
-
-pipeline = VoicePipeline()
-result = await pipeline.run("audio/input.wav")
-
-print(result["transcript"])
-print(result["llm_response"])
-print(result["audio_output"])
-```
-
-This is intentionally minimal. For full control over session_id, mode, language, cancellation, and streaming, use `voice_graph` directly.
-
----
-
-## 22. Startup Display (`startup_display.py`)
-
-**File:** `app/startup/startup_display.py`
-
-Renders an animated boot banner in `LOG_MODE=standard` using Rich. Called once from `controller.py` before the PTT loop starts:
-
-```python
-from app.startup.startup_display import show_boot_sequence
-
-show_boot_sequence([
-    {"label": "STT",           "model": settings.stt_model,                    "status": "ok"},
-    {"label": "LLM",           "model": settings.llm_model,                    "status": "ok"},
-    {"label": "TTS",           "model": f"{settings.tts_model}/{settings.tts_voice}", "status": "ok"},
-    {"label": "Session Store", "model": "redis + lru",                          "status": "ok"},
-], ptt_key="H", exit_key="ESC")
-```
-
-Each module gets an animated progress bar that fills in 24 steps at ~18 ms each, then shows a status icon (`✓`, `⚠`, `—`, `✗`). After the bars complete, the key-binding summary is displayed.
-
----
-
-## 23. Docker Compose & Infrastructure
-
-**File:** `docker-compose.yaml`
-
-Provisions the complete observability stack. The Python app runs on the **host** (not in Docker). Prometheus reaches it via `host.docker.internal:${PROMETHEUS_PORT}`.
-
-### Three Isolated Networks
-
-```
-backend      — Redis, MongoDB, redis-exporter
-               Data tier, completely isolated from observability tier
-               A compromised observability container cannot reach session data
-
-observability — Prometheus, Grafana, Tempo, OTel, Loki, Promtail
-               Telemetry tier — all metrics/traces/logs pipeline
-
-metrics      — node-exporter, cAdvisor, Prometheus
-               Host-metrics tier, separate from backend
-```
-
-### Services
-
-| Service | Image | Ports | Purpose |
-|---|---|---|---|
-| `redis` | `redis:7.2-alpine` | 6379 | Session store + LLM cache |
-| `redis-exporter` | `oliver006/redis_exporter` | 9121 | Redis → Prometheus |
-| `mongo` | `mongo:7` | 27017 | Observability event sink |
-| `prometheus` | `prom/prometheus:v2.50` | 9090 | Metrics scrape + storage |
-| `grafana` | `grafana/grafana:10.4.0` | 3000 | Dashboards |
-| `tempo` | `grafana/tempo:2.4.0` | 3200, 4317 | OTel trace storage |
-| `otel` | `otel/opentelemetry-collector-contrib` | 4318, 4319 | OTel collector relay |
-| `loki` | `grafana/loki:2.9.4` | 3100 | Log aggregation |
-| `promtail` | `grafana/promtail:2.9.4` | — | Docker logs → Loki |
-| `node-exporter` | `prom/node-exporter:v1.7` | 9100 | Host OS metrics |
-| `cadvisor` | `gcr.io/cadvisor/cadvisor:v0.47` | 8080 | Container metrics |
-
-### Redis Configuration Highlights
-
-```
---requirepass ${REDIS_PASSWORD}      # auth
---appendonly yes                     # AOF persistence (≤1s data loss)
---appendfsync everysec
---maxmemory 512mb                    # hard cap, prevents OOM
---maxmemory-policy allkeys-lru       # evict LRU on memory pressure
---io-threads 4                       # parallelise network I/O
---io-threads-do-reads yes
---activedefrag yes                   # background jemalloc defrag
---notify-keyspace-events Kxg         # session expiry notifications
-```
-
-Redis serves three workloads:
-- `llm:v3:*` — LLM response cache (TTL = `LLM_CACHE_TTL`)
-- `llm:stampede:*` — cache stampede locks (TTL = 30s)
-- `session:lock:v1:*`, `session:data:v1:*`, `session:meta:v1:*` — session state
-
-### Tempo Configuration Highlights
-
-```yaml
-metrics_generator:
-  processor:
-    service_graphs:   # span → Prometheus service graph metrics
-    span_metrics:     # span → Prometheus histogram metrics
-      dimensions:
-        - ai.pipeline.stage
-        - ai.pipeline.qos_tier
-        - gen_ai.response.model
-        - ai.stt.language
-        - ai.tts.voice
-```
-
-Tempo generates Prometheus metrics from span data, enabling Grafana's service map panel and log-to-trace correlation via `tracesToMetrics`.
-
-### Promtail Pipeline
-
-Scrapes all Docker container logs via the Docker API and ships them to Loki:
-
-1. **Docker envelope unwrap:** `{"log": "...", "stream": "...", "time": "..."}` → inner log line
-2. **Timestamp:** Uses Docker's timestamp as the Loki log timestamp for accurate correlation
-3. **JSON parse:** Extracts `trace_id`, `span_id`, `session_id`, `level`, `kind`
-4. **Label promotion:** Only `level` and `kind` become Loki index labels (low cardinality). `trace_id` and `session_id` stay in the log body to avoid index explosion — query with `| json | trace_id="<value>"`
-5. **Output:** Sets log line to the inner structlog JSON, discarding the Docker envelope
-
-### Loki Datasource `derivedFields`
-
-Two `derivedFields` are configured so clicking a `trace_id` in a Loki log line opens that trace in Tempo:
-
-```yaml
-derivedFields:
-  - matcherRegex: '"trace_id":"([a-f0-9]{32})"'   # JSON format
-    name: TraceID
-    url: '${__value.raw}'
-    datasourceUid: tempo
-  - matcherRegex: 'trace_id=([a-f0-9]{32})'         # standard format
-    name: TraceID
-    url: '${__value.raw}'
-    datasourceUid: tempo
-```
-
-### Required `.env` Keys for Docker Stack
-
-```
-GRAFANA_PASSWORD=
-REDIS_PASSWORD=
-MONGO_USERNAME=admin
-MONGO_PASSWORD=
-PROMETHEUS_PORT=9091
-```
-
-> **Windows note:** `promtail`, `node-exporter`, and `cadvisor` require Linux kernel interfaces and will fail on Windows Docker Desktop. Comment them out — everything else works fine.
-
----
-
-## 24. Execution Modes
-
-### `mode="api"` (HTTP, batch)
-
-Used by `POST /voice`. Full STT → LLM → TTS pipeline. Returns `VoicePipelineResult` as JSON. Audio is written to `audio_OUTPUT/`. The response includes the local file path.
-
-### `mode="stream"` (WebSocket, token streaming)
-
-Used by `GET /voice/stream`. STT + LLM stream only (no TTS). Each LLM token is sent as a WebSocket JSON message. Final message includes `full_response`. Callers are responsible for their own TTS if needed.
-
-### `mode="realtime"` (stream_full, concurrent pipeline)
-
-STT, LLM, and TTS run concurrently using `BoundedPipelineQueue` inter-stage queues. As soon as the STT transcript is ready, LLM starts streaming. As each sentence-boundary token chunk accumulates, TTS synthesises it and yields audio bytes. This achieves the lowest time-to-first-audio at the cost of higher per-request resource use.
-
-### Desktop vs API mode
-
-| Aspect | Desktop (`APP_MODE=desktop`) | API (`APP_MODE=api`) |
+| Requirement | Version | Notes |
 |---|---|---|
-| Input | Keyboard PTT + microphone | HTTP file upload or WebSocket |
-| Output | Local speaker playback | JSON response + audio file path |
-| Session | Auto-registered from local IP | Manual `POST /session/register` |
-| SECRET_KEY | Auto-generated ephemeral | Must be set in `.env` |
-| Audio sink | `player.play_audio()` | File on disk or S3 |
+| Python | 3.11+ | 3.12 recommended |
+| Redis | 7.0+ | Required for sessions; LRU fallback available |
+| MongoDB | 6.0+ | Optional; disables structured event storage if absent |
+| FFmpeg | 6.0+ | Required for Opus encode/decode and PCM transcoding |
+| PortAudio | 19+ | Required for mic/speaker (desktop mode only) |
+| CUDA | Optional | Faster-Whisper GPU acceleration |
 
----
+### Installation
 
-## 25. Data Flow: End-to-End Walkthrough
+```bash
+# Clone and enter repo
+git clone https://github.com/your-org/voice-interview-pipeline.git
+cd voice-interview-pipeline
 
-### API Mode: Single Request
+# Create a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
+# Install dependencies
+pip install -r requirements.txt
+
+# Install system dependencies (Ubuntu/Debian)
+sudo apt-get install -y ffmpeg portaudio19-dev libsndfile1
+
+# macOS
+brew install ffmpeg portaudio libsndfile
+
+# Verify FFmpeg is available
+ffmpeg -version
 ```
-1. Client: POST /voice
-   Headers: X-Session-ID: 7aab4993...
-   Body: multipart/form-data; file=Recording.m4a
 
-2. main.py: _observability_middleware
-   → assigns request_id = "ed175235..."
-   → extracts traceparent, sets OTel context
-   → starts http.request span
+### Environment Setup
 
-3. main.py: voice_chat()
-   → require_session dependency: loads SessionData from Redis
-   → _validate_upload: checks extension, MIME, size
-   → _save_upload: writes to audio/audio_INPUT/api_{request_id}.m4a
+```bash
+cp .env.example .env
+# Edit .env with your credentials
+```
 
-4. voice_graph.run(state, timeout=120.0)
-   → _prepare_state: assigns request_id, resolves QoSTier
-   → LoadSheddingGuard.__aenter__: checks inflight ≤ 20
-   → LatencyBudget.start(budget_ms=..., tier=STANDARD)
+**Minimum required `.env`:**
 
-5. node_stt:
-   → STTEmitter.start(...)
-   → stt_span context manager
-   → stt.transcribe(audio_path, language=None)
-     → RateLimiter.acquire()
-     → asyncio.Semaphore (max 20 concurrent)
-     → CircuitBreaker.call(whisper_api_call)
-     → openai.audio.transcriptions.create(...)
-     → returns STTResult{text="Tell me about system design."}
-   → truncate to max_transcript_chars
-   → STTEmitter.ok(..., latency_ms=3301)
-   → returns state update: user_input="Tell me about system design."
+```bash
+# ── Core credentials (REQUIRED) ──────────────────────────────────────────────
+OPENAI_API_KEY=sk-...
 
-6. route_after_stt: no error → "llm"
+# ── Session security (REQUIRED) ───────────────────────────────────────────────
+SESSION_SECRET_KEY=your-256-bit-hex-key-here   # min 32 chars
 
-7. node_llm:
-   → LLMEmitter.start(...)
-   → llm_span context manager
-   → conversation_memory.resolve(session_id, transcript)
-     → session_store.load(session_id, client_ip)
-     → builds history_block from session.turns
-     → builds context_prefix from InterviewState
-   → builds prompt = context_prefix + history_block + transcript
-   → llm.generate(prompt, request_id=rid)
-     → check LatencyBudget (remaining time)
-     → RateLimiter.acquire()
-     → check Redis cache: MISS
-     → acquire stampede lock (SETNX)
-     → ChatOpenAI.ainvoke([SystemMessage, HumanMessage])
-     → store response in Redis (TTL=3600)
-     → release stampede lock
-     → returns {response="System design involves...", cached=False, ...}
-   → session_store.append_turn(session_id, transcript, response)
-   → conversation_memory.commit(session_id, transcript, response)
-   → transcript_writer.write_turn(...)   ← fire-and-forget
-   → evaluation_engine.schedule_turn(...)  ← fire-and-forget
-   → sanitize(raw_response, max_chars=4096)
-   → LLMEmitter.ok(..., cache_hit=False, latency_ms=3278)
-   → returns state update: llm_response="System design involves..."
+# ── Redis (strongly recommended) ─────────────────────────────────────────────
+REDIS_URL=redis://localhost:6379/0
+```
 
-8. route_after_llm: no error → "sanitize"
+### Start the Server
 
-9. node_sanitize:
-   → sanitize(): strip control chars, injection check, size cap
-   → SanitizeEmitter.ok(...)
-   → returns state update: cleaned_response="System design involves..."
+```bash
+# Development
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-10. node_tts:
-    → TTSEmitter.start(...)
-    → tts_span context manager
-    → tts.synthesise(cleaned_response, voice="nova")
-      → RateLimiter.acquire()
-      → CircuitBreaker.call(openai_tts_call)
-      → openai.audio.speech.create(model="tts-1", voice="nova", input=text)
-      → write bytes to audio/audio_OUTPUT/tts_ebaa5613.mp3
-      → returns TTSResult{local_path="audio/...", s3_uri="", ...}
-    → TTSEmitter.ok(..., latency_ms=4706)
-    → returns state update: audio_output="audio/.../tts_ebaa5613.mp3"
+# Production
+gunicorn main:app -k uvicorn.workers.UvicornWorker \
+  --workers 4 --bind 0.0.0.0:8000 --timeout 120
 
-11. [IS_DEV only] node_playback_dev:
-    → play_audio("audio/.../tts_ebaa5613.mp3")
-
-12. _extract_result(final_state) → VoicePipelineResult
-    pipeline_done logged: lat=11.346s
-
-13. main.py: voice_chat() returns _ok_response(result, rid)
-    input_path.unlink()   ← cleans up uploaded file
-
-14. HTTP response: 200 OK, JSON body
-
-Background (fire-and-forget):
-  transcript_writer → writes session_{sid[:16]}.txt + emits ObsEvent
-  evaluation_engine → scores turn, stores in Redis eval:score:v1:...
+# Desktop PTT mode (no server needed)
+python controller.py
 ```
 
 ---
 
-## 26. Resilience Patterns
+## 5. Configuration Reference
 
-### Circuit Breaker
+All configuration is managed in `settings.py` via `pydantic_settings.BaseSettings`. Every variable is validated at import time — misconfigured containers **fail at startup**, not mid-traffic.
 
-Every external API call (Whisper, OpenAI chat, OpenAI TTS, Redis) is wrapped in a `CircuitBreaker`. The breaker transitions:
+### OpenAI
 
-```
-CLOSED (normal) → [N failures] → OPEN (fast-fail) → [timeout] → HALF_OPEN (probe) → CLOSED or OPEN
-```
+| Variable | Default | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | *required* | Shared key used by LLM, STT, and TTS nodes |
+| `OPENAI_BASE_URL` | (OpenAI default) | Override for local Whisper endpoint |
 
-When OPEN, callers get `CircuitBreakerOpen` immediately — no waiting. The graph handles this as a transient failure and routes to the retry handler.
+### LLM Node
 
-### Retry Loops
-
-STT and LLM stages have configurable retry counts (`max_stt_retries`, `max_llm_retries`). Each retry is a full re-execution of the stage node. The retry router checks `abort_reason` first — if set (e.g., `budget_exceeded`, `path_traversal`), it bypasses retries entirely and routes to `error_terminal`.
-
-### Latency Budget
-
-The most impactful resilience mechanism for voice UX. A per-request SLA deadline is set at pipeline entry. Every node checks remaining time before starting work. When the budget is exhausted, the node raises `LatencyBudgetExceeded`, which is caught by the graph and treated as an abort — no retries, straight to `error_terminal`. This prevents the pipeline from wasting resources on requests that are already too late.
-
-### Load Shedding
-
-Each graph instance has a `LoadSheddingGuard`. When at capacity, new requests are rejected instantly with a 503-equivalent response. This protects the system from cascading overload — it's better to tell 10% of callers to retry than to let the entire system degrade.
-
-### Graceful Degradation
-
-Every stage can fail without crashing the pipeline. The `error_terminal` node fills in apology strings. The caller always gets a well-formed response, just with `degraded=true`.
-
-### InMemoryLRU Fallback
-
-When Redis is unreachable:
-- Session store falls back to process-local LRU (cross-process uniqueness lost)
-- LLM cache falls back to process-local LRU (cache hit rate drops)
-- `degraded_mode` reduces concurrency to protect model APIs
-
-### Backoff Retry with Jitter
-
-`backoff_retry()` wraps upstream API calls with exponential backoff and random jitter:
-
-```python
-await backoff_retry(
-    api_call,
-    attempts=3,
-    base_delay=1.5,
-    exceptions=(openai.RateLimitError, httpx.TimeoutException),
-)
-```
-
-Jitter prevents retry storms when multiple callers all hit an API limit simultaneously.
-
----
-
-## 27. QoS Tiers & Graph Variants
-
-| | `voice_graph` | `voice_graph_low_latency` | `voice_graph_realtime` |
-|---|---|---|---|
-| STT timeout | 30s | 15s | 10s |
-| LLM timeout | 45s | 20s | 15s |
-| TTS timeout | 30s | 12s | 8s |
-| Max inflight | 20 | 50 | 30 |
-| STT retries | 1 | 1 | 0 |
-| LLM retries | 1 | 1 | 0 |
-| Default tier | STANDARD | STANDARD | REALTIME |
-
-**Why zero retries on realtime?** A retry after a blown SLA budget only pushes the caller further past the deadline. Realtime callers need either a fast answer or a fast apology — not a long wait followed by a slow answer.
-
-**Why 50 max inflight on low_latency but only 30 on realtime?** Realtime requests are by definition high-priority and resource-intensive. Keeping the pool small ensures each gets adequate CPU/IO budget. Low-latency requests are less time-critical and can share more capacity.
-
----
-
-## 28. Session Lifecycle
-
-```
-1. POST /session/register
-   → extract client IP
-   → ip_hash = HMAC-SHA256(SECRET_KEY, canonical_ip)
-   → Redis SETNX session:lock:v1:{ip_hash}  → 409 if already locked
-   → session_id = SHA256(ip_hash + urandom(16))
-   → Redis SETEX session:data:v1:{session_id}  (TTL = TTL_S + GRACE_S)
-   → Redis SETEX session:meta:v1:{ip_hash}
-   → transcript_writer.open_session(session_id)
-   → Response: {session_id, registered_from_ip, ttl_s}
-
-2. [0..N] POST /voice (X-Session-ID: {session_id})
-   → require_session: load session, validate IP
-   → voice_graph.run(state)
-     → conversation history injected from session.turns
-     → after LLM: session_store.append_turn()
-     → after LLM: evaluation_engine.schedule_turn()
-   → Response: {transcript, response, audio, ...}
-
-3. POST /session/end
-   OR SESSION_TTL_S seconds of inactivity
-   → session_store.end(session_id)
-   → Redis DEL session:data:v1:{session_id}
-   → Redis DEL session:lock:v1:{ip_hash}   ← IP is now free
-   → transcript_writer.close_session(session_id)
-   → SessionEmitter.ended(...)
-```
-
----
-
-## 29. Environment Variables Reference
-
-### Required
-
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | OpenAI API key (sk-...) |
-| `SESSION_SECRET_KEY` | 32-byte hex secret for IP HMAC (required in non-desktop mode) |
-
-### LLM
-
-| Variable | Default      | Description |
-|---|--------------|---|
-| `LLM_MODEL` | `gpt-5-mini` | Primary model |
-| `LLM_FALLBACK_MODEL` | `gpt-5-nano` | Fallback when primary circuit opens |
-| `LLM_TEMPERATURE` | `0.7`        | Sampling temperature (0.0–2.0) |
-| `LLM_MAX_CONCURRENT` | `50`         | Max simultaneous LLM calls |
-| `LLM_RATE_PER_SEC` | `20.0`       | Sustained calls/sec |
-| `LLM_RATE_BURST` | `40.0`       | Burst headroom |
-| `LLM_CACHE_TTL` | `3600`       | Redis cache TTL in seconds |
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_MODEL` | `gpt-5.2` | Chat model name (warns on unknown, hard-errors invalid) |
+| `LLM_MAX_CONCURRENT` | `10` | Parallel in-flight LLM calls |
+| `LLM_RATE_LIMIT_RPM` | `500` | Token-bucket requests per minute |
+| `LLM_CACHE_TTL_S` | `300` | Redis cache TTL for LLM responses |
+| `LLM_SERVICE_URL` | *(empty)* | Remote LLM service URL; local node if unset |
 
 ### Redis
 
 | Variable | Default | Description |
 |---|---|---|
-| `REDIS_ENABLED` | `true` | Set false to disable Redis |
-| `REDIS_URL` | `redis://localhost:6379` | Connection URL |
-| `REDIS_MAX_CONN` | `200` | Connection pool size |
-| `REDIS_PASSWORD` | — | Used in Docker stack |
+| `REDIS_URL` | `redis://localhost:6379/0` | Connection string |
+| `REDIS_CACHE_DB` | `1` | LLM response cache database index |
+| `REDIS_POOL_SIZE` | `20` | Max connections in the pool |
 
-### STT
-
-| Variable | Default | Description |
-|---|---|---|
-| `STT_MODEL` | `whisper-1` | Whisper model |
-| `STT_MAX_FILE_MB` | `25.0` | Max audio file size (Whisper hard ceiling) |
-| `STT_MAX_CONCURRENT` | `20` | Max simultaneous Whisper calls |
-| `STT_RATE_PER_SEC` | `10.0` | |
-| `STT_RATE_BURST` | `20.0` | |
-| `STT_S3_BUCKET` | `""` | S3 bucket for audio/transcripts |
-| `STT_SERVICE_URL` | `""` | Remote STT service URL (enables RemoteSTTClient) |
-
-### TTS
+### STT Node
 
 | Variable | Default | Description |
 |---|---|---|
-| `TTS_MODEL` | `tts-1` | `tts-1` or `tts-1-hd` |
-| `TTS_VOICE` | `nova` | `alloy` / `echo` / `fable` / `onyx` / `nova` / `shimmer` |
-| `TTS_FORMAT` | `mp3` | Output audio format |
-| `TTS_OUTPUT_DIR` | `audio/audio_OUTPUT` | Local output directory |
-| `TTS_LOCAL_FILE_TTL` | `3600.0` | Seconds before local files are deleted |
-| `TTS_S3_BUCKET` | `""` | S3 bucket for audio upload |
-| `TTS_SERVICE_URL` | `""` | Remote TTS service URL |
+| `STT_MODEL` | `whisper-1` | Whisper model identifier |
+| `STT_MAX_CONCURRENT` | `5` | Parallel transcription jobs |
+| `STT_S3_BUCKET` | *(empty)* | S3 bucket for audio storage; local disk if unset |
+| `STT_SERVICE_URL` | *(empty)* | Remote STT URL; local node if unset |
+
+### TTS Node
+
+| Variable | Default | Description |
+|---|---|---|
+| `TTS_MODEL` | `tts-1-hd` | TTS model (`tts-1` or `tts-1-hd`) |
+| `TTS_VOICE` | `nova` | Voice: `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer` |
+| `TTS_FORMAT` | `mp3` | Output format; `pcm` enables zero-copy pipeline |
+| `TTS_S3_BUCKET` | *(empty)* | S3 bucket for TTS audio storage |
+| `TTS_SERVICE_URL` | *(empty)* | Remote TTS URL; local node if unset |
+
+### AWS
+
+| Variable | Default | Description |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` | *(empty)* | AWS credential |
+| `AWS_SECRET_ACCESS_KEY` | *(empty)* | AWS credential |
+| `AWS_REGION` | `us-east-1` | S3 region |
 
 ### Graph / Orchestration
 
 | Variable | Default | Description |
 |---|---|---|
-| `VOICE_GRAPH_VERSION` | `v2` | Version label in metrics/responses |
-| `GRAPH_STT_TIMEOUT` | `30.0` | STT stage timeout (seconds) |
-| `GRAPH_LLM_TIMEOUT` | `45.0` | LLM stage timeout |
-| `GRAPH_TTS_TIMEOUT` | `30.0` | TTS stage timeout |
-| `GRAPH_MAX_INFLIGHT` | `20` | Load shedder capacity |
-| `GRAPH_MAX_TRANSCRIPT_CHARS` | `2000` | Transcript cap before LLM |
-| `GRAPH_MAX_LLM_RESPONSE_CHARS` | `4096` | Response cap before sanitize |
-| `GRAPH_MAX_TTS_CHARS` | `4000` | TTS input cap (OpenAI ceiling: 4096) |
-| `GRAPH_MIN_PROMPT_CHARS` | `25` | Min chars before LLM fires |
-| `GRAPH_STT_LLM_QUEUE_DEPTH` | `8` | stream_full() inter-stage queue |
-| `GRAPH_LLM_TTS_QUEUE_DEPTH` | `16` | stream_full() inter-stage queue |
+| `GRAPH_STT_TIMEOUT` | `30.0` | Per-request STT timeout (seconds) |
+| `GRAPH_LLM_TIMEOUT` | `45.0` | Per-request LLM timeout (seconds) |
+| `GRAPH_TTS_TIMEOUT` | `30.0` | Per-request TTS timeout (seconds) |
+| `GRAPH_MAX_INFLIGHT` | `20` | Max concurrent pipeline requests |
+| `GRAPH_MAX_STT_RETRIES` | `1` | STT retry count before abort |
+| `GRAPH_MAX_LLM_RETRIES` | `1` | LLM retry count before abort |
+| `PIPELINE_TIMEOUT` | `120.0` | End-to-end pipeline timeout |
+| `STREAM_TIMEOUT` | `90.0` | WebSocket stream timeout |
+
+### FastAPI Gateway
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_UPLOAD_MB` | `25.0` | Max audio upload size in megabytes |
+| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
+| `AUDIO_INPUT_DIR` | `audio/temp_IN` | Upload staging directory |
 
 ### Session
 
 | Variable | Default | Description |
 |---|---|---|
-| `SESSION_TTL_S` | `1800` | Session idle TTL (30 min) |
-| `SESSION_GRACE_S` | `300` | Grace period on top of TTL |
-| `SESSION_MAX_TURNS` | `20` | Rolling history window |
-| `SESSION_MAX_IP_CHANGES` | `3` | Max IP changes before suspension |
-| `SESSION_LRU_SIZE` | `1024` | LRU fallback capacity |
-| `APP_MODE` | `desktop` | `desktop` or `api` |
+| `SESSION_SECRET_KEY` | *required* | HMAC key for IP fingerprinting |
+| `SESSION_TTL_S` | `3600` | Session TTL in seconds |
+| `SESSION_GRACE_S` | `300` | Extra TTL after session end |
+| `SESSION_MAX_TURNS` | `50` | Max conversation turns per session |
 
-### Gateway
+### Controller (Desktop PTT)
 
 | Variable | Default | Description |
 |---|---|---|
-| `AUDIO_INPUT_DIR` | `audio/audio_INPUT` | Upload staging directory |
-| `MAX_UPLOAD_MB` | `25.0` | Max upload size |
-| `PIPELINE_TIMEOUT` | `120.0` | Outer wall-clock guard (must exceed stage sum) |
-| `STREAM_TIMEOUT` | `90.0` | WebSocket streaming timeout |
-| `CORS_ORIGINS` | `*` | Comma-separated allowed origins |
-| `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `8000` | Server port |
-| `ENV` | `production` | `production` / `development` / `test` |
-
-### Controller (Desktop)
-
-| Variable | Default | Description |
-|---|---|---|
-| `CONTROLLER_PTT_KEY` | `h` | Push-to-talk key |
+| `CONTROLLER_PTT_KEY` | `h` | Hold-to-talk key |
 | `CONTROLLER_EXIT_KEY` | `esc` | Clean exit key |
-| `CONTROLLER_POLL_INTERVAL_S` | `0.03` | Key poll rate (~33 Hz) |
-| `CONTROLLER_DEBOUNCE_S` | `0.35` | Anti-bounce delay |
-| `CONTROLLER_INTERRUPT_DRAIN_S` | `0.05` | Drain after cancel signal |
-| `CONTROLLER_LOOP_DRAIN_S` | `0.10` | Drain before loop.stop() |
-| `CONTROLLER_LOOP_JOIN_TIMEOUT` | `3.0` | Thread join timeout |
-
-### OpenTelemetry
-
-| Variable | Default | Description |
-|---|---|---|
-| `OTEL_ENABLED` | `false` | Master OTel switch |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4319` | gRPC collector endpoint |
-| `OTEL_SERVICE_NAME` | `voice-pipeline` | Service name in spans |
-| `OTEL_TRACE_SAMPLE_RATE` | `1.0` | Fraction of traces sampled |
-| `OTEL_METRIC_INTERVAL_MS` | `30000` | OTel metric push interval |
+| `CONTROLLER_POLL_INTERVAL_S` | `0.03` | Key poll interval |
+| `CONTROLLER_DEBOUNCE_S` | `0.35` | Key debounce threshold |
 
 ### Observability
 
 | Variable | Default | Description |
 |---|---|---|
-| `LOG_MODE` | `verbose` | `standard` (Rich) or `verbose` (JSON) |
-| `LOG_FILE` | `logs/voice_assistant.log` | JSON log output path |
-| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection |
+| `LOG_MODE` | `verbose` | `standard` or `verbose` |
+| `LOG_FILE` | *(empty)* | JSON log file path |
+| `MONGO_URI` | *(empty)* | MongoDB connection string |
 | `MONGO_DB` | `ai_observability` | Database name |
-| `MONGO_COLLECTION` | `pipeline_events` | Collection name |
-| `PROMETHEUS_PORT` | `9091` | App /metrics port (must not be 9090) |
-| `GRAFANA_OUT_DIR` | `infra/grafana` | Grafana provisioning path |
+| `MONGO_ENABLED` | `true` | Toggle MongoDB sink |
+| `MONGO_TTL_DAYS` | `90` | Event document TTL |
+| `PROMETHEUS_PORT` | `9090` | Prometheus metrics HTTP port |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty)* | OTel collector gRPC endpoint |
+| `OTEL_ENABLED` | `false` | Toggle OTel tracing |
+
+### QA Interview
+
+| Variable | Default | Description |
+|---|---|---|
+| `QA_QUESTIONS_PER_DOMAIN` | `7` | Target questions per domain |
+| `QA_MIN_QUESTIONS` | `5` | Minimum before domain rotation |
+| `QA_MAX_QUESTIONS` | `10` | Maximum before forced rotation |
+
+### Evaluation Engine
+
+| Variable | Default | Description |
+|---|---|---|
+| `EVAL_MODEL` | `gpt-5.2` | Scoring model |
+| `EVAL_MAX_CONCURRENT` | `3` | Parallel scoring calls |
+| `EVAL_SESSION_BUDGET_TOKENS` | `50000` | Hard token cap per session |
+| `EVAL_FULL_EVAL_TURNS` | `5` | Always score first N turns |
+| `EVAL_SAMPLE_RATE` | `3` | Then score 1-in-N turns |
+| `EVAL_MIN_ANSWER_CHARS` | `40` | Skip scoring below this length |
+| `EVAL_ENABLED` | `true` | Toggle evaluation globally |
 
 ---
 
-## 30. Running the System
+## 6. Execution Modes
 
-### Prerequisites
+The pipeline has five distinct execution modes, all implemented in `VoiceGraph`:
 
-- Python 3.11+
-- Docker Desktop (for the observability stack)
-- `pip install -r requirements.txt`
-
-### 1. Configure Environment
-
-```bash
-cp .env.example .env
-# Edit .env — at minimum:
-#   OPENAI_API_KEY=sk-...
-#   SESSION_SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
-#   REDIS_PASSWORD=$(python -c "import secrets; print(secrets.token_hex(24))")
-#   MONGO_PASSWORD=$(python -c "import secrets; print(secrets.token_hex(24))")
-#   GRAFANA_PASSWORD=your_password_here
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                         EXECUTION MODE SELECTION                                │
+│                                                                                  │
+│  HTTP POST /voice        ──────────────────────▶  api mode                      │
+│    single-shot request                            await voice_graph.run(state)   │
+│    returns JSON when done                         → VoicePipelineResult          │
+│                                                                                  │
+│  WebSocket /voice/stream ──────────────────────▶  stream mode                   │
+│    bidirectional WS                               async for token in             │
+│    streams LLM tokens in real-time                  voice_graph.stream(state)    │
+│                                                                                  │
+│  WebSocket /voice/stream ──────────────────────▶  realtime mode                 │
+│    (3 concurrent workers)                         async for chunk in             │
+│    streams audio chunks as produced                 voice_graph.stream_full()    │
+│                                                                                  │
+│  PCM native path         ──────────────────────▶  pcm mode                      │
+│    FF_PCM_PIPELINE=true                           async for chunk in             │
+│    zero-copy, no disk I/O                           voice_graph.stream_full_pcm()│
+│                                                                                  │
+│  Desktop controller      ──────────────────────▶  ptt mode                      │
+│    hold PTT_KEY to talk                           await voice_graph.run_ptt(     │
+│    releases → dispatches                            state, is_held_fn)           │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Start Observability Stack
+### Mode Comparison
 
-```bash
-docker compose up -d
+| Mode | Use Case | Latency | Concurrency | Disk I/O |
+|---|---|---|---|---|
+| `api` | REST clients, batch | Highest | 20 inflight | WAV on disk |
+| `stream` | Web clients, partial results | Medium | 20 inflight | WAV on disk |
+| `realtime` | Low-latency cloud | Low | Configurable | Minimal |
+| `pcm` | Desktop, embedded | Lowest | 1 per instance | Zero |
+| `ptt` | Desktop PTT interviews | Low | 1 session | Temp WAV |
 
-# Windows: comment out promtail, node-exporter, cadvisor in docker-compose.yaml first
+### Three Graph Singletons
+
+```python
+# voice_graph.py — three instances with genuinely different configs
+
+voice_graph = VoiceGraph(
+    cfg=VoiceGraphConfig(
+        max_stt_retries=1,
+        max_llm_retries=1,
+        stt_timeout=30.0,
+        llm_timeout=45.0,
+        tts_timeout=30.0,
+        max_inflight=20,
+    )
+)
+
+voice_graph_realtime = VoiceGraph(
+    cfg=VoiceGraphConfig(
+        max_stt_retries=0,      # zero retries — retry under blown SLA makes things worse
+        max_llm_retries=0,
+        stt_timeout=12.0,       # tight timeouts
+        llm_timeout=18.0,
+        tts_timeout=12.0,
+        max_inflight=10,        # reserved realtime capacity
+        qos_tier=QoSTier.REALTIME,
+    )
+)
+
+voice_graph_low_latency = VoiceGraph(
+    cfg=VoiceGraphConfig(
+        max_stt_retries=1,
+        max_llm_retries=0,
+        stt_timeout=20.0,
+        llm_timeout=25.0,
+        tts_timeout=20.0,
+        max_inflight=15,
+    )
+)
 ```
 
-### 3. Verify Configuration
+---
 
-```bash
-python -m app.common.settings   # prints redacted config summary
+## 7. Pipeline Deep Dive
+
+### 7.1 Graph Topology
+
+The pipeline is a LangGraph `StateGraph` with conditional edges implementing retry loops and error terminals.
+
+```
+                        ┌─────────────────────────────────────────────────────┐
+                        │              VOICE PIPELINE GRAPH                   │
+                        │                                                     │
+                        │   START                                             │
+                        │     │                                               │
+                        │     ▼                                               │
+                        │  ┌──────────────────────────────────────────────┐   │
+                        │  │                  node_stt                    │   │
+                        │  │                                              │   │ 
+                        │  │  1. Validate audio path                      │   │
+                        │  │  2. Check latency budget                     │   │
+                        │  │  3. Acquire STT bulkhead semaphore           │   │
+                        │  │  4. Call Whisper API (with timeout)          │   │
+                        │  │  5. Log OTel span, Prometheus, structlog     │   │
+                        │  └──────────────┬───────────────────────────────┘   │
+                        │                 │                                   │
+                        │         route_after_stt()                           │
+                        │            ┌───┴──────────────┐                     │
+                        │         [ok]                [error]                 │
+                        │            │                   │                    │
+                        │            ▼                   ▼                    │
+                        │     ┌──────────┐     ┌────────────────────┐         │
+                        │     │ node_llm │     │  node_stt_error    │         │ 
+                        │     └──────────┘     │                    │         │
+                        │          │           │  retries += 1      │         │
+                        │          │           └────────┬───────────┘         │
+                        │          │                    │                     │
+                        │          │        route_after_stt_error()           │
+                        │          │            ┌───────┴──────────────┐      │
+                        │          │     [retry remaining]    [exhausted/abort│
+                        │          │            │                       │     │
+                        │          │            └────────▶ [back to stt]│     │
+                        │          │                                    │     │
+                        │          │                                    ▼     │
+                        │          │                        ┌────────────────┐│
+                        │          │                        │node_error_     ││
+                        │          │                        │terminal        ││
+                        │          │                        │                ││
+                        │          │                        │ Build error    ││
+                        │          │                        │ result, emit   ││
+                        │          │                        │ final metrics  ││
+                        │          │                        └────────┬───────┘│
+                        │          │                                 │        │
+                        │          ▼                                END       │
+                        │  ┌───────────────────────────────────────────────┐  │
+                        │  │                  node_llm                     │  │
+                        │  │                                               │  │
+                        │  │  QA stage routing:                            │  │
+                        │  │    greeting → return GREETING_TEXT            │  │
+                        │  │    intro    → ATSMode.extract(intro)          │  │
+                        │  │    interview→ InterviewerMode.stream_question │  │
+                        │  │    complete → return CLOSING_TEXT             │  │
+                        │  │                                               │  │
+                        │  │  Resilience: cache hit → skip API             │  │
+                        │  │  circuit breaker → apology response           │  │
+                        │  └──────────────┬────────────────────────────────┘  │
+                        │                 │                                   │
+                        │         route_after_llm()                           │
+                        │            ┌───┴──────────────┐                     │
+                        │         [ok]                [error]                 │
+                        │            │                   │                    │
+                        │            ▼                   ▼                    │
+                        │  ┌──────────────────┐  ┌──────────────────────┐     │
+                        │  │  node_sanitize   │  │  node_llm_error      │     │
+                        │  │                  │  │  retries += 1        │     │
+                        │  │  27-step text    │  └─────────┬────────────┘     │
+                        │  │  cleaning for    │            │                  │
+                        │  │  TTS safety      │  route_after_llm_error()      │
+                        │  └────────┬─────────┘       ┌───┴─────────┐         │
+                        │           │            [retry]          [abort]     │
+                        │           ▼                │                │       │
+                        │  ┌──────────────────┐      └──▶ [node_llm]  │       │
+                        │  │    node_tts      │                       ▼       │
+                        │  │                  │              node_error_      │
+                        │  │  synthesize      │              terminal → END   │
+                        │  │  pcm_stream /    │                               │
+                        │  │  full WAV        │                               │
+                        │  └────────┬─────────┘                               │
+                        │           │                                         │
+                        │  route_after_tts()                                  │
+                        │       ┌───┴──────────────┐                          │
+                        │    [ok,IS_DEV]      [ok,!IS_DEV]     [error]        │
+                        │       │                   │              │          │
+                        │       ▼                   ▼              ▼          │
+                        │ node_playback_     END        node_tts_error →      │
+                        │    dev                        node_error_terminal   │
+                        │ (play locally)                → END                 │
+                        │       │                                             │
+                        │      END                                            │
+                        └─────────────────────────────────────────────────────┘
 ```
 
-### 4a. API Mode
+### 7.2 STT Node (`STT_service.py`)
 
-```bash
-python -m app.endpoint.main --no-reload
-# Server at http://0.0.0.0:8000
-# Docs at http://localhost:8000/docs
+The Speech-to-Text node wraps OpenAI Whisper with a full production resilience stack.
+
+```
+Audio Input (path / PCMChunk / AsyncIterator[PCMChunk])
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           STT NODE INTERNALS                                │
+│                                                                             │
+│  PCMChunk?  ────▶  PCMChunkWAVEncoder                                       │
+│                       │  normalize to int16, enforce mono                   │
+│                       │  chunk_to_wav_bytes()                               │
+│                       ▼                                                     │
+│  File path? ────▶  _validate_audio_path()                                   │
+│                       │  check exists, extension, size                      │
+│                       ▼                                                     │
+│             LatencyBudget.check()  ──── exceeded ──▶ raise LatencyBudget    │
+│                       │                               Exceeded              │
+│                       ▼                                                     │
+│             bulkheads["stt"].acquire()  ── no slots ──▶  503                │
+│                       │                                                     │
+│                       ▼                                                     │
+│             circuit_breaker.call()                                          │
+│                OPEN ──────────────────────────────▶ try local fallback      │
+│                CLOSED / HALF-OPEN:                                          │
+│                       │                                                     │
+│                       ▼                                                     │
+│             _call_whisper(wav_bytes)                                        │
+│               ├── response_format: verbose_json                             │
+│               ├── language: auto-detect                                     │
+│               ├── timeout: STT_TIMEOUT                                      │
+│               └── returns: segments + avg_logprob                           │
+│                       │                                                     │
+│             PCMConfidenceFilter                                             │
+│               └── drops segments with avg_logprob < threshold               │
+│                       │                                                     │
+│             structlog + OTel span + Prometheus                              │
+│             S3 upload (if configured)                                       │
+│                       │                                                     │
+│                       ▼                                                     │
+│             STTResult / PCMSTTResult                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+  transcript text  →  node_llm
 ```
 
-Workflow:
-```bash
-# Register session
-curl -X POST http://localhost:8000/session/register
-# → {"session_id": "7aab4993...", ...}
+**Streaming path** (`transcribe_chunk_stream`):
 
-# Send audio
-curl -X POST http://localhost:8000/voice \
-  -H "X-Session-ID: 7aab4993..." \
-  -F "file=@recording.m4a"
-# → {transcript, response, audio, stage_latencies, ...}
-
-# End session
-curl -X POST http://localhost:8000/session/end \
-  -H "X-Session-ID: 7aab4993..."
+```
+AsyncIterator[PCMChunk]  (from VAD gate)
+    │
+    ├─▶ per chunk: PCMConverter → target format (16 kHz mono int16)
+    ├─▶ PCMChunkWAVEncoder → WAV bytes
+    ├─▶ _call_whisper() → segments
+    └─▶ yield STTSegment (real-time)
 ```
 
-### 4b. Desktop Mode
+### 7.3 LLM Node (`LLM_service.py`)
 
-```bash
-APP_MODE=desktop LOG_MODE=standard python -m app.orchestration.controller
-# Hold H to talk, ESC to exit
+Three operation modes with a shared resilience infrastructure:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           LLM NODE ARCHITECTURE                             │
+│                                                                             │
+│   LLMNode                                                                   │
+│    ├── InterviewerMode         (stage == "interview")                       │
+│    │     stream_question(LLMInterviewInput) → AsyncIterator[str]            │
+│    │     Input ONLY: domain | level | last_q | last_a | switch_flag         │
+│    │     Enforced 80-word cap via _ResponseValidator                        │
+│    │     Truncates to first question sentence ending in "?"                 │
+│    │     Fallback question bank if no valid question found                  │
+│    │                                                                        │
+│    ├── ATSMode                 (stage == "intro")                           │
+│    │     extract(intro_transcript) → str (JSON)                             │
+│    │     response_format: json_object                                       │
+│    │     Validates schema before returning                                  │
+│    │     Rule-based fallback via qa_controller if parse fails               │
+│    │                                                                        │
+│    └── _SharedInfra                                                         │
+│          ├── Redis cache (TTL configurable, stampede lock)                  │
+│          ├── InMemoryLRU (fallback when Redis unreachable)                  │
+│          ├── CircuitBreaker (3 failures → OPEN, 60s reset)                  │
+│          ├── RateLimiter (token bucket, LLM_RATE_LIMIT_RPM)                 │
+│          ├── bulkheads["llm"] (max concurrent = LLM_MAX_CONCURRENT)         │
+│          ├── OTel span (token usage, cache hit/miss, latency)               │
+│          └── Prometheus (ai_llm_requests_total, ai_llm_latency_seconds)     │
+│                                                                             │
+│   LLMNodeV2(LLMNode) — Extended production features                         │
+│    ├── PromptInjectionDetector                                              │
+│    ├── ContentPolicyFilter                                                  │
+│    ├── QuestionDiversityEnforcer   (avoids repeating question types)        │
+│    ├── StaticQuestionBank          (fallback for breaker OPEN state)        │
+│    ├── StreamingWordGuard           (rejects unsafe tokens mid-stream)      │
+│    ├── EvalModeLLM                 (internal; used by evaluation_engine)    │
+│    └── BatchATSProcessor           (parallel intro extraction)              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5. Dashboards
+**Cache flow:**
 
-| URL | Credentials |
+```
+  request_id + input hash
+       │
+       ▼
+  Redis GET  ──── HIT  ──▶  return cached response (instant)
+       │
+      MISS
+       │
+       ▼
+  stampede_lock.acquire()  (prevents N concurrent identical calls)
+       │
+       ▼
+  OpenAI API call
+       │
+       ▼
+  Redis SET (TTL = LLM_CACHE_TTL_S)
+```
+
+### 7.4 Sanitize Node (`sanitize.py`)
+
+A 27-step deterministic text cleaning pipeline that transforms any LLM output into TTS-safe speech.
+
+```
+Raw LLM text
+    │
+    ▼  Step 1:  Type coercion         (None/bytes/int → str)
+    ▼  Step 2:  Empty fast path        (blank → return early)
+    ▼  Step 3:  Null-byte + surrogate  (strip before normalization)
+    ▼  Step 4:  Unicode NFKC           (ＡＢＣ → ABC, ＋ → +)
+    ▼  Step 5:  HTML entity unescape   (&amp; → &, &nbsp; → space)
+    ▼  Step 6:  Script/style strip     (<script>…</script>)
+    ▼  Step 7:  HTML/XML tag strip     (<b>, </em>, <?xml …?>)
+    ▼  Step 8:  ANSI escape strip      (\x1b[31m, \x1b[0m)
+    ▼  Step 9:  Zero-width Unicode     (ZWJ, ZWNJ, BOM, soft hyphen)
+    ▼  Step 10: Newline normalization  (\n → ". ", \r → "", \t → " ")
+    ▼  Step 11: Control char strip     (\x00–\x08, \x0b, \x0c, DEL)
+    ▼  Step 12: Path traversal strip   (../ and ..\\ sequences)
+    ▼  Step 13: Prompt injection detect ("ignore previous", "system:")
+    ▼  Step 14: SSI/template inject    (<!--#, {{, }}, {%, %})
+    ▼  Step 15: Tech token sub         (C++ → "C plus plus", .NET → "dot net")
+    ▼  Step 16: Symbol substitution    (& → "and", @ → "at", % → "percent")
+    ▼  Step 17: Currency expansion     ($5 → "5 dollars", €10 → "10 euros")
+    ▼  Step 18: Markdown block strip   (fenced code, block quotes, hr)
+    ▼  Step 19: Markdown inline strip  (**bold**, _italic_, [links](url))
+    ▼  Step 20: URL simplification     (https://example.com/path → "example.com")
+    ▼  Step 21: Emoji strip            (all Unicode emoji and pictograph ranges)
+    ▼  Step 22: Repeated punctuation   ("!!!" → "!", "???" → "?")
+    ▼  Step 23: Smart quote normalize  (" " → ", ' ' → ')
+    ▼  Step 24: Ellipsis normalize     ("......" → "…", "…" kept)
+    ▼  Step 25: Whitespace normalize   (multi-space → single, strip ends)
+    ▼  Step 26: Empty guard            (if sanitized is blank → return flag)
+    ▼  Step 27: Sentence-boundary cap  (max_chars, break at last sentence)
+    │
+    ▼
+SanitizeResult {
+    text:          str          # TTS-safe, ready to synthesize
+    truncated:     bool
+    original_len:  int
+    sanitized_len: int
+    was_empty:     bool
+    warnings:      list[str]    # tags for each issue class detected
+}
+```
+
+### 7.5 TTS Node (`TTS_service.py`)
+
+```
+SanitizeResult.text
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          TTS NODE INTERNALS                              │
+│                                                                          │
+│  PCMTTSOutputConfig  ─── binds output PCMFormat, PCMPlaybackEnhancer,    │
+│                           PCMLatencyTracker for this node instance       │
+│                                                                          │
+│  LatencyBudget.check()  ──── exceeded ──▶ return apology audio           │
+│                                                                          │
+│  bulkheads["tts"].acquire()                                              │
+│                                                                          │
+│  circuit_breaker.call()                                                  │
+│         │                                                                │
+│         ▼                                                                │
+│  [synthesize_pcm_stream mode — TTS_FORMAT=pcm]                           │
+│   openai.audio.speech.create()  → stream bytes                           │
+│        │                                                                 │
+│        ▼                                                                 │
+│   tts_pcm_to_chunk()           → PCMChunk per packet                     │
+│        │                                                                 │
+│        ▼                                                                 │
+│   PCMTTSQualityGate            → reject/retry bad chunks                 │
+│        │                                                                 │
+│        ▼                                                                 │
+│   PCMSentenceGapManager        → calibrated silence between sentences    │
+│        │                                                                 │
+│        ▼                                                                 │
+│   PCMPlaybackEnhancer          → limiter + AGC before speaker            │
+│        │                                                                 │
+│        ▼                                                                 │
+│   PCMOutputStream.write(chunk) → speaker  OR  yield to caller            │
+│                                                                          │
+│  [synthesize mode — TTS_FORMAT=mp3/wav]                                  │
+│   openai.audio.speech.create() → full audio bytes                        │
+│   write to local disk + S3 upload (if configured)                        │
+│   return file path                                                       │
+│                                                                          │
+│  [failure path]                                                          │
+│   Cached apology audio → return pre-rendered fallback                    │
+│   PCMStreamToWAVCollector → collect stream to in-memory WAV              │
+└──────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+  audio_output path / S3 URI / PCMChunks
+```
+
+---
+
+## 8. PCM Audio Engine
+
+`audio_engine.py` (7,141 lines) is the single source of truth for all raw PCM audio within the pipeline. It eliminates file I/O between stages and provides typed, immutable audio primitives.
+
+### 8.1 Format Negotiation
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         PCMFormat (frozen dataclass)                         │
+│                                                                              │
+│   PCMFormat(sample_rate=16000, channels=1, dtype="int16", byte_order="<")    │
+│                                                                              │
+│   Built-in presets:                                                          │
+│     PCMFormat.whisper()           → 16 kHz, mono, int16, little-endian       │
+│     PCMFormat.openai_tts()        → 24 kHz, mono, float32, little-endian     │
+│     PCMFormat.portaudio_default() → 44100 Hz, stereo, float32                │
+│                                                                              │
+│   negotiate_format(caps_a, caps_b) → PCMFormat                               │
+│     Picks the highest common sample rate and channel count                   │
+│     Used in SessionLifecycleManager.open_session() to wire                   │
+│     mic → STT and TTS → speaker without mismatches                           │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 PCM-Native Realtime Path
+
+The `stream_full_pcm()` mode is the zero-file-I/O path for the lowest achievable latency:
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                    PCM-NATIVE REALTIME PIPELINE (stream_full_pcm)             │
+│                                                                               │
+│                                                                               │
+│  PortAudio callback                                                           │
+│       │                                                                       │
+│       ▼                                                                       │
+│  PCMInputStream ─────────────────────────▶ asyncio.Queue (raw chunks)         │
+│       │  (async-for iterator of PCMChunks)                                    │
+│       │                                                                       │
+│       ▼                                                                       │
+│  PCMSpeechEnhancer                                                            │
+│    ├── bandpass filter   (removes sub-100Hz rumble, >8kHz noise)              │
+│    ├── noise suppression (spectral subtraction)                               │
+│    ├── AGC               (normalise input level)                              │
+│    ├── gain gate         (attenuate during silence)                           │
+│    └── VAD gate          (suppress non-speech frames, 200ms hangover)         │
+│       │                                                                       │
+│       │  yields: PCMChunk[speech-only, enhanced]                              │
+│       │                                                                       │
+│  ┌────┴────────────────────────────────────────────────────────┐              │
+│  │                    StageBus: mic→stt                        │              │
+│  │  BoundedPipelineQueue(maxdepth=8, overflow=DROP_OLDEST)     │              │
+│  │  DLQ, throughput metering, backpressure watermarks          │              │
+│  └─────────────────────────┬───────────────────────────────────┘              │
+│                            │                                                  │
+│                            ▼                                                  │
+│  mic_reader() ──────────▶ STT worker                                          │
+│                            │                                                  │
+│  PCMChunkWAVEncoder        │  chunk → WAV bytes (no temp file)                │
+│       │                    │                                                  │
+│       ▼                    │                                                  │
+│  STTNode.transcribe_chunk()│  WAV bytes → Whisper API → transcript text       │
+│       │                    │                                                  │
+│       ▼                    │                                                  │
+│  PCMConfidenceFilter       │  drops low-logprob segments                      │
+│       │                    │                                                  │
+│  ┌────┴──────────────────────────────────────────────────────┐                │
+│  │                    StageBus: stt→llm                      │                │ 
+│  └─────────────────────────┬─────────────────────────────────┘                │
+│                            │                                                  │
+│                            ▼                                                  │
+│  LLM worker (qa path)      │                                                  │
+│    _node_llm_qa_path()     │  transcript → next question (streamed tokens)    │
+│    InterviewerMode         │                                                  │
+│       │                    │                                                  │
+│  ┌────┴──────────────────────────────────────────────────────┐                │
+│  │                    StageBus: llm→tts                      │                │
+│  └─────────────────────────┬─────────────────────────────────┘                │
+│                            │                                                  │
+│                            ▼                                                  │
+│  TTS worker                │                                                  │
+│    TTSNode.synthesize_     │  tokens → PCMChunks (streamed)                   │
+│      pcm_stream()          │                                                  │
+│       │                    │                                                  │
+│  PCMPlaybackEnhancer       │  limiter + AGC pre-speaker                       │
+│       │                    │                                                  │
+│  PCMOutputStream           │  → PortAudio speaker output                      │
+│       │                    │                                                  │
+│  PCMInterruptDetector ─────┘  monitors for energy burst (barge-in)            │
+│    └── FF_BARGE_IN=true                                                       │
+│        interrupt → cancel TTS worker → restart mic_reader                     │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 Audio Components
+
+| Component | File | Purpose |
+|---|---|---|
+| `PCMFormat` | audio_engine.py | Immutable format descriptor (rate, channels, dtype) |
+| `PCMChunk` | audio_engine.py | Timestamped, typed PCM payload (slots dataclass) |
+| `PCMChunkPool` | audio_engine.py | Numpy array pool, avoids GC on hot path |
+| `PCMRingBuffer` | audio_engine.py | Lock-free power-of-2 circular buffer |
+| `PCMConverter` | audio_engine.py | Resample + channel coerce + dtype convert |
+| `PCMInputStream` | audio_engine.py | Async mic → PCMChunk iterator (PortAudio bridge) |
+| `PCMOutputStream` | audio_engine.py | PCMChunk → speaker (persistent, low-latency) |
+| `PCMVADGate` | audio_engine.py | Energy VAD with hangover + pre-roll |
+| `PCMSpeechEnhancer` | audio_engine.py | Bandpass → NS → AGC → gate → VAD chain |
+| `PCMPlaybackEnhancer` | audio_engine.py | Limiter + AGC before speaker output |
+| `PCMInterruptDetector` | audio_engine.py | Barge-in energy burst detection |
+| `PCMJitterBuffer` | audio_engine.py | Network jitter compensation |
+| `PCMDiagnosticsMonitor` | audio_engine.py | Boundary measurement (clipping, RMS, dropout) |
+| `PCMWaveformAnalyzer` | audio_engine.py | Full waveform stats per chunk |
+| `PCMLatencyTracker` | audio_engine.py | Per-stage latency with percentiles |
+| `PCMFormatRegistry` | audio_engine.py | Global format registry for negotiation |
+| `PCMSplitter` | audio_engine.py | Fan-out: one input → N async consumers |
+| `PCMStreamBridge` | audio_engine.py | Cross-coroutine PCM stream bridge |
+| `PCMPipelineBuilder` | audio_engine.py | Fluent builder for PCM stage chains |
+| `PCMDriftCorrector` | audio_engine.py | Clock drift compensation |
+| `PCMSilencePadder` | audio_engine.py | Inter-sentence silence insertion |
+| `PCMStreamMixer` | audio_engine.py | Mix N PCM streams into one |
+| `PCMTranscoder` | audio_engine.py | FFmpeg-based format transcoding |
+| `tts_pcm_to_chunk()` | audio_engine.py | Parse raw TTS PCM bytes → PCMChunk |
+| `chunk_to_wav_bytes()` | audio_engine.py | PCMChunk → complete WAV bytes |
+| `negotiate_format()` | audio_engine.py | Capability negotiation between two format sets |
+| `FFmpegPCMInputStream` | opus_ffmpeg_io.py | Opus → PCMChunk (network decode) |
+| `FFmpegPCMOutputStream` | opus_ffmpeg_io.py | PCMChunk → Opus (network encode, ABR) |
+
+**Latency optimizations in `player.py`:**
+
+```
+Optimization 1: Persistent PCMOutputStream
+   Open once at startup, keep alive between sentences
+   Saves: 50–150 ms device-open cost per sentence
+
+Optimization 2: Async write scheduling
+   play_audio_bytes() returns in ~μs, actual write is async
+   Saves: sync write latency from TTS call stack
+
+Optimization 3: latency='low' PortAudio setting
+   Minimum safe hardware buffer
+   Saves: 10–30 ms output buffer depth
+
+Optimization 4: Silent warmup chunk
+   Written immediately after stream open
+   Saves: 10–20 ms cold-start jitter on first chunk
+
+Optimization 5: Cached device info
+   Queried once at open, not on every call
+   Saves: syscall overhead per chunk
+
+Optimization 6: PCM-native path (play_pcm_chunk)
+   Bypasses sf.read() entirely for voice_graph.stream_full()
+   Saves: decode + format conversion on every chunk
+```
+
+---
+
+## 9. QA Interview Engine
+
+### 9.1 Session State Machine
+
+The interview progresses through four stages managed by `qa_controller.py`:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                        QA SESSION STATE MACHINE                                  │
+│                                                                                  │
+│                                                                                  │
+│   ┌───────────────┐                                                              │
+│   │   GREETING    │  LLM is bypassed — static greeting text returned             │
+│   │               │  No API call, no latency                                     │
+│   │ "Hello! I'm   │                                                              │
+│   │  your AI      │                                                              │
+│   │  interviewer" │                                                              │
+│   └───────┬───────┘                                                              │
+│           │  candidate speaks (intro)                                            │
+│           ▼                                                                      │
+│   ┌────────────────┐                                                             │
+│   │     INTRO      │  ATSMode.extract(raw_intro_transcript)                      │
+│   │                │  Returns JSON:                                              │
+│   │  ATS extraction│    { name, level, domains[], notes }                        │
+│   │  from intro    │  qa_controller.seed_from_intro() writes QA.json             │
+│   │  transcript    │  domain_queue populated, active_domain set                  │
+│   └───────┬────────┘                                                             │
+│           │  seed complete                                                       │
+│           ▼                                                                      │
+│   ┌───────────────────────────────────────────────────────────┐                  │
+│   │                      INTERVIEW                            │                  │
+│   │                                                           │                  │
+│   │  ┌────────────┐   commit_turn()   ┌────────────────┐      │                  │
+│   │  │  Domain A  │ ───────────────▶  │  Domain A      │      │                  │
+│   │  │  q_asked=0 │                   │  q_asked=7     │      │                  │
+│   │  │  q_target=7│                   │  complete=true │      │                  │
+│   │  └────────────┘                   └───────┬────────┘      │                  │
+│   │                                           │ rotate        │                  │
+│   │  ┌────────────┐                           ▼               │                  │
+│   │  │  Domain B  │ ◀── domain_queue.pop() ───┘               │                  │
+│   │  │  q_asked=0 │                                           │                  │
+│   │  └────────────┘                                           │                  │
+│   │       ...                                                 │                  │
+│   │                                                           │                  │
+│   │  Per-turn LLM input (ONLY these fields):                  │                  │
+│   │    domain | level | last_q | last_a | domain_switch_flag  │                  │
+│   │                                                           │                  │
+│   │  Nothing else — no history, no eval signals, no state     │                  │
+│   └────────────────────────────────────────────────────────┬──┘                  │
+│                                                            │                     │
+│                                              all domains complete                │
+│                                                            ▼                     │
+│   ┌───────────────┐                                                              │
+│   │   COMPLETE    │  LLM bypassed — static closing text returned                 │
+│   │               │  Evaluation batch triggers for remaining domains             │
+│   │ "Thank you for│  Session marked complete in Redis                            │
+│   │  your time"   │                                                              │
+│   └───────────────┘                                                              │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 QA Data Schema
+
+The `QA.json` document is the single source of truth for all interview state, stored per-session in Redis:
+
+```json
+{
+    "session_id":       "550e8400-e29b-41d4-a716-446655440000",
+    "stage":            "interview",
+    "candidate": {
+        "raw_intro":    "Hi, I'm Sarah, senior backend engineer...",
+        "name":         "Sarah",
+        "level":        "advanced",
+        "notes":        "5 years Python, led ML platform team, ATS score 87"
+    },
+    "domains":          ["python", "system_design", "distributed_systems"],
+    "domain_queue":     ["system_design", "distributed_systems"],
+    "active_domain":    "python",
+    "domain_progress": {
+        "python": {
+            "q_asked":  4,
+            "q_target": 7,
+            "complete": false
+        },
+        "system_design": {
+            "q_asked":  0,
+            "q_target": 7,
+            "complete": false
+        }
+    },
+    "turns": [
+        {
+            "turn_index": 0,
+            "domain":     "python",
+            "q":          "What's the difference between a list and a tuple?",
+            "a":          "Lists are mutable, tuples are immutable...",
+            "ts":         1711234567.89
+        }
+    ],
+    "current_question": "How would you optimize a slow Python generator pipeline?",
+    "turn_index":       4,
+    "domain_switched":  false,
+    "total_questions":  4,
+    "created_at":       1711234500.0,
+    "updated_at":       1711234600.0
+}
+```
+
+### 9.3 LLM Modes
+
+```
+Data Flow Per Turn (interview stage):
+
+  voice_graph.node_llm()
+        │
+        ├─ 1. qa_controller.get_llm_input(session_id, candidate_answer)
+        │        └─▶ LLMInterviewInput:
+        │               { domain, level, last_q, last_a, domain_switch_flag }
+        │
+        ├─ 2. LLM API call (InterviewerMode)
+        │        └─▶ stream: "Great answer! Now, how would you..."
+        │
+        ├─ 3. sanitize(llm_response)
+        │
+        ├─ 4. qa_controller.commit_turn(session_id, answer, question)
+        │        └─▶ CommittedTurn:
+        │               { turn_index, domain, q, a, ts, domain_rotated }
+        │
+        ├─ 5. qa_audit_bus.route_turn(committed_turn, qa_doc)
+        │        └─▶ transcript_writer.write_turn()  [async, fire-and-forget]
+        │        └─▶ eval_engine.schedule_turn_eval() [async, fire-and-forget]
+        │
+        └─ 6. [if domain_rotated] qa_audit_bus.trigger_domain_eval()
+                   └─▶ eval_engine.schedule_domain_eval() [batch scoring]
+```
+
+**Intro phase (ATS extraction):**
+
+```
+Candidate speaks intro
+        │
+        ▼
+  STT → raw_intro_transcript
+        │
+        ▼
+  qa_controller.get_intro_input(session_id, intro_text)
+        │
+        ▼
+  ATSMode.extract(intro_text)
+   └─▶ GPT API: response_format=json_object
+   └─▶ Returns: { name, level, domains[], notes }
+        │
+        ▼
+  qa_controller.seed_from_intro(session_id, ats_result)
+   └─▶ Writes domains, level to QA.json
+   └─▶ Advances stage → "interview"
+   └─▶ Returns first LLMInterviewInput
+```
+
+---
+
+## 10. Evaluation Engine
+
+The evaluation engine scores every candidate answer **off the critical path** — TTS latency is never affected.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                         EVALUATION ENGINE                                      │
+│                                                                                │
+│  Triggers (all async, fire-and-forget from qa_audit_bus):                      │
+│    • Per-turn: schedule_turn_eval(session_id, turn)                            │
+│    • Per-domain: schedule_domain_eval(session_id, domain, turns)               │
+│                                                                                │
+│  ┌───────────────────────────────────────────────────────────────────────────┐ │
+│  │                      COST CONTROLS (in order)                             │ │
+│  │                                                                           │ │
+│  │  1. MINIMUM ANSWER GATE                                                   │ │
+│  │     answer.len < EVAL_MIN_ANSWER_CHARS (40)?                              │ │
+│  │     → skip ("Yes", "I don't know" not worth scoring)                      │ │
+│  │                                                                           │ │
+│  │  2. ADAPTIVE SAMPLING                                                     │ │
+│  │     first EVAL_FULL_EVAL_TURNS (5)? → always score                        │ │
+│  │     after that? → score 1 in EVAL_SAMPLE_RATE (3)                         │ │
+│  │                                                                           │ │
+│  │  3. PER-SESSION BUDGET                                                    │ │
+│  │     tokens_consumed >= EVAL_SESSION_BUDGET_TOKENS (50000)?                │ │
+│  │     → stop silently (Redis budget counter)                                │ │
+│  │                                                                           │ │
+│  │  4. CONTENT-HASH CACHE                                                    │ │
+│  │     sha256(question + answer) hit in Redis?                               │ │
+│  │     → return cached score instantly                                       │ │
+│  │                                                                           │ │
+│  │  5. DEDUP SENTINEL                                                        │ │
+│  │     Redis NX key: eval:dedup:v1:{session_id}:{turn_index}                 │ │
+│  │     → prevents double-scoring on retry                                    │ │
+│  │                                                                           │ │
+│  │  6. DEDICATED BULKHEAD                                                    │ │
+│  │     max EVAL_MAX_CONCURRENT (3) parallel scoring calls                    │ │
+│  │     A burst of PTT presses won't spawn 20 API calls                       │ │
+│  │                                                                           │ │
+│  │  7. TOKEN-BUCKET RATE LIMITER                                             │ │
+│  │     Separate from main LLM limiter                                        │ │
+│  │     Eval can't consume interview quota                                    │ │
+│  │                                                                           │ │
+│  │  8. CIRCUIT BREAKER                                                       │ │
+│  │     3 consecutive failures → OPEN                                         │ │
+│  │     Stops evaluation until model recovers                                 │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  Scoring Model: EVAL_MODEL (default: gpt-5.2)                                  │
+│  Scoring Input:                                                                │
+│    { domain, level, question, answer }  (truncated to avoid overrun)           │
+│                                                                                │
+│  Scoring Output (structured JSON):                                             │
+│    {                                                                           │
+│      "score": 1–10,                                                            │
+│      "dimension_scores": { "technical": 8, "communication": 7, ... },          │
+│      "feedback": "Strong explanation of GIL, missed mention of asyncio",       │
+│      "flags": ["partial", "off_topic"]                                         │
+│    }                                                                           │
+│                                                                                │
+│  Redis key layout:                                                             │
+│    eval:score:v1:{session_id}:{turn_index}    JSON blob                        │
+│    eval:budget:v1:{session_id}               int tokens consumed               │
+│    eval:dedup:v1:{session_id}:{turn_index}   NX sentinel                       │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Dead-Letter Queue for eval failures:**
+
+```
+eval_engine.schedule_domain_eval() fails
+        │
+        ▼
+  DLQ entry (in-process bounded queue)
+        │
+        ▼
+  Background retry task
+   └─▶ exponential backoff (1s, 2s, 4s, 8s, max 60s)
+   └─▶ max attempts: 5
+   └─▶ alert via observability if exhausted
+   └─▶ no turns silently dropped
+```
+
+---
+
+## 11. Session Management
+
+### 11.1 Session Store
+
+`session_store.py` provides IP-locked sessions with Redis as the primary store and an in-process LRU as fallback.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          SESSION STORE ARCHITECTURE                           │
+│                                                                               │
+│  Registration: POST /session/register                                         │
+│                                                                               │
+│  Client IP                                                                    │
+│      │                                                                        │
+│      ▼                                                                        │
+│  IP extraction priority:                                                      │
+│    1. CF-Connecting-IP  (Cloudflare)                                          │
+│    2. X-Forwarded-For   (standard proxy)                                      │
+│    3. REMOTE_ADDR       (direct connection)                                   │
+│      │                                                                        │
+│      ▼                                                                        │
+│  ip_hash = HMAC-SHA256(SESSION_SECRET_KEY, canonical_ip)                      │
+│  (raw IPs never stored)                                                       │
+│      │                                                                        │
+│      ▼                                                                        │
+│  Redis SETNX  session:lock:{ip_hash}                                          │
+│    ├── SUCCESS → new session allowed                                          │
+│    └── FAIL    → 409 Conflict ("active session exists for this IP")           │
+│      │                                                                        │
+│      ▼                                                                        │
+│  session_id = sha256(ip_hash + os.urandom(16))   (opaque, non-reversible)     │
+│      │                                                                        │
+│      ▼                                                                        │
+│  Redis SETEX  session:data:{session_id}  (TTL = SESSION_TTL_S + GRACE)        │
+│  Redis SETEX  session:meta:{ip_hash}     (ip_hash → session_id mapping)       │
+│      │                                                                        │
+│      ▼                                                                        │
+│  Response: { session_id, registered_from_ip (masked), expires_at }            │
+│                                                                               │
+│  Redis Key Layout:                                                            │
+│    session:lock:{ip_hash}     NX sentinel, TTL = TTL + GRACE                  │
+│    session:data:{session_id}  JSON conversation state, same TTL               │
+│    session:meta:{ip_hash}     session_id string lookup, same TTL              │
+│                                                                               │
+│  InMemoryLRU Fallback (Redis unreachable):                                    │
+│    Process-local, no cross-process guarantee                                  │
+│    Concurrency throttled in degraded_mode()                                   │
+│    Warning logged, SLA marked degraded in response                            │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 Session Lifecycle Manager
+
+`SessionLifecycleManager` in `voice_graph.py` handles all resource acquisition and release per session:
+
+```
+open_session(session_id)
+        │
+        ├─ 1. Mic health check            (async, optional via FF_SESSION_LIFECYCLE)
+        │       └─▶ recorder.run_startup_health_check()
+        │
+        ├─ 2. Speaker health check         (async, optional)
+        │       └─▶ player.check_audio_health()
+        │
+        ├─ 3. QA controller session create
+        │       └─▶ qa_controller.create_session(session_id)
+        │
+        ├─ 4. Audit bus open
+        │       └─▶ qa_audit_bus.open_session(session_id)
+        │
+        ├─ 5. Transcript writer begin
+        │       └─▶ transcript_writer.open_session(session_id)
+        │
+        ├─ 6. PCM format negotiation       (mic → STT, TTS → speaker)
+        │       └─▶ negotiate_format(mic_caps, stt_caps) → mic_fmt
+        │       └─▶ negotiate_format(tts_caps, speaker_caps) → tts_fmt
+        │
+        └─▶ SessionResources (fmt, start_time, diagnostics, watchdog)
+
+
+close_session(session_id, reason="complete")
+        │
+        ├─ 1. QA controller close
+        ├─ 2. Audit bus close + flush
+        ├─ 3. Transcript writer flush     (wait TRANSCRIPT_QUEUE_DEPTH drain)
+        ├─ 4. PCM stream drain            (flush speaker output)
+        ├─ 5. LLM session cache evict
+        ├─ 6. Temp file cleanup           (remove WAV uploads)
+        └─▶ Emit session_close ObsEvent
+```
+
+**Pipeline Watchdog:**
+
+```
+PipelineWatchdog
+    │
+    ├── Heartbeat check every WATCHDOG_INTERVAL_S (default: 5s)
+    ├── Monitors: StageBus depth, pipeline stage timestamps, error rates
+    │
+    ├── Strike system:
+    │     1 strike  → log warning
+    │     2 strikes → Prometheus alert
+    │     3 strikes → recovery action
+    │
+    └── Recovery actions (in escalation order):
+          1. mic_restart     (PCMInputStream.restart())
+          2. speaker_restart (PCMOutputStream.restart())
+          3. pipeline_reset  (cancel all tasks, reinitialize)
+```
+
+---
+
+## 12. Transcript Writer
+
+`transcription.py` writes every interview turn to two independent, non-blocking sinks simultaneously.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                         TRANSCRIPT WRITER (Dual Sink)                         │
+│                                                                               │
+│  After each committed turn:                                                   │
+│    transcript_writer.write_turn(session_id, user_text, assistant_text)        │
+│                                                                               │
+│                         asyncio.Queue (TRANSCRIPT_QUEUE_DEPTH=512)            │
+│                                   │                                           │
+│                         background drain task                                 │
+│                           (run_in_executor → thread pool)                     │
+│                                   │                                           │
+│                   ┌───────────────┴──────────────────┐                        │
+│                   │                                   │                       │
+│                   ▼                                   ▼                       │
+│            SINK A — .txt file               SINK B — observability            │
+│                                                                               │
+│  transcripts/session_{sid[:16]}.txt        emit(ObsEvent(                     │
+│                                                kind=TRANSCRIPT_TURN,          │
+│  Format:                                       session_id=...,                │
+│    ────────────────────────────             ))                                │
+│    Session  : {full_uuid}                        │                            │
+│    Started  : 2024-03-24 10:17:02 UTC            ├─▶ structlog JSON file      │
+│    ────────────────────────────             ├─▶ Prometheus counter            │
+│                                             │       ai_transcript_turns_total │
+│    [10:17:02] [d056d716]   <user>           ├─▶ MongoDB document              │
+│    [10:17:10] [AI]         <assistant>      └─▶ OTel span annotation          │
+│                                                                               │
+│    [10:18:05] [d056d716]   <user>                                             │
+│    [10:18:12] [AI]         <assistant>                                        │
+│                                                                               │
+│    ────────────────────────────                                               │
+│    Session ended : 2024-03-24 10:45:00 UTC                                    │
+│    ────────────────────────────                                               │
+│                                                                               │
+│  Queue full → TranscriptEmitter.queue_drop() → counter increment + log        │
+│  Flush on close: await transcript_writer.flush(timeout=5.0)                   │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 13. QA Audit Bus
+
+`conversation_memory.py` is **not** a conversation memory module — it is a dedicated audit routing bus between the pipeline and its downstream systems.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          QA AUDIT BUS (conversation_memory.py)                │
+│                                                                               │
+│  RESPONSIBILITIES:                                                            │
+│    1. Turn routing       → fan out CommittedTurns to transcript + eval        │
+│    2. Domain batch mgmt  → accumulate turns, dispatch when quota met          │
+│    3. Session lifecycle  → open/close events to transcript + observability    │
+│    4. Eval scheduling    → ensure each domain batch scored exactly once       │
+│    5. Audit snapshots    → Redis-backed per-session turn log                  │
+│    6. Dead-letter queue  → if eval unreachable, retry with backoff            │
+│                                                                               │
+│  DOES NOT:                                                                    │
+│    ✗ Build LangChain message lists  (qa_controller owns LLM input)            │
+│    ✗ Maintain rolling windows       (LLM never sees history)                  │
+│    ✗ Inject system prompts          (qa_controller owns all prompts)          │
+│    ✗ Track topics or hints          (qa_controller.QADocument owns state)     │
+│                                                                               │
+│  Data Flow:                                                                   │
+│                                                                               │
+│  voice_graph.node_llm()                                                       │
+│       │                                                                       │
+│       ├─ qa_controller.commit_turn() → CommittedTurn                          │
+│       │                                                                       │
+│       ▼                                                                       │
+│  qa_audit_bus.route_turn(committed_turn, qa_doc)                              │
+│       │                                                                       │
+│       ├─▶  transcript_writer.write_turn()          [fire-and-forget]          │
+│       ├─▶  eval_engine.schedule_turn_eval()        [fire-and-forget]          │
+│       └─▶  Redis: audit:v1:{session_id}:turns      [append JSON record]       │
+│                                                                               │
+│  [domain quota satisfied]                                                     │
+│  qa_audit_bus.trigger_domain_eval(session_id, domain, qa_doc)                 │
+│       │                                                                       │
+│       ├─ Check: audit:v1:{session_id}:domains_evaled  (idempotency)           │
+│       ├─ Mark domain as dispatched (Redis SET NX)                             │
+│       └─▶ eval_engine.schedule_domain_eval()       [async, fire-and-forget]   │
+│                                                                               │
+│  Redis key schema:                                                            │
+│    audit:v1:{session_id}:turns           → JSON list of AuditTurnRecord       │
+│    audit:v1:{session_id}:domains_evaled  → JSON set of dispatched domains     │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 14. Observability Stack
+
+### 14.1 Three-Layer Architecture
+
+`observability.py` (8,178 lines) implements a unified three-layer observability stack driven by a single `emit()` call:
+
+```
+                    emit(ObsEvent(...))
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+           ▼               ▼               ▼
+    LAYER 1             LAYER 2         LAYER 3
+    Structured          Prometheus      MongoDB
+    Logging             Metrics         Events
+
+ structlog console    Counters         Structured
+ + JSON file          Histograms       document per
+ (LOG_FILE)           Gauges           event
+                                       TTL = 90 days
+                      :9090/metrics
+                                       Grafana
+ Rich TUI live        Grafana          dashboards from
+ dashboard            dashboards       auto-generated JSON
+
+
+                           +
+                    LAYER 0 (optional)
+                    OpenTelemetry spans
+                    OTLP/gRPC export
+                    W3C TraceContext
+```
+
+**Correlation:** Every event, metric label, and MongoDB document is correlated by:
+- `session_id` (session-level correlation)
+- `request_id` (per-turn correlation)
+
+### Event Coverage
+
+| Domain | Events Tracked |
 |---|---|
-| http://localhost:3000 | admin / `GRAFANA_PASSWORD` |
-| http://localhost:9090 | — |
-| http://localhost:3200 | — |
-| http://localhost:8000/docs | — |
+| **STT** | transcription, language confidence, audio quality, remote fallback |
+| **LLM** | token usage, cache hit/miss, model fallback, stream vs batch |
+| **TTS** | synthesis, apology fallback, chunk errors, S3 upload |
+| **Eval** | scoring, budget, adaptive sampling, dedup |
+| **Sess** | registration, IP change, suspension, TTL expiry |
+| **Pipe** | stage retries, aborts, load shedding, SLA breaches |
+| **Mem** | history compression, turn overflow, LRU fallback |
+| **San** | sanitization warnings, prompt injection, truncation |
+| **CB** | circuit breaker state transitions (all services) |
+| **RL** | rate limiter exhaustion events |
+| **BH** | bulkhead saturation events |
+| **Ctrl** | PTT press/release, empty recording, pipeline interrupt |
+| **Transcript** | turn written, session open/close, queue drops |
 
-### Development Mode
+### 14.2 Metrics Reference
+
+**Pipeline metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_pipeline_requests_total` | Counter | `stage`, `status` | Total pipeline invocations |
+| `ai_pipeline_latency_seconds` | Histogram | `stage` | Per-stage latency distribution |
+| `ai_pipeline_inflight` | Gauge | — | Currently active pipeline requests |
+| `ai_pipeline_shed_total` | Counter | `reason` | Load-shedded requests |
+
+**STT metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_stt_requests_total` | Counter | `status`, `model` | Transcription attempts |
+| `ai_stt_latency_seconds` | Histogram | `model` | STT latency distribution |
+| `ai_stt_audio_duration_seconds` | Histogram | — | Input audio duration |
+| `ai_stt_language_confidence` | Histogram | `language` | Whisper language confidence |
+
+**LLM metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_llm_requests_total` | Counter | `status`, `model`, `cache` | LLM API calls |
+| `ai_llm_latency_seconds` | Histogram | `model` | LLM response latency |
+| `ai_llm_tokens_total` | Counter | `model`, `type` | Token consumption |
+| `ai_llm_cache_hits_total` | Counter | — | Redis cache hits |
+
+**TTS metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_tts_requests_total` | Counter | `status`, `voice` | TTS synthesis attempts |
+| `ai_tts_latency_seconds` | Histogram | `voice` | Synthesis latency |
+| `ai_tts_chars_total` | Counter | `voice` | Characters synthesized |
+
+**Eval metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_eval_requests_total` | Counter | `status` | Scoring attempts |
+| `ai_eval_skipped_total` | Counter | `reason` | Skipped evaluations |
+| `ai_eval_budget_exhausted_total` | Counter | — | Budget cap hits |
+| `ai_eval_score` | Histogram | `domain` | Score distributions by domain |
+
+**Transcript metrics:**
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `ai_transcript_turns_total` | Counter | — | Turns written to transcript |
+| `ai_transcript_drops_total` | Counter | — | Queue-full drops |
+
+### 14.3 Grafana Dashboards
+
+Auto-generated dashboard JSON is written to `GRAFANA_OUT_DIR` (default: `grafana/`) on startup. Five dashboards are provisioned:
+
+1. **Pipeline Overview** — request rate, latency percentiles (p50/p95/p99), error rate, inflight gauge
+2. **STT Performance** — audio duration distribution, confidence distribution, language breakdown
+3. **LLM Performance** — token rate, cache hit rate, latency heatmap, model fallback events
+4. **Session Analytics** — session count, duration distribution, IP change events
+5. **Evaluation** — score distributions per domain, budget consumption, circuit breaker state
+
+---
+
+## 15. Resilience Patterns
+
+All resilience primitives live in `shared.py` and are imported by every node.
+
+### 15.1 Circuit Breakers
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        CIRCUIT BREAKER STATE MACHINE                    │
+│                                                                         │
+│                                                                         │
+│  ┌─────────────┐   3 consecutive       ┌─────────────┐                  │
+│  │   CLOSED    │─── failures ────────▶ │    OPEN     │                  │
+│  │  (normal)   │                       │  (blocking) │                  │
+│  └─────────────┘                       └──────┬──────┘                  │
+│         ▲                                      │                        │
+│         │                               60s timeout                     │
+│         │                                      │                        │
+│         │                                      ▼                        │
+│         │                             ┌─────────────────┐               │
+│         │                             │   HALF-OPEN     │               │
+│  success│                             │  (test call)    │               │
+│  ──────────────────────────────────── │                 │               │
+│  failure────────────────────────────▶ │ 1 trial request │               │
+│                                       │  allowed        │               │
+│                                       └─────────────────┘               │
+│                                                                         │
+│  Per-service breakers (independent):                                    │
+│    circuit_breakers["stt"]   → STT API calls                            │
+│    circuit_breakers["llm"]   → LLM API calls                            │
+│    circuit_breakers["tts"]   → TTS API calls                            │
+│    circuit_breakers["eval"]  → Evaluation scoring calls                 │
+│    circuit_breakers["redis"] → Redis operations                         │
+│    circuit_breakers["mongo"] → MongoDB writes                           │
+│                                                                         │
+│  On OPEN:                                                               │
+│    STT breaker → try local Whisper fallback                             │
+│    LLM breaker → return static question bank response                   │
+│    TTS breaker → return cached apology audio                            │
+│    Eval breaker → skip evaluation, log event                            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 Rate Limiting & Bulkheads
+
+```
+Token-bucket rate limiter (per service):
+   ┌──────────────────────────────────────────────┐
+   │  RateLimiter(rpm=500)                        │
+   │    bucket_tokens = min(burst, tokens + rate) │
+   │    acquire(n=1) → wait until token available │
+   └──────────────────────────────────────────────┘
+
+Bulkhead pool (per operation type):
+   ┌─────────────────────────────────────────────┐
+   │  bulkheads["stt"]   = asyncio.Semaphore(5)  │
+   │  bulkheads["llm"]   = asyncio.Semaphore(10) │
+   │  bulkheads["tts"]   = asyncio.Semaphore(5)  │
+   │  bulkheads["eval"]  = asyncio.Semaphore(3)  │
+   │                                             │
+   │  Separate budgets → STT flood can't starve  │
+   │  LLM slots; eval can't steal interview quota│
+   └─────────────────────────────────────────────┘
+```
+
+### 15.3 Load Shedding
+
+```
+LoadSheddingGuard (per VoiceGraph instance):
+   ┌─────────────────────────────────────────────────────────┐
+   │                                                         │
+   │  inflight_count  ≥  max_inflight (20)?                  │
+   │        │                                                │
+   │       YES → raise LoadSheddingRejected → 503            │
+   │        │                                                │
+   │        NO → accept request, inflight_count += 1         │
+   │             on completion: inflight_count -= 1          │
+   │                                                         │
+   │  Three singletons → separate inflight caps:             │
+   │    voice_graph          max_inflight=20                 │
+   │    voice_graph_realtime max_inflight=10 (reserved)      │
+   │    voice_graph_low_lat  max_inflight=15                 │
+   │                                                         │
+   │  A standard request surge cannot exhaust realtime slots │
+   └─────────────────────────────────────────────────────────┘
+```
+
+### 15.4 Latency Budget
+
+```
+LatencyBudget — SLA deadline propagated via context variable:
+
+  Request enters pipeline:
+    budget = LatencyBudget(deadline_ms=PIPELINE_TIMEOUT * 1000)
+    _latency_budget_cv.set(budget)
+
+  Each node calls:
+    budget.check(stage="stt")
+      │
+      ├── remaining_ms() > 0 → proceed
+      └── remaining_ms() ≤ 0 → raise LatencyBudgetExceeded
+                                 → return error immediately
+                                 → never start a stage that's already late
+
+  Impact: prevents runaway requests from consuming resources
+  after the user-visible SLA is already blown.
+```
+
+### Backoff Retry
+
+```python
+# shared.py — backoff_retry decorator
+@backoff_retry(
+    max_attempts=3,
+    base_delay=0.5,
+    max_delay=10.0,
+    jitter=True,           # randomize ±25% to avoid thundering herd
+    exceptions=(httpx.TimeoutException, openai.RateLimitError),
+)
+async def _call_whisper(wav_bytes: bytes) -> dict:
+    ...
+```
+
+---
+
+## 16. Distributed Service Mode
+
+Each pipeline stage can run as an independent microservice. The `voice_graph.py` constructor accepts any object implementing the relevant `Protocol`, and factory functions (`get_stt_node()`, `get_llm_node()`, `get_tts_node()`) select local vs remote based on env vars:
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                       DISTRIBUTED SERVICE WIRING                             │
+│                                                                              │
+│  ENV vars control routing (set before module import):                        │
+│    STT_SERVICE_URL=https://stt.internal:8001  → RemoteSTTClient              │
+│    LLM_SERVICE_URL=https://llm.internal:8002  → RemoteLLMClient              │
+│    TTS_SERVICE_URL=https://tts.internal:8003  → RemoteTTSClient              │
+│                                                                              │
+│  [No URL set]   → local node (in-process, direct API calls)                  │
+│  [URL set]      → remote HTTP client (outbound requests, SSE streaming)      │
+│                                                                              │
+│  Remote clients inject on every request:                                     │
+│    1. W3C TraceContext headers  (OTel distributed tracing stays stitched)    │
+│    2. LatencyBudget-ms header   (remaining SLA propagated to remote node)    │
+│    3. Request-ID header         (correlation across service boundaries)      │
+│                                                                              │
+│  STT remote:                                                                 │
+│    POST {STT_SERVICE_URL}/transcribe                                         │
+│    Content-Type: multipart/form-data (binary audio)                          │
+│    Streaming: SSE for chunk transcription                                    │
+│                                                                              │
+│  LLM remote:                                                                 │
+│    POST {LLM_SERVICE_URL}/stream_question                                    │
+│    Body: LLMInterviewInput JSON                                              │
+│    Response: chunked transfer encoding (token stream)                        │
+│                                                                              │
+│  TTS remote:                                                                 │
+│    POST {TTS_SERVICE_URL}/synthesize_stream                                  │
+│    Body: token stream (chunked POST)                                         │
+│    Response: chunked audio bytes                                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Protocol definitions** (`shared.py`):
+
+```python
+class STTNodeProtocol(Protocol):
+    async def transcribe(self, audio_path: str, *, request_id: str) -> STTResult: ...
+    async def transcribe_chunk(self, chunk: PCMChunk, *, request_id: str) -> str: ...
+
+class LLMNodeProtocol(Protocol):
+    async def stream_question(self, input: LLMInterviewInput) -> AsyncIterator[str]: ...
+    async def extract_ats(self, intro_text: str) -> str: ...
+
+class TTSNodeProtocol(Protocol):
+    async def synthesize(self, text: str, *, request_id: str) -> str: ...
+    async def synthesize_pcm_stream(self, tokens: AsyncIterator[str]) -> AsyncIterator[PCMChunk]: ...
+```
+
+---
+
+## 17. Feature Flags
+
+All feature flags are resolved at module load time from environment variables. Changing them requires a process restart.
+
+| Flag | Default | Description |
+|---|---|---|
+| `FF_PCM_PIPELINE` | `false` | Enable zero-copy PCM-native pipeline (`stream_full_pcm` mode) |
+| `FF_BARGE_IN` | `false` | Enable barge-in detection (requires `FF_PCM_PIPELINE=true`) |
+| `FF_AUDIO_DIAGNOSTICS` | `true in dev` | Enable per-boundary PCM waveform measurements |
+| `FF_SESSION_LIFECYCLE` | `true` | Enable full session lifecycle management |
+| `FF_QUESTION_PREFETCH` | `true` | Prefetch next question while TTS is speaking |
+| `FF_CANARY_PCT` | `0.0` | Fraction (0.0–1.0) of requests routed to PCM pipeline for gradual rollout |
+
+**Canary rollout:**
+
+```
+FF_PCM_PIPELINE=false
+FF_CANARY_PCT=0.1       # 10% of requests use PCM pipeline
+
+# _should_use_pcm_pipeline(request_id):
+#   hash(request_id) % 1.0 < FF_CANARY_PCT → True (use PCM)
+```
+
+---
+
+## 18. API Reference
+
+### Endpoints
+
+#### `POST /voice`
+
+Single-shot voice processing. Returns complete result when pipeline finishes.
+
+**Request:**
+```
+Content-Type: multipart/form-data
+X-Session-ID: {session_id}         (required)
+X-Request-ID: {uuid}               (optional, auto-generated if absent)
+X-QoS-Tier: realtime|standard      (optional, defaults to standard)
+
+file: <audio file>                 (.wav, .mp3, .mp4, .m4a, .webm, .mpeg, .mpga)
+                                   max size: MAX_UPLOAD_MB (default 25 MB)
+```
+
+**Response `200 OK`:**
+```json
+{
+  "request_id":        "550e8400-...",
+  "transcript":        "What's the difference between a list and a tuple?",
+  "response":          "Great question! Let's explore Python mutability...",
+  "cleaned_response":  "Great question! Let us explore Python mutability...",
+  "audio":             "/audio/temp_OUT/abc123.mp3",
+  "audio_s3_uri":      "s3://my-bucket/tts/abc123.mp3",
+  "degraded":          false,
+  "error":             "",
+  "error_stage":       "",
+  "stage_latencies": {
+    "stt": 1.24,
+    "llm": 2.87,
+    "sanitize": 0.003,
+    "tts": 1.56
+  },
+  "pipeline_latency_s": 5.77,
+  "graph_version":     "v1.4.0",
+  "metadata":          {}
+}
+```
+
+**Error responses:**
+
+| Code | Condition |
+|---|---|
+| `400` | Missing/invalid session ID, unsupported file type |
+| `413` | Audio file exceeds `MAX_UPLOAD_MB` |
+| `503` | Load shedding (max inflight reached) |
+| `504` | Pipeline timeout |
+
+---
+
+#### `WebSocket /voice/stream`
+
+Streaming voice processing. Sends partial results as pipeline stages complete.
+
+**Protocol:**
+
+```
+Client → Server: binary audio frame (raw PCM or encoded)
+Server → Client: JSON messages:
+
+  { "type": "transcript",   "text": "..." }          # STT complete
+  { "type": "llm_token",    "token": "..." }          # LLM streaming token
+  { "type": "audio_chunk",  "bytes": "<base64>" }     # TTS audio chunk
+  { "type": "done",         "result": {...} }          # Pipeline complete
+  { "type": "error",        "message": "...",
+                            "stage": "stt" }           # Stage error
+```
+
+---
+
+#### `POST /session/register`
+
+Register a new interview session. One active session permitted per IP.
+
+**Response `200`:**
+```json
+{
+  "session_id":          "550e8400-e29b-41d4-a716-446655440000",
+  "registered_from_ip":  "192.168.*.1",
+  "expires_at":          1711234567.89
+}
+```
+
+**Response `409`:**
+```json
+{ "detail": "An active session already exists for this IP address." }
+```
+
+---
+
+#### `POST /session/end`
+
+Explicitly end a session and release the IP lock.
+
+**Headers:** `X-Session-ID: {session_id}`
+
+---
+
+#### `POST /session/refresh`
+
+Refresh session TTL (call periodically for long interviews).
+
+**Headers:** `X-Session-ID: {session_id}`
+
+---
+
+#### `DELETE /cancel/{request_id}`
+
+Cancel an in-flight pipeline request across all three graph instances.
+
+**Response `200`:**
+```json
+{ "cancelled": true, "request_id": "..." }
+```
+
+---
+
+#### `GET /health`
+
+Service health check. Returns 200 if healthy, 503 if degraded.
+
+```json
+{
+  "status": "healthy",
+  "graph_version": "v1.4.0",
+  "integrations": {
+    "audit_bus":        "ok",
+    "transcript_writer":"ok",
+    "finalize_eval":    "ok"
+  },
+  "graphs": {
+    "standard":     { "inflight": 3, "healthy": true },
+    "realtime":     { "inflight": 0, "healthy": true },
+    "low_latency":  { "inflight": 1, "healthy": true }
+  }
+}
+```
+
+---
+
+#### `GET /metrics`
+
+Prometheus metrics in text exposition format.
+
+---
+
+### Integration Wiring (Lifespan)
+
+The three downstream integrations are wired in the FastAPI `lifespan` context manager:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await _obs_bootstrap()
+    set_audit_bus(qa_audit_bus)
+    set_transcript_writer(transcript_writer)
+    set_finalize_eval(evaluation_engine.finalize_session)
+
+    yield
+
+    # Shutdown — drain all three singletons
+    for graph in _ALL_GRAPHS:
+        await graph.session_manager.force_close_all("shutdown")
+    await transcript_writer.flush(timeout=10.0)
+```
+
+---
+
+## 19. Desktop Controller (PTT)
+
+`controller.py` is the desktop input layer — keyboard events, recording, and pipeline dispatch.
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                          DESKTOP PTT CONTROLLER                               │
+│                                                                               │
+│  Process startup:                                                             │
+│    1. show_boot_sequence()        (Rich TUI boot screen)                      │
+│    2. _voice_graph_startup()      (initialize nodes, warm connections)        │
+│    3. _register_session()         (register with session_store as local IP)   │
+│    4. Start asyncio event loop on background thread                           │
+│    5. Enter keyboard poll loop (POLL_INTERVAL_S = 30ms)                       │
+│                                                                               │
+│  PTT_KEY (default: 'h') held:                                                 │
+│    ┌──────────────────────────────────────────────────────────────────────┐   │
+│    │  1. _interrupt() called:                                             │   │
+│    │       stop_all()                   # stop speaker output             │   │
+│    │       cancel active pipeline task  # via _active.take()              │   │
+│    │       set _interrupt_flag          # discard queued coroutines       │   │
+│    │                                                                      │   │
+│    │  2. record_audio_until_released(is_held_fn=keyboard.is_pressed)      │   │
+│    │       PCMInputStream → VAD → enhancement → WAV                       │   │
+│    │       blocks until key released                                      │   │
+│    │                                                                      │   │
+│    │  3. [key released]                                                   │   │
+│    │       If silence only → empty recording counter, skip dispatch       │   │
+│    │       If speech detected → _dispatch(audio_path)                     │   │
+│    └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                               │
+│  _dispatch(audio_path):                                                       │
+│    request_id = new_request_id()                                              │
+│    _active.set(request_id)                                                    │
+│    run_coroutine_threadsafe(_run_pipeline(audio_path), _loop)                 │
+│                                                                               │
+│  _run_pipeline(audio_path):                                                   │
+│    result = await voice_graph.run(state={                                     │
+│        "audio_path": audio_path,                                              │
+│        "session_id": _session_id,                                             │
+│        "request_id": request_id,                                              │
+│    })                                                                         │
+│    play_pcm_bytes(result.audio_bytes, fmt)                                    │
+│    delete_temp_recording(audio_path)                                          │
+│                                                                               │
+│  EXIT_KEY (default: 'esc'):                                                   │
+│    cancel active pipeline                                                     │
+│    _voice_graph_shutdown()                                                    │
+│    stop_all() + drain_output()                                                │
+│    session_store.end_session(_session_id)                                     │
+│    sys.exit(0)                                                                │
+│                                                                               │
+│  Single asyncio event loop on background thread:                              │
+│    One loop, zero teardown overhead per PTT press                             │
+│    run_coroutine_threadsafe() — safe cross-thread dispatch                    │
+│    _interrupt_flag prevents stale coroutines from starting                    │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Controller metrics:**
+
+| Metric | Description |
+|---|---|
+| `controller_sessions_total` | PTT sessions dispatched |
+| `controller_interrupts_total` | Pipelines interrupted by user |
+| `controller_empty_recordings_total` | PTT releases with no usable audio |
+| `controller_pipeline_errors_total` | Unhandled pipeline errors |
+| `controller_recording_duration_seconds` | Mic hold duration per PTT press |
+
+---
+
+## 20. Kafka Integration
+
+`StageBus` in `voice_graph.py` can be replaced with a Kafka-backed implementation for distributed multi-node deployments:
+
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                    KAFKA STAGE BUS (optional)                                 │
+│                                                                               │
+│  Default: StageBus wraps BoundedPipelineQueue (in-process, asyncio)           │
+│  With Kafka: StageBus wraps KafkaStageBus (distributed, cross-node)           │
+│                                                                               │
+│  Enable:                                                                      │
+│    KAFKA_BOOTSTRAP_SERVERS=broker1:9092,broker2:9092                          │
+│    KAFKA_STAGE_BUS_ENABLED=true                                               │
+│                                                                               │
+│  Topic naming:                                                                │
+│    voice.stage.{session_id}.{source}_{dest}                                   │
+│    e.g.: voice.stage.550e84.stt_llm                                           │
+│                                                                               │
+│  Stage consumers:                                                             │
+│    STT node publishes to:   voice.stage.*.stt_llm                             │
+│    LLM node consumes from:  voice.stage.*.stt_llm                             │
+│    LLM node publishes to:   voice.stage.*.llm_tts                             │
+│    TTS node consumes from:  voice.stage.*.llm_tts                             │
+│                                                                               │
+│  Overflow policy → Kafka topic retention policy                               │
+│  DLQ → dedicated Kafka dead-letter topic                                      │
+│  Backpressure → consumer lag monitoring via Prometheus                        │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 21. Deployment
+
+### Docker
+
+```dockerfile
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg portaudio19-dev libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000 9090
+
+CMD ["gunicorn", "main:app", \
+     "-k", "uvicorn.workers.UvicornWorker", \
+     "--workers", "4", \
+     "--bind", "0.0.0.0:8000", \
+     "--timeout", "120", \
+     "--graceful-timeout", "30"]
+```
 
 ```bash
-ENV=development LOG_MODE=standard python -m app.endpoint.main --no-reload
+docker build -t voice-interview-pipeline .
+docker run -d \
+  --name voice-pipeline \
+  -p 8000:8000 \
+  -p 9090:9090 \
+  -e OPENAI_API_KEY=sk-... \
+  -e SESSION_SECRET_KEY=your-key \
+  -e REDIS_URL=redis://redis:6379/0 \
+  -e MONGO_URI=mongodb://mongo:27017 \
+  voice-interview-pipeline
 ```
 
-In development mode:
-- `node_playback_dev` is compiled into the graph (local audio playback)
-- `IS_DEV=true` throughout the codebase
-- Warnings for production-unsafe settings are suppressed
+### Docker Compose
 
-**MODES:**
+```yaml
+version: "3.9"
 
-**Interactive CLI:**
-```
- .\run.ps1 → interactive CLI
-```
-or
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      SESSION_SECRET_KEY: ${SESSION_SECRET_KEY}
+      REDIS_URL: redis://redis:6379/0
+      MONGO_URI: mongodb://mongo:27017
+      LLM_MODEL: gpt-5.2
+      TTS_VOICE: nova
+    depends_on:
+      - redis
+      - mongo
+    restart: unless-stopped
 
-**Manual — uvicorn local:**
-```
- docker compose -f docker-compose.yaml up -d --scale app=0
- dotenv -f .env -f .env.local run -- uvicorn app.endpoint.main:app --reload
-```
-or
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
 
-**Manual — uvicorn Docker:**
-```
- docker compose up -d
-```
-or
+  mongo:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
 
-**Manual — gunicorn Docker:**
-```
-docker compose -f docker-compose.yaml up -d
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana:/etc/grafana/provisioning/dashboards
+
+volumes:
+  mongo-data:
 ```
 
-> **Note:** `--reload` is safe to use. OTel and Prometheus bootstrap already guard against double-init — the warnings you may see on reloader startup are harmless and suppressed in development mode.
+### Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-pipeline
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: voice-pipeline
+  template:
+    metadata:
+      labels:
+        app: voice-pipeline
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+        - name: app
+          image: voice-interview-pipeline:latest
+          ports:
+            - containerPort: 8000
+            - containerPort: 9090
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-secret
+                  key: api-key
+            - name: SESSION_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: session-secret
+                  key: key
+            - name: REDIS_URL
+              value: redis://redis-service:6379/0
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+```
 
 ---
 
-## 31. Dependency Map
+## 22. Performance Tuning
+
+### Latency Budget Allocation (Default)
 
 ```
-settings.py
-  ← shared.py (reads settings via getattr)
-  ← STT_service.py
-  ← LLM_service.py
-  ← TTS_service.py
-  ← voice_graph.py
-  ← main.py
-  ← controller.py
+Total PIPELINE_TIMEOUT = 120s
 
-shared.py
-  ← STT_service.py
-  ← LLM_service.py
-  ← TTS_service.py
-  ← voice_graph.py
-  ← session_store.py
-  ← conversation_memory.py
-  ← evaluation_engine.py
-  ← transcription.py
-  ← main.py
-  ← controller.py
+  Stage           Timeout   Retries    Notes
+  ─────────────────────────────────────────────────────────
+  STT             30s       1          Retry adds up to 30s extra
+  LLM             45s       1          Retry adds up to 45s extra
+  TTS             30s       0          No retry (apology fallback instead)
+  Sanitize        ~3ms      —          CPU-bound, negligible
+  ─────────────────────────────────────────────────────────
+  Baseline        105s                 Without retries
+  Worst case      180s                 All retries exhausted
 
-log_config.py
-  ← shared.py (configure_logging called at import)
-
-observability.py
-  ← voice_graph.py (emitters, span ctx managers)
-  ← STT_service.py
-  ← LLM_service.py
-  ← TTS_service.py
-  ← session_store.py
-  ← transcription.py
-  ← evaluation_engine.py
-  ← controller.py
-  ← main.py (bootstrap)
-
-session_store.py
-  ← conversation_memory.py (imports session_store)
-  ← voice_graph.py (lazy import inside node_llm)
-  ← main.py (session_router)
-  ← controller.py
-
-conversation_memory.py
-  ← voice_graph.py (lazy import inside node_llm)
-
-evaluation_engine.py
-  ← voice_graph.py (lazy import inside node_llm)
-  ← controller.py (shutdown)
-
-transcription.py
-  ← voice_graph.py (lazy import inside node_llm)
-  ← controller.py (open/close session, flush)
-
-STT_service.py → voice_graph.py (STTNodeProtocol)
-LLM_service.py → voice_graph.py (LLMNodeProtocol)
-TTS_service.py → voice_graph.py (TTSNodeProtocol)
-sanitize.py    → voice_graph.py (node_sanitize)
-
-voice_graph.py → main.py (voice_graph, voice_graph_realtime, voice_graph_low_latency)
-voice_graph.py → pipeline.py
-voice_graph.py → controller.py
-
-player.py  → voice_graph.py (play_audio, stop_all)
-           → controller.py
-recorder.py → controller.py
-
-startup_display.py → controller.py
-
-docker-compose.yaml → external: Redis, MongoDB, Prometheus, Grafana, Tempo, Loki
+Realtime profile (voice_graph_realtime):
+  STT: 12s, LLM: 18s, TTS: 12s, 0 retries → 42s worst case
 ```
 
-**Lazy imports in `node_llm`:** `session_store`, `evaluation_engine`, `conversation_memory`, and `transcript_writer` are imported inside the node function body, not at module level. This avoids circular import issues (those modules import `voice_graph` indirectly via `settings` or `shared`) and ensures they are only loaded when actually needed.
+### Key Levers
+
+| Lever | Impact | Where to set |
+|---|---|---|
+| `TTS_FORMAT=pcm` | -100–200ms per turn | `.env` |
+| `FF_PCM_PIPELINE=true` | -300–600ms total | `.env` |
+| `LLM_MODEL=gpt-5-mini` | -500–1500ms LLM latency | `.env` |
+| `FF_QUESTION_PREFETCH=true` | -200–800ms LLM latency (amortized) | `.env` (default on) |
+| `GRAPH_LLM_TIMEOUT` | Guards runaway calls | `.env` |
+| `GRAPH_MAX_INFLIGHT` | Prevent overload | `.env` |
+| `EVAL_SAMPLE_RATE=5` | Reduce eval API cost | `.env` |
+| `REDIS_POOL_SIZE=50` | Reduce Redis latency under load | `.env` |
+
+### PCM Pipeline Latency Budget
+
+```
+Without FF_PCM_PIPELINE (file-based):
+  Mic capture     →  disk write (.wav)         ~50ms overhead
+  WAV on disk     →  STT read                  ~10ms overhead
+  TTS bytes       →  disk write + read          ~30ms overhead
+  Play audio file →  file open + device open   ~100ms overhead
+                                               ─────────────
+                                               ~190ms removable overhead
+
+With FF_PCM_PIPELINE (zero file I/O):
+  PCMChunk        →  WAV encode in memory      ~1ms
+  PCMChunks       →  PCMOutputStream (warm)    ~0ms device open
+                                               ─────────────
+                                               ~191ms saved per turn
+```
 
 ---
 
-*This document covers every file, every class, every design decision, and every integration point in the Voice Assistant Pipeline codebase. For questions about a specific subsystem, refer to the section index above.*
+## 23. Troubleshooting
+
+### Common Issues
+
+**Redis connection failure:**
+```
+WARNING  session_store degraded_mode=True
+CRITICAL SessionSecretKey not configured — refusing to start
+```
+→ Check `REDIS_URL`. System falls back to `InMemoryLRU` but **cross-process session guarantees are lost**. Set `REDIS_URL` for production.
+
+---
+
+**STT circuit breaker OPEN:**
+```
+WARNING  stt_circuit_breaker state=OPEN fallback=local_whisper
+```
+→ Whisper API is returning errors. Check `OPENAI_API_KEY` validity. Confirm rate limits. If `OPENAI_BASE_URL` is set, verify local endpoint is healthy.
+
+---
+
+**Load shedding 503:**
+```
+INFO   load_shed request_id=... max_inflight=20 current=20
+```
+→ Increase `GRAPH_MAX_INFLIGHT` or scale horizontally. Check if `voice_graph_realtime` is saturated separately.
+
+---
+
+**TTS timeout:**
+```
+ERROR  tts_timeout timeout=30.0 stage=tts
+```
+→ Increase `GRAPH_TTS_TIMEOUT`. Check if sanitized text is very long (truncated by sanitizer? Check `SanitizeResult.truncated`). Verify TTS API response times in Prometheus.
+
+---
+
+**Empty recordings (PTT mode):**
+```
+INFO  controller_empty_recording request_id=...
+```
+→ PTT was pressed but VAD gate detected only silence. Check mic input level. Verify `PCMVADGate` threshold isn't too aggressive for the recording environment. Run `recorder.run_startup_health_check()`.
+
+---
+
+**PCM pipeline unavailable:**
+```
+RuntimeError: PCM pipeline is not enabled. Set VOICE_FF_PCM_PIPELINE=1
+              or configure FF_CANARY_PCT for gradual rollout.
+```
+→ Set `FF_PCM_PIPELINE=true` in `.env`. For gradual rollout: set `FF_CANARY_PCT=0.1` (10% of traffic).
+
+---
+
+**MongoDB writes dropping:**
+```
+WARNING  mongo_queue_full events_dropped=47
+```
+→ Increase `MONGO_QUEUE_DEPTH`. Increase `MONGO_BATCH_SIZE`. Verify MongoDB write latency is acceptable. Consider sharding if sustained.
+
+---
+
+**ATS extraction fails (bad JSON from LLM):**
+```
+WARNING  ats_parse_failed fallback=rule_based
+```
+→ ATSMode validates schema and falls back to rule-based extraction. The fallback extracts keywords from the raw intro text. Check `LLM_MODEL` — newer models have better JSON adherence.
+
+---
+
+### Health Check Endpoints
+
+```bash
+# Service health
+curl http://localhost:8000/health
+
+# Prometheus metrics
+curl http://localhost:9090/metrics | grep ai_
+
+# Session debug (requires X-Session-ID header)
+curl -H "X-Session-ID: {sid}" http://localhost:8000/debug/session
+
+# Recording health (desktop mode)
+python -c "
+import asyncio
+from app.audio_essentials.recorder import run_startup_health_check
+result = asyncio.run(run_startup_health_check())
+print(result)
+"
+```
+
+---
+
+## 24. Development Guide
+
+### Project Structure for Tests
+
+```
+tests/
+├── unit/
+│   ├── test_sanitize.py         # 27-step sanitizer pipeline
+│   ├── test_qa_controller.py    # State machine transitions
+│   ├── test_session_store.py    # Redis + LRU fallback
+│   └── test_audio_engine.py     # PCMFormat, PCMChunk, converters
+├── integration/
+│   ├── test_voice_graph.py      # Full pipeline with mock nodes
+│   ├── test_evaluation.py       # Eval with mock LLM
+│   └── test_transcript.py       # Dual-sink writer
+└── fixtures/
+    ├── sample_audio.wav         # 3s test audio
+    └── mock_nodes.py            # Protocol-compliant mock STT/LLM/TTS
+```
+
+### Implementing a Custom Node
+
+Any class satisfying the relevant `Protocol` can be injected:
+
+```python
+from app.common.shared import STTNodeProtocol
+from app.audio_essentials.audio_engine import PCMChunk
+
+class MySTTNode:
+    """Custom STT implementation."""
+
+    async def transcribe(self, audio_path: str, *, request_id: str):
+        # ... your implementation
+        return STTResult(transcript="...", language="en", confidence=0.95)
+
+    async def transcribe_chunk(self, chunk: PCMChunk, *, request_id: str) -> str:
+        # PCM-native path
+        return "..."
+
+# Inject into voice graph
+from app.orchestration.voice_graph import VoiceGraph, VoiceGraphConfig
+
+graph = VoiceGraph(
+    stt=MySTTNode(),
+    cfg=VoiceGraphConfig(),
+)
+```
+
+### Running a Single Pipeline Turn
+
+```python
+import asyncio
+from app.orchestration.voice_graph import voice_graph, VoiceState
+
+async def test_turn():
+    state: VoiceState = {
+        "audio_path": "tests/fixtures/sample_audio.wav",
+        "session_id": "test-session-001",
+        "request_id": "req-001",
+    }
+    result = await voice_graph.run(state)
+    print(result["transcript"])
+    print(result["response"])
+    print(f"Latency: {result['pipeline_latency_s']:.2f}s")
+
+asyncio.run(test_turn())
+```
+
+### Extending the QA State Machine
+
+To add a new interview stage, edit `qa_controller.py`:
+
+```python
+class QAStage(str, Enum):
+    GREETING  = "greeting"
+    INTRO     = "intro"
+    INTERVIEW = "interview"
+    COMPLETE  = "complete"
+    MY_STAGE  = "my_stage"    # ← add here
+```
+
+Then add routing logic in `voice_graph.py → node_llm()`:
+
+```python
+if stage == QAStage.MY_STAGE:
+    return await my_stage_handler(state)
+```
+
+### Structured Event Emission
+
+```python
+from app.monitoring.observability import emit, ObsEvent, EventKind
+
+# In any pipeline node:
+emit(ObsEvent(
+    kind="my_custom_event",
+    service="my_service",
+    session_id=session_id,
+    request_id=request_id,
+    ts=time.time(),
+    extra={"my_field": my_value},
+))
+# → structlog, Prometheus, MongoDB, OTel — all at once
+```
+
+### Debugging PCM Pipeline
+
+```python
+from app.audio_essentials.audio_engine import PCMLatencyTracker, PCMWaveformAnalyzer
+
+# Get per-stage latency report
+from app.audio_essentials.recorder import get_recording_latency_report
+report = get_recording_latency_report()
+# {
+#   "capture_start": {"mean_ms": 12.3, "p95_ms": 18.7},
+#   "vad_pass":      {"mean_ms": 0.4,  "p95_ms": 0.8},
+#   "wav_encode":    {"mean_ms": 1.1,  "p95_ms": 1.9},
+# }
+
+# Get waveform stats for a PCMChunk
+from app.audio_essentials.audio_engine import PCMWaveformAnalyzer, PCMFormat
+analyzer = PCMWaveformAnalyzer(PCMFormat.whisper())
+stats = analyzer.analyze(chunk)
+# WaveformStats(rms=0.12, peak=0.87, clipping_ratio=0.002, dc_offset=0.001)
+```
+
+---
+
+## Appendix: Full Component Interaction Timeline
+
+```
+                    COMPLETE REQUEST TIMELINE (interview turn)
+                    ─────────────────────────────────────────
+
+t=0ms     PTT key held / HTTP request received
+          │
+          ├─ IP extracted, session_id validated (Redis lookup ~1ms)
+          │
+t=1ms     ─ Pipeline starts: LoadSheddingGuard.acquire()
+          │
+          ├─ LatencyBudget set (120s deadline)
+          │
+t=2ms     ─ node_stt enters:
+          │   bulkheads["stt"].acquire()
+          │   circuit_breaker["stt"].check()
+          │
+t=3ms     ─ Whisper API call starts (network + inference)
+          │
+t=1240ms  ─ STT returns: transcript = "What does GIL mean?"
+          │   PCMConfidenceFilter passes (logprob > threshold)
+          │   STTEmitter.success() → structlog + Prometheus + MongoDB + OTel
+          │
+t=1241ms  ─ node_llm enters:
+          │   qa_controller.get_llm_input(session_id, "What does GIL mean?")
+          │   → LLMInterviewInput { domain="python", level="advanced", ... }
+          │
+          │   [Cache check: Redis GET cache:llm:{hash}] → MISS
+          │
+          │   LLM API streaming call starts
+          │
+t=2100ms  ─ First LLM token arrives: "Excellent"
+t=2250ms  ─ Token stream complete: "Excellent question! The GIL..."
+          │   _ResponseValidator: valid question found ✓
+          │   LLMEmitter.success() → all sinks
+          │
+t=2251ms  ─ node_sanitize:
+          │   sanitize_for_tts(llm_response) → SanitizeResult
+          │   27 steps, ~2ms CPU
+          │
+t=2253ms  ─ node_tts enters:
+          │   PCMTTSOutputConfig check
+          │   TTS API streaming starts
+          │
+t=2800ms  ─ First TTS audio chunk arrives
+          │   PCMTTSQualityGate: RMS=0.14, peak=0.71 → OK
+          │   PCMSentenceGapManager: no gap (first sentence)
+          │   PCMPlaybackEnhancer: limiter pass-through (no clip)
+          │   PCMOutputStream.write(chunk) → speaker starts
+          │
+t=3200ms  ─ TTS complete
+          │   TTSEmitter.success()
+          │
+          ├─ [fire-and-forget async tasks]:
+          │     qa_audit_bus.route_turn() →
+          │       transcript_writer.write_turn()     (async queue)
+          │       eval_engine.schedule_turn_eval()   (async task)
+          │
+t=3201ms  ─ Pipeline result built
+          │   pipeline_latency_s = 3.2s
+          │   PipelineEmitter.complete()
+          │
+t=3202ms  ─ Response returned to caller
+          │   JSON with transcript, response, audio path, stage_latencies
+          │
+          ├─ [background, off critical path]:
+t=3500ms      transcript_writer drains queue → .txt + MongoDB
+t=4000ms      eval_engine scores answer → Redis score key
+              adaptive_sampling: turn 4 of 5 always-score → SCORED
+              budget: 847 tokens consumed (remaining: 49,153)
+```
+
+---
+
+<div align="center">
+
+**Built for production. Designed for clarity. Instrumented for everything.**
+
+Total codebase: ~49,908 lines | 19 modules | 5 execution modes | 3-layer observability
+
+</div>
