@@ -102,7 +102,7 @@
       },
       "targets": [
         {
-          "expr": "ai_pipeline_inflight",
+          "expr": "voice_pipeline_active",
           "legendFormat": "Active Pipelines"
         }
       ],
@@ -156,7 +156,7 @@
       },
       "targets": [
         {
-          "expr": "ai_session_active",
+          "expr": "session_active",
           "legendFormat": "Active Sessions"
         }
       ],
@@ -210,7 +210,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "Pipeline P99 (s)"
         }
       ],
@@ -372,7 +372,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(ai_eval_budget_exhausted_total[1h]))",
+          "expr": "sum(increase(eval_budget_exhausted_total[1h]))",
           "legendFormat": "Eval Budget Exhaust"
         }
       ],
@@ -438,18 +438,18 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_pipeline_requests_total{status=\"ok\"}[1m])) * 60",
+          "expr": "sum(rate(voice_pipeline_completions_total{status=\"ok\"}[1m])) * 60",
           "legendFormat": "ok",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_pipeline_requests_total{status=\"error\"}[1m])) * 60",
+          "expr": "sum(rate(voice_pipeline_completions_total{status=\"error\"}[1m])) * 60",
           "legendFormat": "error",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_pipeline_requests_total{status=\"cache\"}[1m])) * 60",
-          "legendFormat": "cache",
+          "expr": "sum(rate(voice_pipeline_completions_total{status=\"empty\"}[1m])) * 60",
+          "legendFormat": "empty",
           "interval": "30s"
         }
       ],
@@ -487,17 +487,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(ai_pipeline_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99",
           "interval": "30s"
         }
@@ -536,22 +536,22 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"stt\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_pipeline_stage_latency_seconds_bucket{stage=\"stt\"}[5m])) by (le))",
           "legendFormat": "stt",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"llm\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_pipeline_stage_latency_seconds_bucket{stage=\"llm\"}[5m])) by (le))",
           "legendFormat": "llm",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"tts\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_pipeline_stage_latency_seconds_bucket{stage=\"tts\"}[5m])) by (le))",
           "legendFormat": "tts",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ai_pipeline_stage_latency_seconds_bucket{stage=\"sanitize\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(voice_pipeline_stage_latency_seconds_bucket{stage=\"sanitize\"}[5m])) by (le))",
           "legendFormat": "sanitize",
           "interval": "30s"
         }
@@ -590,7 +590,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_pipeline_stage_errors_total[1m])) by (stage)",
+          "expr": "sum(rate(voice_pipeline_stage_errors_total[1m])) by (stage)",
           "legendFormat": "{{stage}}",
           "interval": "30s"
         }
@@ -629,12 +629,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_pipeline_stage_retries_total[5m])) by (stage)",
+          "expr": "sum(rate(voice_pipeline_stage_retries_total[5m])) by (stage)",
           "legendFormat": "retry:{{stage}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_pipeline_aborted_total[5m])) by (reason)",
+          "expr": "sum(rate(voice_pipeline_cancellations_total[5m])) by (reason)",
           "legendFormat": "abort:{{reason}}",
           "interval": "30s"
         }
@@ -673,17 +673,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_pipeline_load_shed_total[5m])) by (tier)",
+          "expr": "sum(rate(voice_pipeline_load_shed_total[5m])) by (tier)",
           "legendFormat": "shed:{{tier}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_pipeline_degraded_total[5m])) by (stage)",
+          "expr": "sum(rate(voice_pipeline_degraded_total[5m])) by (stage)",
           "legendFormat": "degraded:{{stage}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_pipeline_cancelled_total[5m])) by (stage)",
+          "expr": "sum(rate(voice_pipeline_cancellations_total[5m]))",
           "legendFormat": "cancelled:{{stage}}",
           "interval": "30s"
         }
@@ -722,7 +722,7 @@
       },
       "targets": [
         {
-          "expr": "ai_pipeline_inflight",
+          "expr": "voice_pipeline_active",
           "legendFormat": "{{tier}}",
           "interval": "30s"
         }
@@ -773,7 +773,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_stt_requests_total[1m])) by (status) * 60",
+          "expr": "sum(rate(stt_requests_total[1m])) by (status) * 60",
           "legendFormat": "{{status}}",
           "interval": "30s"
         }
@@ -812,17 +812,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(ai_stt_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(stt_latency_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99",
           "interval": "30s"
         }
@@ -861,7 +861,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_language_confidence_bucket[10m])) by (le, language))",
+          "expr": "histogram_quantile(0.50, sum(rate(stt_language_confidence_bucket[10m])) by (le, language))",
           "legendFormat": "{{language}} p50",
           "interval": "30s"
         }
@@ -917,22 +917,22 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_stt_empty_audio_total[5m]))",
+          "expr": "sum(rate(stt_empty_audio_total[5m]))",
           "legendFormat": "empty_audio",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_stt_low_confidence_total[5m]))",
+          "expr": "sum(rate(stt_low_confidence_total[5m]))",
           "legendFormat": "low_confidence",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_stt_remote_fallback_total[5m]))",
+          "expr": "sum(rate(stt_remote_fallback_total[5m]))",
           "legendFormat": "remote_fallback",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_stt_path_rejected_total[5m]))",
+          "expr": "sum(rate(stt_path_rejected_total[5m]))",
           "legendFormat": "path_rejected",
           "interval": "30s"
         }
@@ -971,12 +971,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(stt_audio_duration_seconds_bucket[10m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(stt_audio_duration_seconds_bucket[10m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         }
@@ -1027,7 +1027,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_llm_requests_total[1m])) by (status, model) * 60",
+          "expr": "sum(rate(llm_requests_total[1m])) by (status, model) * 60",
           "legendFormat": "{{status}}:{{model}}",
           "interval": "30s"
         }
@@ -1066,12 +1066,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+          "expr": "histogram_quantile(0.50, sum(rate(llm_latency_seconds_bucket[5m])) by (le, model))",
           "legendFormat": "p50 {{model}}",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+          "expr": "histogram_quantile(0.95, sum(rate(llm_latency_seconds_bucket[5m])) by (le, model))",
           "legendFormat": "p95 {{model}}",
           "interval": "30s"
         }
@@ -1110,7 +1110,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_llm_tokens_total[1m])) by (model, kind) * 60",
+          "expr": "sum(rate(llm_tokens_used[1m])) by (model, kind) * 60",
           "legendFormat": "{{model}}:{{kind}}",
           "interval": "30s"
         }
@@ -1149,7 +1149,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_llm_cache_hits_total[5m])) / (sum(rate(ai_llm_cache_hits_total[5m])) + sum(rate(ai_llm_cache_misses_total[5m])))",
+          "expr": "sum(rate(llm_cache_hits_total[5m])) / (sum(rate(llm_cache_hits_total[5m])) + sum(rate(llm_cache_misses_total[5m])))",
           "legendFormat": "hit_rate",
           "interval": "30s"
         }
@@ -1205,12 +1205,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_llm_model_fallback_total[5m])) by (primary, fallback)",
+          "expr": "sum(rate(llm_fallback_used_total[5m])) by (primary, fallback)",
           "legendFormat": "fallback {{primary}}\u2192{{fallback}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_llm_cache_stampede_total[5m]))",
+          "expr": "sum(rate(llm_lru_hits_total[5m]))",
           "legendFormat": "cache_stampede",
           "interval": "30s"
         }
@@ -1249,17 +1249,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
           "legendFormat": "p99",
           "interval": "30s"
         }
@@ -1298,12 +1298,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(llm_history_turns_bucket[10m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(llm_history_turns_bucket[10m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         }
@@ -1354,7 +1354,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_tts_requests_total[1m])) by (status, voice) * 60",
+          "expr": "sum(rate(tts_requests_total[1m])) by (status, provider, mode) * 60",
           "legendFormat": "{{status}}:{{voice}}",
           "interval": "30s"
         }
@@ -1393,12 +1393,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+          "expr": "histogram_quantile(0.50, sum(rate(tts_latency_seconds_bucket[5m])) by (le, voice))",
           "legendFormat": "p50 {{voice}}",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_tts_latency_seconds_bucket[5m])) by (le, voice))",
+          "expr": "histogram_quantile(0.90, sum(rate(tts_latency_seconds_bucket[5m])) by (le, voice))",
           "legendFormat": "p90 {{voice}}",
           "interval": "30s"
         }
@@ -1437,22 +1437,22 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_tts_apology_fallback_total[5m]))",
+          "expr": "sum(rate(tts_apology_fallback_total[5m]))",
           "legendFormat": "apology_fallback",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_tts_chunk_errors_total[5m]))",
+          "expr": "sum(rate(tts_chunk_errors_total[5m]))",
           "legendFormat": "chunk_errors",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_tts_s3_uploads_total{status=\"error\"}[5m]))",
+          "expr": "sum(rate(tts_s3_uploads_total{status=\"error\"}[5m]))",
           "legendFormat": "s3_errors",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_tts_file_cleanups_total[5m]))",
+          "expr": "sum(rate(tts_file_cleanups_total[5m]))",
           "legendFormat": "file_cleanups",
           "interval": "30s"
         }
@@ -1503,17 +1503,17 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.25, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.25, sum(rate(eval_overall_score_bucket[30m])) by (le))",
           "legendFormat": "p25",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(eval_overall_score_bucket[30m])) by (le))",
           "legendFormat": "median",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.75, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.75, sum(rate(eval_overall_score_bucket[30m])) by (le))",
           "legendFormat": "p75",
           "interval": "30s"
         }
@@ -1552,17 +1552,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_eval_skipped_total[5m])) by (reason)",
+          "expr": "sum(rate(eval_turns_skipped_total[5m])) by (reason)",
           "legendFormat": "skip:{{reason}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_eval_budget_exhausted_total[5m]))",
+          "expr": "sum(rate(eval_budget_exhausted_total[5m]))",
           "legendFormat": "budget_exhausted",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_eval_model_fallback_total[5m]))",
+          "expr": "sum(rate(eval_model_fallback_total[5m]))",
           "legendFormat": "model_fallback",
           "interval": "30s"
         }
@@ -1613,7 +1613,7 @@
       },
       "targets": [
         {
-          "expr": "ai_session_active",
+          "expr": "session_active",
           "legendFormat": "active",
           "interval": "30s"
         }
@@ -1669,17 +1669,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_session_created_total[1m])) * 60",
+          "expr": "sum(rate(session_created_total[1m])) * 60",
           "legendFormat": "created",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_session_ended_total[1m])) by (reason) * 60",
+          "expr": "sum(rate(session_ended_total[1m])) by (reason) * 60",
           "legendFormat": "ended:{{reason}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_session_rejected_total[1m])) by (reason) * 60",
+          "expr": "sum(rate(session_rejected_total[1m])) by (reason) * 60",
           "legendFormat": "rejected:{{reason}}",
           "interval": "30s"
         }
@@ -1718,17 +1718,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_session_ip_changes_total[5m]))",
+          "expr": "sum(rate(session_ip_changes_total[5m]))",
           "legendFormat": "ip_changes",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_session_ip_limit_total[5m]))",
+          "expr": "sum(rate(session_ip_limit_total[5m]))",
           "legendFormat": "ip_limit_exceeded",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_session_lru_hits_total[5m]))",
+          "expr": "sum(rate(session_lru_hits_total[5m]))",
           "legendFormat": "lru_hits_degraded",
           "interval": "30s"
         }
@@ -1767,12 +1767,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(session_duration_seconds_bucket[30m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(session_duration_seconds_bucket[30m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         }
@@ -1811,12 +1811,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(session_history_turns_bucket[30m])) by (le))",
           "legendFormat": "p50",
           "interval": "30s"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(session_history_turns_bucket[30m])) by (le))",
           "legendFormat": "p90",
           "interval": "30s"
         }
@@ -2106,17 +2106,17 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(ai_sanitize_total[1m])) by (status) * 60",
+          "expr": "sum(rate(sanitize_calls_total[1m])) by (status) * 60",
           "legendFormat": "{{status}}",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_sanitize_injection_total[1m])) * 60",
+          "expr": "sum(rate(sanitize_injection_total[1m])) * 60",
           "legendFormat": "injection_detected",
           "interval": "30s"
         },
         {
-          "expr": "sum(rate(ai_sanitize_truncated_total[1m])) * 60",
+          "expr": "sum(rate(sanitize_truncated_total[1m])) * 60",
           "legendFormat": "truncated",
           "interval": "30s"
         }

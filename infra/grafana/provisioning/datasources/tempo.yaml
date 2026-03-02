@@ -36,6 +36,6 @@ datasources:
             value: stage
         queries:
           - name: Pipeline latency
-            query: histogram_quantile(0.95, sum(rate(ai_pipeline_latency_seconds_bucket{$$__tags}[5m])) by (le))
+            query: histogram_quantile(0.95, sum(rate(voice_pipeline_latency_seconds_bucket{$$__tags}[5m])) by (le))
           - name: Stage errors
             query: sum(rate(ai_pipeline_stage_errors_total{$$__tags}[5m])) by (stage)

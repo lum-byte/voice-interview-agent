@@ -6711,7 +6711,7 @@ def build_grafana_dashboard() -> dict:
     y += 1
     kpis = [
         ("Active Pipelines", "voice_pipeline_active", "short"),
-        ("Active Sessions", "ai_session_active", "short"),
+        ("Active Sessions", "session_active", "short"),
         (
             "Pipeline P99 (s)",
             "histogram_quantile(0.99, sum(rate(voice_pipeline_latency_seconds_bucket[5m])) by (le))",
@@ -6721,7 +6721,7 @@ def build_grafana_dashboard() -> dict:
         ("CB Open (any)", "sum(ai_circuit_breaker_state == 2)", "short"),
         (
             "Eval Budget Exhaust",
-            "sum(increase(ai_eval_budget_exhausted_total[1h]))",
+            "sum(increase(eval_budget_exhausted_total[1h]))",
             "short",
         ),
     ]
@@ -6739,15 +6739,15 @@ def build_grafana_dashboard() -> dict:
             "Pipeline Requests/min",
             [
                 _target(
-                    'sum(rate(voice_pipeline_total{status="ok"}[1m])) * 60', "ok"
+                    'sum(rate(voice_pipeline_completions_total{status="ok"}[1m])) * 60', "ok"
                 ),
                 _target(
-                    'sum(rate(voice_pipeline_total{status="error"}[1m])) * 60',
+                    'sum(rate(voice_pipeline_completions_total{status="error"}[1m])) * 60',
                     "error",
                 ),
                 _target(
-                    'sum(rate(voice_pipeline_total{status="cache"}[1m])) * 60',
-                    "cache",
+                    'sum(rate(voice_pipeline_completions_total{status="empty"}[1m])) * 60',
+                    "empty",
                 ),
             ],
             x=0,
@@ -6948,7 +6948,7 @@ def build_grafana_dashboard() -> dict:
             "Language Confidence Distribution",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_stt_language_confidence_bucket[10m])) by (le, language))",
+                    "histogram_quantile(0.50, sum(rate(stt_language_confidence_bucket[10m])) by (le, language))",
                     "{{language}} p50",
                 ),
             ],
@@ -6971,12 +6971,12 @@ def build_grafana_dashboard() -> dict:
             pid,
             "STT Edge Cases",
             [
-                _target("sum(rate(ai_stt_empty_audio_total[5m]))", "empty_audio"),
-                _target("sum(rate(ai_stt_low_confidence_total[5m]))", "low_confidence"),
+                _target("sum(rate(stt_empty_audio_total[5m]))", "empty_audio"),
+                _target("sum(rate(stt_low_confidence_total[5m]))", "low_confidence"),
                 _target(
-                    "sum(rate(ai_stt_remote_fallback_total[5m]))", "remote_fallback"
+                    "sum(rate(stt_remote_fallback_total[5m]))", "remote_fallback"
                 ),
-                _target("sum(rate(ai_stt_path_rejected_total[5m]))", "path_rejected"),
+                _target("sum(rate(stt_path_rejected_total[5m]))", "path_rejected"),
             ],
             x=0,
             y=y,
@@ -6992,11 +6992,11 @@ def build_grafana_dashboard() -> dict:
             "Audio Duration Distribution (p50/p90)",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(stt_audio_duration_seconds_bucket[10m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_stt_audio_duration_seconds_bucket[10m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(stt_audio_duration_seconds_bucket[10m])) by (le))",
                     "p90",
                 ),
             ],
@@ -7019,7 +7019,7 @@ def build_grafana_dashboard() -> dict:
             "LLM Requests/min by Status & Model",
             [
                 _target(
-                    "sum(rate(ai_llm_requests_total[1m])) by (status, model) * 60",
+                    "sum(rate(llm_requests_total[1m])) by (status, model) * 60",
                     "{{status}}:{{model}}",
                 ),
             ],
@@ -7039,11 +7039,11 @@ def build_grafana_dashboard() -> dict:
             "LLM Latency Percentiles",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+                    "histogram_quantile(0.50, sum(rate(llm_latency_seconds_bucket[5m])) by (le, model))",
                     "p50 {{model}}",
                 ),
                 _target(
-                    "histogram_quantile(0.95, sum(rate(ai_llm_latency_seconds_bucket[5m])) by (le, model))",
+                    "histogram_quantile(0.95, sum(rate(llm_latency_seconds_bucket[5m])) by (le, model))",
                     "p95 {{model}}",
                 ),
             ],
@@ -7063,7 +7063,7 @@ def build_grafana_dashboard() -> dict:
             "Token Consumption Rate (tokens/min)",
             [
                 _target(
-                    "sum(rate(ai_llm_tokens_total[1m])) by (model, kind) * 60",
+                    "sum(rate(llm_tokens_used[1m])) by (model, kind) * 60",
                     "{{model}}:{{kind}}",
                 ),
             ],
@@ -7083,7 +7083,7 @@ def build_grafana_dashboard() -> dict:
             "Cache Hit Rate",
             [
                 _target(
-                    "sum(rate(ai_llm_cache_hits_total[5m])) / (sum(rate(ai_llm_cache_hits_total[5m])) + sum(rate(ai_llm_cache_misses_total[5m])))",
+                    "sum(rate(llm_cache_hits_total[5m])) / (sum(rate(llm_cache_hits_total[5m])) + sum(rate(llm_cache_misses_total[5m])))",
                     "hit_rate",
                 ),
             ],
@@ -7107,10 +7107,10 @@ def build_grafana_dashboard() -> dict:
             "LLM Fallback & Stampede",
             [
                 _target(
-                    "sum(rate(ai_llm_model_fallback_total[5m])) by (primary, fallback)",
+                    "sum(rate(llm_fallback_used_total[5m])) by (primary, fallback)",
                     "fallback {{primary}}→{{fallback}}",
                 ),
-                _target("sum(rate(ai_llm_cache_stampede_total[5m]))", "cache_stampede"),
+                _target("sum(rate(llm_lru_hits_total[5m]))", "cache_stampede"),
             ],
             x=18,
             y=y,
@@ -7127,15 +7127,15 @@ def build_grafana_dashboard() -> dict:
             "Prompt Token Distribution (p50/p90/p99)",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
                     "p90",
                 ),
                 _target(
-                    "histogram_quantile(0.99, sum(rate(ai_llm_tokens_prompt_bucket[10m])) by (le))",
+                    "histogram_quantile(0.99, sum(rate(llm_tokens_used_bucket[10m])) by (le))",
                     "p99",
                 ),
             ],
@@ -7153,11 +7153,11 @@ def build_grafana_dashboard() -> dict:
             "History Depth at LLM Call",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(llm_history_turns_bucket[10m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_llm_history_turns_bucket[10m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(llm_history_turns_bucket[10m])) by (le))",
                     "p90",
                 ),
             ],
@@ -7222,14 +7222,14 @@ def build_grafana_dashboard() -> dict:
             "TTS Edge Cases",
             [
                 _target(
-                    "sum(rate(ai_tts_apology_fallback_total[5m]))", "apology_fallback"
+                    "sum(rate(tts_apology_fallback_total[5m]))", "apology_fallback"
                 ),
-                _target("sum(rate(ai_tts_chunk_errors_total[5m]))", "chunk_errors"),
+                _target("sum(rate(tts_chunk_errors_total[5m]))", "chunk_errors"),
                 _target(
-                    'sum(rate(ai_tts_s3_uploads_total{status="error"}[5m]))',
+                    'sum(rate(tts_s3_uploads_total{status="error"}[5m]))',
                     "s3_errors",
                 ),
-                _target("sum(rate(ai_tts_file_cleanups_total[5m]))", "file_cleanups"),
+                _target("sum(rate(tts_file_cleanups_total[5m]))", "file_cleanups"),
             ],
             x=16,
             y=y,
@@ -7249,15 +7249,15 @@ def build_grafana_dashboard() -> dict:
             "Eval Score Distribution",
             [
                 _target(
-                    "histogram_quantile(0.25, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+                    "histogram_quantile(0.25, sum(rate(eval_overall_score_bucket[30m])) by (le))",
                     "p25",
                 ),
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(eval_overall_score_bucket[30m])) by (le))",
                     "median",
                 ),
                 _target(
-                    "histogram_quantile(0.75, sum(rate(ai_eval_scores_bucket[30m])) by (le))",
+                    "histogram_quantile(0.75, sum(rate(eval_overall_score_bucket[30m])) by (le))",
                     "p75",
                 ),
             ],
@@ -7275,14 +7275,14 @@ def build_grafana_dashboard() -> dict:
             "Eval Skips & Budget",
             [
                 _target(
-                    "sum(rate(ai_eval_skipped_total[5m])) by (reason)",
+                    "sum(rate(eval_turns_skipped_total[5m])) by (reason)",
                     "skip:{{reason}}",
                 ),
                 _target(
-                    "sum(rate(ai_eval_budget_exhausted_total[5m]))", "budget_exhausted"
+                    "sum(rate(eval_budget_exhausted_total[5m]))", "budget_exhausted"
                 ),
                 _target(
-                    "sum(rate(ai_eval_model_fallback_total[5m]))", "model_fallback"
+                    "sum(rate(eval_model_fallback_total[5m]))", "model_fallback"
                 ),
             ],
             x=12,
@@ -7302,7 +7302,7 @@ def build_grafana_dashboard() -> dict:
             pid,
             "Active Sessions",
             [
-                _target("ai_session_active", "active"),
+                _target("session_active", "active"),
             ],
             x=0,
             y=y,
@@ -7322,13 +7322,13 @@ def build_grafana_dashboard() -> dict:
             pid,
             "Session Lifecycle Events/min",
             [
-                _target("sum(rate(ai_session_created_total[1m])) * 60", "created"),
+                _target("sum(rate(session_created_total[1m])) * 60", "created"),
                 _target(
-                    "sum(rate(ai_session_ended_total[1m])) by (reason) * 60",
+                    "sum(rate(session_ended_total[1m])) by (reason) * 60",
                     "ended:{{reason}}",
                 ),
                 _target(
-                    "sum(rate(ai_session_rejected_total[1m])) by (reason) * 60",
+                    "sum(rate(session_rejected_total[1m])) by (reason) * 60",
                     "rejected:{{reason}}",
                 ),
             ],
@@ -7347,12 +7347,12 @@ def build_grafana_dashboard() -> dict:
             pid,
             "IP Security Events",
             [
-                _target("sum(rate(ai_session_ip_changes_total[5m]))", "ip_changes"),
+                _target("sum(rate(session_ip_changes_total[5m]))", "ip_changes"),
                 _target(
-                    "sum(rate(ai_session_ip_limit_total[5m]))", "ip_limit_exceeded"
+                    "sum(rate(session_ip_limit_total[5m]))", "ip_limit_exceeded"
                 ),
                 _target(
-                    "sum(rate(ai_session_lru_hits_total[5m]))", "lru_hits_degraded"
+                    "sum(rate(session_lru_hits_total[5m]))", "lru_hits_degraded"
                 ),
             ],
             x=18,
@@ -7370,11 +7370,11 @@ def build_grafana_dashboard() -> dict:
             "Session Duration Distribution",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(session_duration_seconds_bucket[30m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_session_duration_seconds_bucket[30m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(session_duration_seconds_bucket[30m])) by (le))",
                     "p90",
                 ),
             ],
@@ -7393,11 +7393,11 @@ def build_grafana_dashboard() -> dict:
             "Turns per Session Distribution",
             [
                 _target(
-                    "histogram_quantile(0.50, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+                    "histogram_quantile(0.50, sum(rate(session_history_turns_bucket[30m])) by (le))",
                     "p50",
                 ),
                 _target(
-                    "histogram_quantile(0.90, sum(rate(ai_session_turns_bucket[30m])) by (le))",
+                    "histogram_quantile(0.90, sum(rate(session_history_turns_bucket[30m])) by (le))",
                     "p90",
                 ),
             ],
@@ -7527,13 +7527,13 @@ def build_grafana_dashboard() -> dict:
             "Sanitizer Events/min",
             [
                 _target(
-                    "sum(rate(ai_sanitize_total[1m])) by (status) * 60", "{{status}}"
+                    "sum(rate(sanitize_calls_total[1m])) by (status) * 60", "{{status}}"
                 ),
                 _target(
-                    "sum(rate(ai_sanitize_injection_total[1m])) * 60",
+                    "sum(rate(sanitize_injection_total[1m])) * 60",
                     "injection_detected",
                 ),
-                _target("sum(rate(ai_sanitize_truncated_total[1m])) * 60", "truncated"),
+                _target("sum(rate(sanitize_truncated_total[1m])) * 60", "truncated"),
             ],
             x=0,
             y=y,

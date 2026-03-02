@@ -871,6 +871,7 @@ services:
     volumes:
       - audio_input:/app/audio/temp_IN
       - audio_output:/app/audio/temp_OUT
+      - ./infra/grafana:/app/infra/grafana
 
     healthcheck:
       test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
