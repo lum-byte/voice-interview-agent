@@ -3241,6 +3241,15 @@ class QAControllerV2(_QAControllerWithRecovery):
             level=doc.candidate.level,
         ))
 
+        concept_tracker.extract_answer_signals(
+            session_id=session_id,
+            domain=committed.domain,
+            answer=candidate_answer,
+            question=llm_question,
+            turn_index=committed.turn_index,
+            level=doc.candidate.level,
+        )
+
         # ── Register fingerprint ───────────────────────────────────────────────
         if llm_question.strip():
             await self._fingerprints.register(

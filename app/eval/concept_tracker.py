@@ -12,25 +12,6 @@ reasoning exists. Memory is Redis. Transport is Kafka. The LLM only sees
 a slightly extended difficulty suffix that says:
     "Focus on: X. Avoid recently covered: Y."
 
-WHAT THIS IS NOT
-────────────────
-- Not a new LLM context layer
-- Not a conversation history injection
-- Not a change to LLMInterviewInput
-- Not a graph database or embedding store
-
-THE ONLY SURFACE TOUCHED IN THE EXISTING SYSTEM
-────────────────────────────────────────────────
-`LLMInputBuilder.build()` → `difficulty_prompt_suffix`
-That suffix already exists. We extend it by ~20-40 words per turn.
-The LLM gets a constraint, not an explanation. It follows it.
-
-INTEGRATION (3 surgical edits, documented at bottom of file)
-────────────────────────────────────────────────────────────
-  [1] qa_controller.py  — QAControllerV2.commit_turn()
-  [2] qa_controller.py  — LLMInputBuilder.build()
-  [3] voice_graph.py    — on_startup() / on_shutdown()
-
 DESIGN AXIOMS
 ─────────────
 A. Concept extraction is RULE-BASED. Zero LLM calls. Zero latency on critical path.
@@ -219,7 +200,7 @@ class ConceptSteeringSignal:
 
         parts: list[str] = []
 
-        if self.focus_concepts:
+        if self.focus_concepts: # noqa
             focus_labels = [c.replace("_", " ") for c in self.focus_concepts]
             parts.append(f"Focus your question on: {', '.join(focus_labels)}.")
 
@@ -429,19 +410,9 @@ class ConceptCoverageStore:
         return ConceptCoverageMap(session_id=session_id, domain=domain)
 
     async def save(self, coverage: ConceptCoverageMap) -> None:
-        key = self._key(coverage.session_id, coverage.domain)
+        key  = self._key(coverage.session_id, coverage.domain)
         blob = coverage.to_json()
-
-        # Always write to local fallback
         await self._local.set(key, blob)
-
-        try:
-            r = await self._get_redis()
-            if r:
-                await r.setex(key, _COVERAGE_TTL_S, blob)
-        except Exception as exc:
-            log.debug("concept_store_save_redis_error", error=str(exc))   # always write local fallback
-
         try:
             r = await self._get_redis()
             if r:
@@ -844,3 +815,1036 @@ concept_tracker = ConceptTracker()
 #             await concept_tracker.evict_session(session_id, doc.domains)
 #
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § ANSWER SIGNAL DATA STRUCTURES
+# Per-session per-domain tracking of what the candidate claims to know.
+# Lives alongside ConceptCoverageMap. Answer text never stored here.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import statistics as _statistics  # noqa — already in stdlib, alias avoids shadowing
+
+# Answer signal config
+_SIGNAL_PREFIX   = "concept:sig:v1:"
+_SIGNAL_TTL_S    = _COVERAGE_TTL_S
+
+MAX_PROBE_HINTS:  int   = int(os.getenv("CONCEPT_MAX_PROBE",   "3"))
+MAX_WEAK_HINTS:   int   = int(os.getenv("CONCEPT_MAX_WEAK",    "2"))
+MAX_DYNAMIC_CAPS: int   = int(os.getenv("CONCEPT_MAX_DYNAMIC", "8"))
+
+CLAIM_STRONG_THRESHOLD: float = 0.70
+CLAIM_WEAK_THRESHOLD:   float = 0.35
+CLAIM_DROP_THRESHOLD:   float = 0.20
+
+PRESS_DECAY_TURNS: int = int(os.getenv("CONCEPT_PRESS_DECAY", "4"))
+
+MIN_ANSWER_CHARS_FOR_EXTRACTION: int = 30
+
+CONTRADICTION_VARIANCE_THRESHOLD: float = 0.18
+
+
+@dataclass
+class CandidateClaimEntry:
+    """
+    A single concept-level signal extracted from a candidate's answer.
+    Never sent to the LLM directly — only its rendered label appears in
+    the suffix instruction.
+
+    signal_type values:
+      "claimed"       — candidate confidently named/explained this concept
+      "weak"          — candidate hedged ("I think it's something like…")
+      "slip"          — keyword density suggests concept confusion
+      "dynamic"       — term not in registry, discovered live from answer
+      "contradiction" — candidate's confidence swung >THRESHOLD across turns
+    """
+    concept:            str
+    raw_term:           str      # exact term candidate used (logging only)
+    confidence:         float    # 0.0–1.0
+    signal_type:        str
+    turn_index:         int
+    pressed:            bool           = False
+    press_urgency:      float          = 1.0
+    contradiction_turn: int | None     = None
+    ts:                 float          = field(default_factory=time.time)
+
+    def decay(self, current_turn: int) -> None:
+        """Linear urgency decay over PRESS_DECAY_TURNS since claim was made."""
+        elapsed = max(0, current_turn - self.turn_index)
+        if elapsed >= PRESS_DECAY_TURNS:
+            self.press_urgency = 0.0
+        else:
+            self.press_urgency = 1.0 - (elapsed / PRESS_DECAY_TURNS)
+
+    def to_dict(self) -> dict:
+        return {
+            "concept":            self.concept,
+            "raw_term":           self.raw_term,
+            "confidence":         round(self.confidence, 3),
+            "signal_type":        self.signal_type,
+            "turn_index":         self.turn_index,
+            "pressed":            self.pressed,
+            "press_urgency":      round(self.press_urgency, 3),
+            "contradiction_turn": self.contradiction_turn,
+            "ts":                 self.ts,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "CandidateClaimEntry":
+        e = CandidateClaimEntry(
+            concept     = str(d["concept"]),
+            raw_term    = str(d["raw_term"]),
+            confidence  = float(d["confidence"]),
+            signal_type = str(d["signal_type"]),
+            turn_index  = int(d["turn_index"]),
+        )
+        e.pressed            = bool(d.get("pressed", False))
+        e.press_urgency      = float(d.get("press_urgency", 1.0))
+        e.contradiction_turn = d.get("contradiction_turn")
+        e.ts                 = float(d.get("ts", time.time()))
+        return e
+
+
+@dataclass
+class CandidateSignalMap:
+    """
+    Per-session per-domain store of all answer signals extracted so far.
+    Sits alongside ConceptCoverageMap in Redis.
+
+    Responsibilities:
+      - Accumulate CandidateClaimEntry records across turns
+      - Track dynamic concepts discovered live from answers
+      - Detect cross-turn contradictions
+      - Expose ranked probe/weak lists for steering signal assembly
+    """
+    session_id:    str
+    domain:        str
+    claims:        list[CandidateClaimEntry]              = field(default_factory=list)
+    concept_turns: dict[str, list[int]]                   = field(default_factory=dict)
+    dynamic_concepts: dict[str, list[str]]                = field(default_factory=dict)
+    claim_history: dict[str, list[tuple[int, float]]]     = field(default_factory=dict)
+    contradictions: list[dict[str, Any]]                  = field(default_factory=list)
+    total_answers_processed: int                          = 0
+    last_updated:  float                                  = field(default_factory=time.time)
+
+    def add_claim(self, entry: CandidateClaimEntry) -> None:
+        """
+        Merge new claim. If concept already claimed this session, keep the
+        higher-confidence one. Flag if confidence swing is large (contradiction).
+        """
+        concept = entry.concept
+
+        if concept not in self.claim_history:
+            self.claim_history[concept] = []
+        self.claim_history[concept].append((entry.turn_index, entry.confidence))
+
+        if concept not in self.concept_turns:
+            self.concept_turns[concept] = []
+        if entry.turn_index not in self.concept_turns[concept]:
+            self.concept_turns[concept].append(entry.turn_index)
+
+        existing = [c for c in self.claims if c.concept == concept and not c.pressed]
+        if existing:
+            best = max(existing, key=lambda c: c.confidence)
+            delta = abs(best.confidence - entry.confidence)
+            if delta >= CONTRADICTION_VARIANCE_THRESHOLD:
+                entry.contradiction_turn = best.turn_index
+                entry.signal_type = "contradiction"
+                self.contradictions.append({
+                    "concept": concept,
+                    "turn_a":  best.turn_index,
+                    "conf_a":  round(best.confidence, 3),
+                    "turn_b":  entry.turn_index,
+                    "conf_b":  round(entry.confidence, 3),
+                    "delta":   round(delta, 3),
+                })
+            if entry.confidence > best.confidence:
+                best.confidence    = entry.confidence
+                best.signal_type   = entry.signal_type
+                best.press_urgency = 1.0
+                best.ts            = entry.ts
+            return
+
+        self.claims.append(entry)
+        self.last_updated = time.time()
+
+    def register_dynamic(self, term: str, keywords: list[str]) -> None:
+        if len(self.dynamic_concepts) >= MAX_DYNAMIC_CAPS:
+            return
+        norm = term.lower().replace("-", "_").replace(" ", "_")
+        if norm not in self.dynamic_concepts:
+            self.dynamic_concepts[norm] = keywords
+
+    def mark_pressed(self, concept: str) -> None:
+        for claim in self.claims:
+            if claim.concept == concept:
+                claim.pressed      = True
+                claim.press_urgency = 0.0
+
+    def decay_all(self, current_turn: int) -> None:
+        for claim in self.claims:
+            if not claim.pressed:
+                claim.decay(current_turn)
+
+    def pending_probes(self, current_turn: int) -> list[CandidateClaimEntry]:
+        """
+        Unpressed claims ranked by interrogation value:
+          1. contradictions (story changed — highest value)
+          2. slips (demonstrably confused)
+          3. claimed (need to verify depth)
+          4. weak (hedged, gentle follow-up)
+          5. dynamic (live-discovered terms)
+        Within tier: sort by press_urgency desc.
+        """
+        self.decay_all(current_turn)
+        active = [c for c in self.claims if not c.pressed and c.press_urgency > 0.0]
+        tier = {"contradiction": 0, "slip": 1, "claimed": 2, "weak": 3, "dynamic": 4}
+        return sorted(
+            active,
+            key=lambda c: (tier.get(c.signal_type, 9), -c.press_urgency, -c.confidence),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id":              self.session_id,
+            "domain":                  self.domain,
+            "claims":                  [c.to_dict() for c in self.claims],
+            "concept_turns":           self.concept_turns,
+            "dynamic_concepts":        self.dynamic_concepts,
+            "claim_history":           {
+                k: [[ti, conf] for ti, conf in v]
+                for k, v in self.claim_history.items()
+            },
+            "contradictions":          self.contradictions,
+            "total_answers_processed": self.total_answers_processed,
+            "last_updated":            self.last_updated,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @staticmethod
+    def from_dict(d: dict) -> "CandidateSignalMap":
+        m = CandidateSignalMap(
+            session_id = str(d["session_id"]),
+            domain     = str(d["domain"]),
+        )
+        m.claims       = [CandidateClaimEntry.from_dict(c) for c in d.get("claims", [])]
+        m.concept_turns = {k: list(v) for k, v in d.get("concept_turns", {}).items()}
+        m.dynamic_concepts = dict(d.get("dynamic_concepts", {}))
+        m.claim_history = {
+            k: [(int(ti), float(conf)) for ti, conf in v]
+            for k, v in d.get("claim_history", {}).items()
+        }
+        m.contradictions          = list(d.get("contradictions", []))
+        m.total_answers_processed = int(d.get("total_answers_processed", 0))
+        m.last_updated            = float(d.get("last_updated", time.time()))
+        return m
+
+    @staticmethod
+    def from_json(raw: str) -> "CandidateSignalMap":
+        return CandidateSignalMap.from_dict(json.loads(raw))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § UPDATED ConceptSteeringSignal
+# Replaces the original. Three new list fields for answer-axis signals.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Monkey-patch the existing ConceptSteeringSignal with the new fields and
+# updated to_suffix_instruction. We re-declare it as a new dataclass here;
+# the module-level name is rebound below. The old class is discarded.
+
+@dataclass
+class ConceptSteeringSignal:  # noqa: F811 — intentional rebind
+    """
+    Output of ConceptTracker.get_steering_signal().
+    Consumed ONLY by LLMInputBuilder to extend difficulty_prompt_suffix.
+
+    Six axes (two original, four new):
+      avoid_concepts      — questions already covered
+      focus_concepts      — registry concepts not touched
+      probe_concepts      — candidate claimed, needs proving       [NEW]
+      weak_concepts       — candidate hedged on these             [NEW]
+      dynamic_probes      — live-discovered terms to press        [NEW]
+      contradiction_flags — candidate's story changed across turns [NEW]
+    """
+    session_id:          str
+    domain:              str
+    avoid_concepts:      list[str]
+    focus_concepts:      list[str]
+    probe_concepts:      list[str]      = field(default_factory=list)
+    weak_concepts:       list[str]      = field(default_factory=list)
+    dynamic_probes:      list[str]      = field(default_factory=list)
+    contradiction_flags: list[str]      = field(default_factory=list)
+    coverage_ratio:      float          = 0.0
+    has_signal:          bool           = False
+    ts:                  float          = field(default_factory=time.time)
+
+    def to_suffix_instruction(self) -> str:
+        """
+        Renders as a plain-English constraint appended to difficulty_prompt_suffix.
+        This is the ONLY thing the LLM sees from this entire module.
+
+        Priority order (highest interrogation value first):
+          1. Contradiction flags — candidate's story changed, press directly
+          2. Probe concepts — claimed but unproven depth
+          3. Weak concepts — hedged, follow-up needed
+          4. Dynamic probes — live-discovered terms
+          5. Focus concepts — registry gaps
+          6. Avoid concepts — already covered, skip
+
+        Budget: ~40-80 words. Every word is load-bearing.
+        """
+        if not self.has_signal:
+            return ""
+
+        parts: list[str] = []
+
+        if self.contradiction_flags:
+            flags = [c.replace("_", " ") for c in self.contradiction_flags[:2]]
+            parts.append(
+                f"IMPORTANT: The candidate gave inconsistent answers about: "
+                f"{', '.join(flags)}. Press directly on this — ask them to "
+                f"clarify their understanding clearly."
+            )
+
+        all_probes = self.probe_concepts + self.dynamic_probes
+        if all_probes:
+            labels = [c.replace("_", " ") for c in all_probes[:MAX_PROBE_HINTS]]
+            parts.append(
+                f"The candidate mentioned {', '.join(labels)} — press on these "
+                f"specifically to verify actual depth, not just familiarity."
+            )
+
+        if self.weak_concepts:
+            labels = [c.replace("_", " ") for c in self.weak_concepts[:MAX_WEAK_HINTS]]
+            parts.append(
+                f"The candidate seemed uncertain about: {', '.join(labels)}. "
+                f"A targeted follow-up will reveal real understanding."
+            )
+
+        if self.focus_concepts: # noqa
+            labels = [c.replace("_", " ") for c in self.focus_concepts]
+            parts.append(f"Topics not yet covered: {', '.join(labels)}.")
+
+        if self.avoid_concepts:
+            labels = [c.replace("_", " ") for c in self.avoid_concepts]
+            parts.append(
+                f"Do NOT revisit: {', '.join(labels)} — "
+                f"these have already been covered this session."
+            )
+
+        return " ".join(parts)
+
+    def is_empty(self) -> bool:
+        return (
+            not self.avoid_concepts
+            and not self.focus_concepts
+            and not self.probe_concepts
+            and not self.weak_concepts
+            and not self.dynamic_probes
+            and not self.contradiction_flags
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § ANSWER SIGNAL EXTRACTOR
+# Four rule-based passes over answer text. In-process only. <1ms total.
+# Answer text never leaves this call.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AnswerSignalExtractor:
+    """
+    Extracts concept-level signals from a candidate's spoken answer.
+
+    Pass 1 — REGISTRY CLAIM DETECTION
+        Checks answer against CONCEPT_REGISTRY[domain] keywords.
+        Base confidence from keyword hit density. Per-concept negation check
+        prevents pressing concepts the candidate explicitly disclaimed.
+
+    Pass 2 — HEDGE + NEGATION SCORING (integrated into Pass 1 via multiplier)
+        Global hedge multiplier computed once from linguistic marker patterns.
+        Strong hedges ("I'm not sure") cut confidence. Claim phrases
+        ("I've built", "we use in production") boost it. Explicit negations
+        ("I've never used X") suppress the concept entirely.
+
+    Pass 3 — DYNAMIC CONCEPT DISCOVERY
+        Extracts PascalCase terms, ALLCAPS acronyms, dunder attributes,
+        quoted terms, and snake_case identifiers not present in registry.
+        Each becomes a session-local probe target.
+
+    Pass 4 — SLIP DETECTION
+        If candidate appears to explain concept A (≥2 keywords), but the
+        answer's dominant keyword density belongs to concept B, flags as
+        "slip" — suggests concept confusion rather than knowledge gap.
+    """
+
+    # ── Hedge banks: (regex_pattern, confidence_multiplier) ───────────────────
+
+    _HEDGE_STRONG: list[tuple[str, float]] = [
+        (r"\bi'?m not sure\b",            0.25),
+        (r"\bi don'?t know\b",            0.20),
+        (r"\bi might be wrong\b",         0.25),
+        (r"\bi'?m guessing\b",            0.20),
+        (r"\bnot entirely sure\b",        0.25),
+        (r"\bi'?m not confident\b",       0.25),
+        (r"\bvaguely\b",                  0.30),
+        (r"\bsomething like that\b",      0.30),
+        (r"\bi'?m hazy on\b",             0.25),
+        (r"\bdon'?t remember exactly\b",  0.25),
+        (r"\bno idea\b",                  0.15),
+        (r"\bblank on\b",                 0.20),
+    ]
+
+    _HEDGE_MEDIUM: list[tuple[str, float]] = [
+        (r"\bi think\b",                  0.60),
+        (r"\bi believe\b",                0.60),
+        (r"\bi assume\b",                 0.55),
+        (r"\bi'?m pretty sure\b",         0.65),
+        (r"\bif i remember\b",            0.55),
+        (r"\bif i recall\b",              0.55),
+        (r"\bsomething to do with\b",     0.50),
+        (r"\bkind of\b",                  0.60),
+        (r"\bsort of\b",                  0.60),
+        (r"\bmore or less\b",             0.65),
+        (r"\balong the lines of\b",       0.55),
+        (r"\bif i'?m not mistaken\b",     0.60),
+        (r"\bi think it involves\b",      0.55),
+    ]
+
+    _HEDGE_SOFT: list[tuple[str, float]] = [
+        (r"\bi think it'?s\b",            0.70),
+        (r"\bprobably\b",                 0.72),
+        (r"\bmaybe\b",                    0.70),
+        (r"\bperhaps\b",                  0.72),
+        (r"\bshould be\b",               0.75),
+        (r"\btypically\b",               0.82),
+        (r"\busually\b",                 0.82),
+        (r"\bgenerally\b",               0.85),
+        (r"\bmost of the time\b",        0.80),
+    ]
+
+    # Explicit disclaimer — SUPPRESS concept entirely (candidate is honest)
+    _NEGATION_PATTERNS: list[str] = [
+        r"\bi haven'?t (?:used|worked with|tried|seen|touched)\b",
+        r"\bi don'?t (?:know|use|have experience with|understand|work with)\b",
+        r"\bi'?ve never\b",
+        r"\bnot familiar with\b",
+        r"\bno experience with\b",
+        r"\bhaven'?t really (?:used|worked with)\b",
+        r"\bdon'?t really (?:know|understand)\b",
+        r"\bout of my (?:depth|knowledge|area|expertise)\b",
+        r"\bnever (?:used|worked with|seen|tried)\b",
+    ]
+
+    # Direct experience assertion — boost confidence
+    _CLAIM_BOOST_PATTERNS: list[tuple[str, float]] = [
+        (r"\bi'?(?:ve)? (?:built|implemented|written|created|designed|shipped)\b", 1.35),
+        (r"\bwe (?:use|used|built|implemented|deployed)\b",                        1.20),
+        (r"\bi (?:use|regularly use|work with|specialize in)\b",                   1.20),
+        (r"\bin (?:production|my current project|my last job)\b",                  1.25),
+        (r"\bactually\b",                                                           1.08),
+        (r"\bi know\b",                                                             1.10),
+        (r"\bfamiliar with\b",                                                      1.10),
+        (r"\bextensively\b",                                                        1.30),
+        (r"\bdeeply\b",                                                             1.25),
+        (r"\bthe way it works is\b",                                                1.15),
+        (r"\bwhat happens is\b",                                                    1.12),
+    ]
+
+    # Dynamic discovery patterns
+    _DYNAMIC_PASCAL  = re.compile(r'\b([A-Z][a-z]+(?:[A-Z][a-z]*)+)\b')
+    _DYNAMIC_ACRONYM = re.compile(r'\b([A-Z]{2,8})\b')
+    _DYNAMIC_DUNDER  = re.compile(r'(__[a-z][a-z_]+__)')
+    _DYNAMIC_QUOTED  = re.compile(r'["\']([a-zA-Z][a-zA-Z0-9_\-]{2,30})["\']')
+    _DYNAMIC_SNAKE   = re.compile(r'\b([a-z][a-z0-9]+(?:_[a-z][a-z0-9]+){1,4})\b')
+
+    _COMMON_WORDS: frozenset[str] = frozenset({
+        "the", "and", "that", "this", "with", "for", "from", "have", "has",
+        "are", "was", "were", "been", "its", "our", "their", "can", "will",
+        "would", "could", "should", "does", "did", "not", "yes", "but",
+        "also", "just", "like", "then", "when", "what", "how", "why",
+        "which", "where", "who", "all", "any", "some", "more", "than",
+        "into", "use", "used", "using", "about", "make", "made", "take",
+        "work", "works", "good", "bad", "new", "old", "get", "got", "set",
+        "run", "runs", "put", "see", "say", "said", "way", "time", "part",
+        "well", "even", "back", "still", "really", "def", "class", "return",
+        "import", "pass", "none", "true", "false", "null", "int", "str",
+        "list", "dict", "bool", "yeah", "okay", "right", "basically",
+        "actually", "thing", "things", "stuff", "like", "mean", "means",
+    })
+
+    _STOP_ACRONYMS: frozenset[str] = frozenset({
+        "I", "A", "OK", "API", "DB", "UI", "UX", "URL", "HTTP", "HTTPS",
+        "REST", "JSON", "XML", "SQL", "AWS", "GCP", "CPU", "RAM", "SSD",
+        "IDE", "CLI", "SDK", "MVP", "POC", "SLA", "SLO", "KPI", "ROI",
+        "ETL", "SPA", "CMS", "CDN", "DNS", "TCP", "UDP", "IP",
+    })
+
+    @staticmethod
+    def _normalize(text: str) -> str:
+        t = text.lower()
+        t = re.sub(r"[^\w\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    @classmethod
+    def _compute_hedge_multiplier(cls, answer_lower: str) -> float:
+        """
+        Returns a confidence multiplier in [0.15, 1.40].
+        All matched hedge/boost patterns stack multiplicatively.
+        """
+        mult = 1.0
+        for pattern, mod in cls._HEDGE_STRONG:
+            if re.search(pattern, answer_lower):
+                mult *= mod
+        for pattern, mod in cls._HEDGE_MEDIUM:
+            if re.search(pattern, answer_lower):
+                mult *= mod
+        for pattern, mod in cls._HEDGE_SOFT:
+            if re.search(pattern, answer_lower):
+                mult *= mod
+        for pattern, boost in cls._CLAIM_BOOST_PATTERNS:
+            if re.search(pattern, answer_lower):
+                mult *= boost
+        return max(0.15, min(1.40, mult))
+
+    @classmethod
+    def _is_negated(cls, answer_lower: str) -> bool:
+        return any(re.search(p, answer_lower) for p in cls._NEGATION_PATTERNS)
+
+    @classmethod
+    def _is_concept_negated(cls, concept_keywords: list[str], answer_lower: str) -> bool:
+        """
+        Per-concept negation: is a negation pattern within 50 chars of one of
+        this concept's keywords? Prevents pressing concepts explicitly disclaimed.
+        """
+        for neg_pattern in cls._NEGATION_PATTERNS:
+            for m in re.finditer(neg_pattern, answer_lower):
+                w_start = max(0, m.start() - 50)
+                w_end   = min(len(answer_lower), m.end() + 50)
+                window  = answer_lower[w_start:w_end]
+                if any(kw in window for kw in concept_keywords):
+                    return True
+        return False
+
+    @classmethod
+    def _extract_registry_claims(
+        cls,
+        domain:           str,
+        answer:           str,
+        hedge_multiplier: float,
+        turn_index:       int,
+    ) -> list[CandidateClaimEntry]:
+        """Pass 1: registry keyword matching with per-concept negation check."""
+        domain_concepts = CONCEPT_REGISTRY.get(domain, {})
+        normalized      = cls._normalize(answer)
+        answer_lower    = answer.lower()
+        entries: list[CandidateClaimEntry] = []
+
+        for concept_name, keywords in domain_concepts.items():
+            hits = [kw for kw in keywords if kw in normalized]
+            if not hits:
+                continue
+            if cls._is_concept_negated(keywords, answer_lower):
+                continue
+
+            base: float = min(1.0, len(hits) / max(1.0, len(keywords) * 0.4))
+            confidence = max(0.0, min(1.0, base * hedge_multiplier))
+
+            if confidence < CLAIM_DROP_THRESHOLD:
+                continue
+
+            sig_type = "claimed" if confidence >= CLAIM_STRONG_THRESHOLD else "weak"
+            entries.append(CandidateClaimEntry(
+                concept     = concept_name,
+                raw_term    = hits[0],
+                confidence  = round(confidence, 3),
+                signal_type = sig_type,
+                turn_index  = turn_index,
+            ))
+
+        return entries
+
+    @classmethod
+    def _extract_dynamic_concepts(
+        cls,
+        answer:           str,
+        existing_dynamic: dict[str, list[str]],
+        domain:           str,
+    ) -> dict[str, list[str]]:
+        """Pass 3: extract technical terms not in the static registry."""
+        registry_kws: set[str] = set()
+        for keywords in CONCEPT_REGISTRY.get(domain, {}).values():
+            registry_kws.update(kw.lower() for kw in keywords)
+
+        discovered: dict[str, list[str]] = {}
+
+        def _add(raw_term: str) -> None:
+            norm = raw_term.lower().replace("-", "_").replace(" ", "_")
+            if norm in existing_dynamic or norm in discovered:
+                return
+            if norm in cls._COMMON_WORDS or len(norm) < 3:
+                return
+            if norm in registry_kws:
+                return
+            discovered[norm] = list({norm, raw_term.lower()})
+
+        for m in cls._DYNAMIC_PASCAL.finditer(answer):
+            _add(m.group(1))
+        for m in cls._DYNAMIC_ACRONYM.finditer(answer):
+            tok = m.group(1)
+            if tok not in cls._STOP_ACRONYMS:
+                _add(tok)
+        for m in cls._DYNAMIC_DUNDER.finditer(answer):
+            _add(m.group(1))
+        for m in cls._DYNAMIC_QUOTED.finditer(answer):
+            _add(m.group(1))
+        for m in cls._DYNAMIC_SNAKE.finditer(answer):
+            tok = m.group(1)
+            if tok not in cls._COMMON_WORDS and "_" in tok:
+                _add(tok)
+
+        return discovered
+
+    @classmethod
+    def _detect_slips(
+        cls,
+        domain:           str,
+        answer:           str,
+        hedge_multiplier: float,
+        turn_index:       int,
+    ) -> list[CandidateClaimEntry]:
+        """
+        Pass 4: slip detection.
+        If candidate uses ≥2 keywords for concept A, but the dominant keyword
+        density in the answer is 2.5× from concept B, flag concept A as "slip".
+        """
+        domain_concepts = CONCEPT_REGISTRY.get(domain, {})
+        if len(domain_concepts) < 2:
+            return []
+
+        normalized    = cls._normalize(answer)
+        concept_hits: dict[str, int] = {}
+        for cname, keywords in domain_concepts.items():
+            count = sum(1 for kw in keywords if kw in normalized)
+            if count >= 2:
+                concept_hits[cname] = count
+
+        if len(concept_hits) < 2:
+            return []
+
+        sorted_hits          = sorted(concept_hits.items(), key=lambda x: -x[1])
+        dominant, dom_count  = sorted_hits[0]
+        entries: list[CandidateClaimEntry] = []
+
+        for cname, hit_count in sorted_hits[1:]:
+            if dom_count >= hit_count * 2.5 and hit_count >= 2:
+                slip_conf = min(0.65, 0.40 + 0.05 * hit_count) * hedge_multiplier
+                if slip_conf < CLAIM_DROP_THRESHOLD:
+                    continue
+                entries.append(CandidateClaimEntry(
+                    concept     = cname,
+                    raw_term    = cname.replace("_", " "),
+                    confidence  = round(slip_conf, 3),
+                    signal_type = "slip",
+                    turn_index  = turn_index,
+                ))
+
+        return entries
+
+    @classmethod
+    def process_answer(
+        cls,
+        domain:     str,
+        answer:     str,
+        question:   str, # noqa
+        turn_index: int,
+        signal_map: CandidateSignalMap,
+    ) -> CandidateSignalMap:
+        """
+        Main entry point. Runs all four passes. Mutates signal_map in place.
+        Fully synchronous — no I/O. Answer text never leaves this call.
+        """
+        if len(answer.strip()) < MIN_ANSWER_CHARS_FOR_EXTRACTION:
+            signal_map.total_answers_processed += 1
+            return signal_map
+
+        answer_lower = answer.lower()
+
+        # Global negation fast path: candidate is broadly disclaiming
+        if cls._is_negated(answer_lower):
+            signal_map.total_answers_processed += 1
+            log.debug(
+                "answer_signal_negated",
+                session_id = signal_map.session_id[:8],
+                domain     = domain,
+                turn_index = turn_index,
+            )
+            return signal_map
+
+        hedge_mult = cls._compute_hedge_multiplier(answer_lower)
+
+        # Pass 1: registry claims
+        for entry in cls._extract_registry_claims(domain, answer, hedge_mult, turn_index):
+            signal_map.add_claim(entry)
+
+        # Pass 3: dynamic discovery
+        new_dynamic = cls._extract_dynamic_concepts(answer, signal_map.dynamic_concepts, domain)
+        for term, keywords in new_dynamic.items():
+            signal_map.register_dynamic(term, keywords)
+            signal_map.add_claim(CandidateClaimEntry(
+                concept     = term,
+                raw_term    = term.replace("_", " "),
+                confidence  = round(0.60 * hedge_mult, 3),
+                signal_type = "dynamic",
+                turn_index  = turn_index,
+            ))
+
+        # Pass 4: slip detection
+        for entry in cls._detect_slips(domain, answer, hedge_mult, turn_index):
+            signal_map.add_claim(entry)
+
+        signal_map.total_answers_processed += 1
+        signal_map.last_updated = time.time()
+
+        log.debug(
+            "answer_signal_extracted",
+            session_id     = signal_map.session_id[:8],
+            domain         = domain,
+            turn_index     = turn_index,
+            hedge_mult     = round(hedge_mult, 3),
+            total_claims   = len(signal_map.claims),
+            contradictions = len(signal_map.contradictions),
+        )
+
+        return signal_map
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § CANDIDATE SIGNAL STORE
+# Redis-backed persistence for CandidateSignalMap.
+# NEVER stores answer text — only derived labels and confidence scores.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CandidateSignalStore:
+
+    def __init__(self) -> None:
+        self._redis: Any = None
+        self._lock       = asyncio.Lock()
+        self._local      = InMemoryLRU(max_size=int(os.getenv("CONCEPT_LRU_SIZE", "4096")))
+
+    def _key(self, session_id: str, domain: str) -> str: # noqa
+        return f"{_SIGNAL_PREFIX}{session_id}:{domain}"
+
+    async def _get_redis(self) -> Any:
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            return None
+        async with self._lock:
+            if self._redis is None:
+                try:
+                    import redis.asyncio as aioredis  # type: ignore
+                    self._redis = await aioredis.from_url(
+                        redis_url,
+                        encoding         = "utf-8",
+                        decode_responses = True,
+                        max_connections  = int(os.getenv("CONCEPT_REDIS_MAX_CONN", "200")),
+                        socket_timeout   = 0.3,
+                    )
+                except Exception as exc:
+                    log.warning("candidate_signal_store_redis_failed", error=str(exc))
+        return self._redis
+
+    async def load(self, session_id: str, domain: str) -> CandidateSignalMap:
+        key = self._key(session_id, domain)
+        raw: str | None = None
+        try:
+            r = await self._get_redis()
+            if r:
+                raw = await r.get(key)
+        except Exception as exc:
+            log.debug("signal_store_load_redis_error", error=str(exc))
+        if raw is None:
+            raw = await self._local.get(key)
+        if raw:
+            try:
+                return CandidateSignalMap.from_json(raw)
+            except Exception:  # noqa
+                pass
+        return CandidateSignalMap(session_id=session_id, domain=domain)
+
+    async def save(self, signal_map: CandidateSignalMap) -> None:
+        key  = self._key(signal_map.session_id, signal_map.domain)
+        blob = signal_map.to_json()
+        await self._local.set(key, blob)
+        try:
+            r = await self._get_redis()
+            if r:
+                await r.setex(key, _SIGNAL_TTL_S, blob)
+        except Exception as exc:
+            log.debug("signal_store_save_redis_error", error=str(exc))
+
+    async def delete(self, session_id: str, domains: list[str]) -> None:
+        for domain in domains:
+            key = self._key(session_id, domain)
+            await self._local.delete(key)
+            try:
+                r = await self._get_redis()
+                if r:
+                    await r.delete(key)
+            except Exception:  # noqa
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# § CONCEPT TRACKER — EXTENDED
+# Extends the module-level singleton with answer-signal capabilities.
+# We monkey-patch the existing ConceptTracker class with new methods
+# rather than redefining it, to avoid touching the existing wiring.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_extended_tracker() -> "ConceptTracker":
+    """
+    Rebuild the singleton with the new signal store and answer extractor wired in.
+    Called once at module load. Returns the fully extended ConceptTracker instance.
+    """
+
+    class _ExtendedConceptTracker(ConceptTracker):
+        """
+        ConceptTracker extended with dual-axis signal assembly.
+        Replaces the module-level singleton.
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._signal_store     = CandidateSignalStore()
+            self._answer_extractor = AnswerSignalExtractor()
+
+        # ── Answer signal extraction (in-process path) ────────────────────────
+
+        def extract_answer_signals(
+            self,
+            session_id:  str,
+            domain:      str,
+            answer:      str,
+            question:    str,
+            turn_index:  int,
+            level:       str = "intermediate", # noqa
+        ) -> None:
+            """
+            Called from commit_turn() after emit().
+            Schedules async extraction + Redis persistence. Never blocks.
+
+            ANSWER TEXT BOUNDARY: `answer` processed in-place.
+            Never serialized to logs at INFO+, never sent to Kafka,
+            never stored in Redis. Only derived labels are persisted.
+            """
+            task = asyncio.ensure_future(
+                self._extract_and_save(session_id, domain, answer, question, turn_index)
+            )
+            task.add_done_callback(self._on_extract_done)
+
+        @staticmethod
+        def _on_extract_done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception():
+                log.debug("concept_extract_task_failed", error=str(task.exception()))
+
+        async def _extract_and_save(
+            self,
+            session_id: str,
+            domain:     str,
+            answer:     str,
+            question:   str,
+            turn_index: int,
+        ) -> None:
+            try:
+                signal_map = await self._signal_store.load(session_id, domain)
+                signal_map = AnswerSignalExtractor.process_answer(
+                    domain     = domain,
+                    answer     = answer,
+                    question   = question,
+                    turn_index = turn_index,
+                    signal_map = signal_map,
+                )
+                await self._signal_store.save(signal_map)
+            except Exception as exc:
+                log.debug("concept_extract_and_save_failed", error=str(exc))
+
+        # ── Override: get_steering_signal with answer-axis merged in ──────────
+
+        async def get_steering_signal(
+            self,
+            session_id: str,
+            domain:     str,
+            n_turns:    int = 0,
+        ) -> ConceptSteeringSignal:
+            """
+            Merges coverage map (question axis) + signal map (answer axis).
+            Both stores loaded concurrently. Always returns a valid signal.
+            """
+            try:
+                if n_turns < MIN_TURNS_BEFORE_STEER:
+                    return self._empty_signal(session_id, domain)
+
+                coverage, signal_map = await asyncio.gather(
+                    self._store.load(session_id, domain),
+                    self._signal_store.load(session_id, domain),
+                    return_exceptions=True,
+                )
+
+                if isinstance(coverage, Exception):
+                    coverage = ConceptCoverageMap(session_id=session_id, domain=domain)
+                if isinstance(signal_map, Exception):
+                    signal_map = CandidateSignalMap(session_id=session_id, domain=domain)
+
+                if coverage.total_tracked == 0 and signal_map.total_answers_processed == 0:
+                    return self._empty_signal(session_id, domain)
+
+                # Axis 1: coverage
+                avoid = coverage.covered_concepts()[:MAX_AVOID_HINTS]
+                focus = coverage.uncovered_concepts(domain)[:MAX_FOCUS_HINTS]
+
+                # Axis 2: answer signals
+                pending             = signal_map.pending_probes(current_turn=n_turns)
+                probe_concepts      = [e.concept for e in pending if e.signal_type in ("claimed", "slip") and e.press_urgency > 0.3][:MAX_PROBE_HINTS]
+                weak_concepts       = [e.concept for e in pending if e.signal_type == "weak" and e.press_urgency > 0.3][:MAX_WEAK_HINTS]
+                dynamic_probes      = [e.concept for e in pending if e.signal_type == "dynamic" and e.press_urgency > 0.4][:MAX_PROBE_HINTS]
+                contradiction_flags = [e.concept for e in pending if e.signal_type == "contradiction"][:2]
+
+                total_in_domain = len(CONCEPT_REGISTRY.get(domain, {}))
+                ratio           = len(coverage.covered) / total_in_domain if total_in_domain else 0.0
+
+                has_signal = bool(avoid or focus or probe_concepts or weak_concepts or dynamic_probes or contradiction_flags)
+
+                signal = ConceptSteeringSignal(
+                    session_id          = session_id,
+                    domain              = domain,
+                    avoid_concepts      = avoid,
+                    focus_concepts      = focus,
+                    probe_concepts      = probe_concepts,
+                    weak_concepts       = weak_concepts,
+                    dynamic_probes      = dynamic_probes,
+                    contradiction_flags = contradiction_flags,
+                    coverage_ratio      = round(ratio, 3),
+                    has_signal          = has_signal,
+                )
+
+                log.debug(
+                    "concept_signal_built",
+                    session_id     = session_id[:8],
+                    domain         = domain,
+                    avoid          = avoid,
+                    focus          = focus,
+                    probe          = probe_concepts,
+                    weak           = weak_concepts,
+                    dynamic        = dynamic_probes,
+                    contradictions = contradiction_flags,
+                    coverage_ratio = signal.coverage_ratio,
+                    pending_total  = len(pending),
+                )
+
+                return signal
+
+            except Exception as exc:
+                log.debug("concept_signal_error", error=str(exc))
+                return self._empty_signal(session_id, domain)
+
+        # ── Override: evict_session — also clears signal store ────────────────
+
+        async def evict_session(self, session_id: str, domains: list[str]) -> None:
+            await asyncio.gather(
+                self._store.delete(session_id, domains),
+                self._signal_store.delete(session_id, domains),
+                return_exceptions=True,
+            )
+            log.debug("concept_session_evicted", session_id=session_id[:8])
+
+        # ── Optional precision wire ────────────────────────────────────────────
+
+        async def mark_concept_pressed(
+            self,
+            session_id: str,
+            domain:     str,
+            concept:    str,
+        ) -> None:
+            """
+            Optional: retire a claim immediately when a question presses it,
+            rather than waiting for PRESS_DECAY_TURNS natural decay.
+            Best-effort — silent on failure.
+            """
+            try:
+                signal_map = await self._signal_store.load(session_id, domain)
+                signal_map.mark_pressed(concept)
+                await self._signal_store.save(signal_map)
+            except Exception as exc:
+                log.debug("concept_mark_pressed_failed", error=str(exc))
+
+        # ── Extended reporting ─────────────────────────────────────────────────
+
+        async def get_coverage_report(
+            self, session_id: str, domain: str
+        ) -> dict[str, Any]:
+            coverage, signal_map = await asyncio.gather(
+                self._store.load(session_id, domain),
+                self._signal_store.load(session_id, domain),
+            )
+            all_concepts = ConceptExtractor.all_concepts_for_domain(domain)
+            return {
+                "session_id":    session_id,
+                "domain":        domain,
+                "covered":       coverage.covered,
+                "uncovered":     [c for c in all_concepts if c not in coverage.covered],
+                "total_tracked": coverage.total_tracked,
+                "coverage_ratio": round(len(coverage.covered) / max(len(all_concepts), 1), 3),
+                "last_updated":  coverage.last_updated,
+                "claims":        [c.to_dict() for c in signal_map.claims],
+                "dynamic_concepts": signal_map.dynamic_concepts,
+                "contradictions":   signal_map.contradictions,
+                "total_answers_processed": signal_map.total_answers_processed,
+                "pending_probes": [
+                    c.to_dict()
+                    for c in signal_map.pending_probes(current_turn=coverage.total_tracked)
+                ],
+            }
+
+        async def get_answer_signal_report(
+            self, session_id: str, domain: str
+        ) -> dict[str, Any]:
+            signal_map = await self._signal_store.load(session_id, domain)
+            return {
+                "session_id":              session_id,
+                "domain":                  domain,
+                "total_answers_processed": signal_map.total_answers_processed,
+                "claims":                  [c.to_dict() for c in signal_map.claims],
+                "contradictions":          signal_map.contradictions,
+                "dynamic_concepts":        signal_map.dynamic_concepts,
+                "claim_history":           signal_map.claim_history,
+                "last_updated":            signal_map.last_updated,
+            }
+
+        @staticmethod
+        def _empty_signal(session_id: str, domain: str) -> ConceptSteeringSignal:
+            return ConceptSteeringSignal(
+                session_id          = session_id,
+                domain              = domain,
+                avoid_concepts      = [],
+                focus_concepts      = [],
+                probe_concepts      = [],
+                weak_concepts       = [],
+                dynamic_probes      = [],
+                contradiction_flags = [],
+                coverage_ratio      = 0.0,
+                has_signal          = False,
+            )
+
+    return _ExtendedConceptTracker()
+
+
+# ── Replace module-level singleton with extended version ─────────────────────
+# The original `concept_tracker = ConceptTracker()` above is overridden here.
+# All existing import sites (`from app.eval.concept_tracker import concept_tracker`)
+# pick up this extended instance automatically — no import changes needed.
+
+concept_tracker = _build_extended_tracker()  # noqa: F811
+
