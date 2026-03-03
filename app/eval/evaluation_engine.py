@@ -667,7 +667,8 @@ class EvaluationEngine:
         question: str,
         candidate_ans: str,
         turn_index: int,
-        request_id: str,
+        domain: str = "",
+        request_id: str = "",
     ) -> TurnScore:
         """
         Full scoring path. Handles dedup guard, cache, rate limit, model call,
@@ -774,6 +775,22 @@ class EvaluationEngine:
 
                     # Persist score and warm content cache
                     await self._persist_score(session_id, turn_index, result)
+
+                    # ── Feed score into PerformanceScaler ─────────────────────
+                    # Normalized to 0.0–1.0 (eval scores are 0–10).
+                    # Fire-and-forget safe — scaler never raises.
+                    try:
+                        from app.eval.performance_scaler import performance_scaler
+                        await performance_scaler.push_eval_score(
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            normalized_score=result.overall / 10.0,
+                            domain=domain,
+                            answer_text=candidate_ans,
+                        )
+                    except Exception as _scaler_exc:
+                        log.debug("perf_scaler_push_failed", error=str(_scaler_exc))
+
                     await self._rset(cache_key, raw_json, ttl=EVAL_TTL_S)
 
                     # Deduct from session budget
@@ -833,7 +850,8 @@ class EvaluationEngine:
         question: str,
         candidate_ans: str,
         turn_index: int,
-        request_id: str,
+        domain: str = "",
+        request_id: str = "",
     ) -> None:
         """
         Exception-safe coroutine wrapper for asyncio.create_task().
@@ -860,6 +878,7 @@ class EvaluationEngine:
                 question=question,
                 candidate_ans=candidate_ans,
                 turn_index=turn_index,
+                domain=domain,
                 request_id=request_id,
             )
 
@@ -884,6 +903,7 @@ class EvaluationEngine:
             question: str,
             candidate_ans: str,
             turn_index: int,
+            domain: str = "",
             request_id: str | None = None,
     ) -> asyncio.Task:
         """
@@ -926,6 +946,7 @@ class EvaluationEngine:
                 question=question,
                 candidate_ans=candidate_ans,
                 turn_index=turn_index,
+                domain=domain,
                 request_id=rid,
             ),
             name=f"eval:{session_id}:{turn_index}",
@@ -1019,6 +1040,7 @@ class EvaluationEngine:
                 question=question,
                 candidate_ans=answer,
                 turn_index=turn_index,
+                domain=domain,
                 request_id=f"{rid}:{turn_index}",  # unique rid per sub-task for tracing
             )
 

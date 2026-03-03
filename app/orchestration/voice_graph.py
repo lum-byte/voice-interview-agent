@@ -2697,7 +2697,7 @@ def _build_graph_for_instance(
         try:
             # play_audio has async internals — call directly in the event loop,
             # not via to_thread (which runs in a worker thread with no event loop).
-            result = play_audio(local_path)
+            result = play_audio(local_path) # noqa
             if asyncio.iscoroutine(result):
                 await result
             latency = time.monotonic() - t0
@@ -6212,6 +6212,14 @@ async def on_startup() -> None:
         canary_pct=FF_CANARY_PCT,
     )
 
+    # ── 9. Concept tracker ───────────────────────────────────────────────
+    try:
+        from app.eval.concept_tracker import concept_tracker
+        await concept_tracker.start()
+        log.info("startup_concept_tracker_ok", service="concept_tracker")
+    except Exception as exc:
+        log.error("startup_concept_tracker_failed", service="concept_tracker", error=str(exc))
+
     startup_latency = time.monotonic() - t0
     log.info(
         "voice_graph_startup_complete",
@@ -6244,6 +6252,9 @@ async def on_shutdown() -> None:
                 log.info("shutdown_sessions_closed", tier=graph_instance._tier, count=closed)  # noqa
         except Exception as exc:
             log.warning("shutdown_sessions_close_error", error=str(exc))
+
+    from app.eval.concept_tracker import concept_tracker
+    await concept_tracker.stop()
 
     # ── 2. STT unload ────────────────────────────────────────────────────
     try:

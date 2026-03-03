@@ -107,7 +107,14 @@ from app.common.shared import (
     make_histogram,
     new_request_id, # noqa
 )
+
+from app.eval.performance_scaler import (
+    PerformanceScaler,
+    apply_signal_to_llm_input,
+)
+
 from app.monitoring.observability import get_logger
+from app.eval.concept_tracker import concept_tracker, QuestionAskedEvent
 
 log = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -2861,6 +2868,18 @@ class LLMInputBuilder:
                 f"recent_question_fingerprints (avoid repeating these): {', '.join(fp_hints)}"
             )
 
+        # ── Concept steering suffix ───────────────────────────────────────────
+        # get_steering_signal() reads Redis coverage map built by the Kafka
+        # consumer. Falls back cleanly (empty string) if no data yet.
+        steering = await concept_tracker.get_steering_signal(
+            session_id=doc.session_id,
+            domain=domain,
+            n_turns=q_index,
+        )
+        steer_suffix = steering.to_suffix_instruction()
+        if steer_suffix:
+            sys_text += f"\n\n{steer_suffix}"
+
         messages = [
             SystemMessage(content=sys_text),
             HumanMessage(content="\n".join(user_parts)),
@@ -2907,6 +2926,7 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
         self._checkpoints   = QACheckpointStore(self._redis)
         self._guardrails    = QAGuardrailEngine()
         self._input_builder = LLMInputBuilder(self._difficulty, self._fingerprints)
+        self._scaler = PerformanceScaler()
 
     async def advance_stage(self, session_id: str, new_stage: str) -> None:
         """
@@ -3074,6 +3094,13 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
                 targets={k: v for k, v in weighted_targets.items()},
             )
 
+            # ── Initialize PerformanceScaler for this session ─────────────────
+            await self._scaler.initialize_session(
+                session_id=session_id,
+                stated_level=ats_result.level,
+                domains=doc.domains,
+            )
+
             # ── Return first LLMInterviewInput for the opening question ──────────
             return await self.get_llm_input(session_id, "")
 
@@ -3102,7 +3129,20 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
                 return None  # all domains exhausted → session complete
             await self._redis.set(doc)
 
-        return await self._input_builder.build(doc, candidate_answer)
+        llm_input = await self._input_builder.build(doc, candidate_answer)
+
+        # ── Apply adaptive difficulty from PerformanceScaler ──────────────────
+        # get_current_signal() is always safe — returns a default if no state.
+        signal = await self._scaler.get_current_signal(session_id, doc.active_domain)
+        llm_input = apply_signal_to_llm_input(signal, llm_input)
+
+        log.debug(
+            "qa_scaler_signal",
+            session_id=session_id[:8],
+            **signal.to_log_dict(),
+        )
+
+        return llm_input
 
     # ── override commit_turn to add guardrails + fingerprinting + checkpoint ──
 
@@ -3179,6 +3219,27 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
 
         # ── Parent commit ──────────────────────────────────────────────────────
         committed = await super().commit_turn(session_id, candidate_answer, llm_question)
+
+        # ── Notify PerformanceScaler of committed turn (pre-score metadata) ───
+        # Stores answer_words + difficulty so push_eval_score() can correlate
+        # when the async eval score arrives later.
+        await self._scaler.notify_turn_committed(
+            session_id=session_id,
+            turn_index=committed.turn_index,
+            domain=committed.domain,
+            answer_text=candidate_answer,
+            difficulty=None,  # scaler reads its own current_difficulty
+        )
+
+        # ── Emit concept tracking event (fire-and-forget via Kafka) ───────────
+        # Only the question travels — answer never leaves this process boundary.
+        concept_tracker.emit(QuestionAskedEvent(
+            session_id=session_id,
+            domain=committed.domain,
+            question=llm_question,
+            turn_index=committed.turn_index,
+            level=doc.candidate.level,
+        ))
 
         # ── Register fingerprint ───────────────────────────────────────────────
         if llm_question.strip():
@@ -3377,6 +3438,11 @@ class QAControllerV2(QAController):   # type: ignore[name-defined]
         # Drop the prefetch buffer for this session so stale LLM inputs don't
         # linger in memory after the session is gone.
         qa_prefetch_buffer.cancel_session(session_id)
+        await self._scaler.evict_session(session_id)
+
+        # ── Evict concept coverage map from Redis ─────────────────────────────
+        if doc:
+            await concept_tracker.evict_session(session_id, doc.domains)
 
         log.info("qa_session_v2_closed", session_id=session_id[:8])
 
