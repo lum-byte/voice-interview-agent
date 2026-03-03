@@ -2575,12 +2575,15 @@ t=4000ms      eval_engine scores answer → Redis score key
               budget: 847 tokens consumed (remaining: 49,153)
 ```
 
+## Runtime Sequence Flow
+
+![Sequence Diagram](docs/architecture/sequence-diagram.svg)
+
+
 ---
 
 <div align="center">
 
 **Built for production. Designed for clarity. Instrumented for everything.**
-
-Total codebase: ~49,908 lines | 19 modules | 5 execution modes | 3-layer observability
 
 </div>
