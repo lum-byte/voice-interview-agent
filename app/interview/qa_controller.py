@@ -5,7 +5,7 @@ This module is the single source of truth for ALL interview session state.
 It completely replaces conversation_memory.py as the context provider for
 the LLM node in voice_graph.py.
 
-PHILOSOPHY:
+MENTAL MODEL:
 ───────────
   The LLM is a QUESTION GENERATOR, not a conversational assistant.
   It receives the minimum possible context to produce the next question.

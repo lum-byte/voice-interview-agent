@@ -2,38 +2,6 @@
 performance_scaler.py  ─  PerformanceScaler
 ════════════════════════════════════════════
 
-DROP LOCATION: qa_controller.py, line 3628 — paste the entire contents
-of this file directly above the comment block:
-    # ── voice_graph integration: build_next_llm_input ─────────────────────────────
-
-CONNECT (3 surgical edits to qa_controller.py):
-────────────────────────────────────────────────
-  [1] QAControllerV2.__init__() — add at end of method body:
-          self._scaler = PerformanceScaler()
-
-  [2] QAControllerV2.seed_from_intro() — after Redis write succeeds, add:
-          await self._scaler.initialize_session(
-              session_id=session_id,
-              stated_level=ats_result.level,
-              domains=doc.domains,
-          )
-
-  [3] QAControllerV2.get_llm_input() — just before constructing LLMInterviewInput,
-      replace the raw `doc.candidate.level` usage with:
-          _sig = await self._scaler.get_current_signal(session_id, doc.active_domain)
-          _effective_level = _sig.effective_level
-          _probe_flag      = _sig.probe_flag
-      Then pass `_effective_level` where `doc.candidate.level` was used.
-
-  [EVAL HOOK] In evaluation_engine.py — after scoring a turn, call:
-          await qa_controller._scaler.push_eval_score(
-              session_id=session_id,
-              turn_index=turn_index,
-              normalized_score=score_0_to_1,
-              domain=domain,
-              answer_text=answer_text,
-          )
-
 Architecture
 ────────────
 A candidate's stated level is a PRIOR, not ground truth.
