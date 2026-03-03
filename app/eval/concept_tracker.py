@@ -57,6 +57,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from app.common.shared import InMemoryLRU
 
 log = get_logger(__name__)
 
@@ -343,8 +344,9 @@ class ConceptEventProducer:
         try:
             producer = await self._get_producer()
             if producer:
-                await producer.send_and_wait(
+                await producer.send(
                     KAFKA_TOPIC_IN,
+                    key=event.session_id.encode(),
                     value = event.to_json(),
                 )
                 log.debug(
@@ -379,7 +381,7 @@ class ConceptCoverageStore:
     def __init__(self) -> None:
         self._redis: Any      = None
         self._lock            = asyncio.Lock()
-        self._local: dict[str, str] = {}   # key → JSON blob (fallback)
+        self._local = InMemoryLRU(max_size=int(os.getenv("CONCEPT_LRU_SIZE", "4096")))   # key → JSON blob (fallback)
 
     def _key(self, session_id: str, domain: str) -> str: # noqa
         return f"{_COVERAGE_PREFIX}{session_id}:{domain}"
@@ -396,7 +398,7 @@ class ConceptCoverageStore:
                         redis_url,
                         encoding         = "utf-8",
                         decode_responses = True,
-                        max_connections  = 10,
+                        max_connections=int(os.getenv("CONCEPT_REDIS_MAX_CONN", "200")),
                         socket_timeout   = 0.3,
                     )
                 except Exception as exc:
@@ -415,7 +417,7 @@ class ConceptCoverageStore:
             log.debug("concept_store_load_redis_error", error=str(exc))
 
         if raw is None:
-            raw = self._local.get(key)
+            raw = await self._local.get(key)
 
         if raw:
             try:
@@ -427,9 +429,18 @@ class ConceptCoverageStore:
         return ConceptCoverageMap(session_id=session_id, domain=domain)
 
     async def save(self, coverage: ConceptCoverageMap) -> None:
-        key  = self._key(coverage.session_id, coverage.domain)
+        key = self._key(coverage.session_id, coverage.domain)
         blob = coverage.to_json()
-        self._local[key] = blob   # always write local fallback
+
+        # Always write to local fallback
+        await self._local.set(key, blob)
+
+        try:
+            r = await self._get_redis()
+            if r:
+                await r.setex(key, _COVERAGE_TTL_S, blob)
+        except Exception as exc:
+            log.debug("concept_store_save_redis_error", error=str(exc))   # always write local fallback
 
         try:
             r = await self._get_redis()
@@ -442,12 +453,15 @@ class ConceptCoverageStore:
         """Called on session eviction."""
         for domain in domains:
             key = self._key(session_id, domain)
-            self._local.pop(key, None)
+
+            # local fallback
+            await self._local.delete(key)
+
             try:
                 r = await self._get_redis()
                 if r:
                     await r.delete(key)
-            except Exception: # noqa
+            except Exception:  # noqa
                 pass
 
 
@@ -669,7 +683,13 @@ class ConceptTracker:
         Called from commit_turn(). Schedules async produce — never blocks.
         Falls back to in-process queue if Kafka producer isn't available yet.
         """
-        asyncio.ensure_future(self._emit_async(event))
+        task = asyncio.ensure_future(self._emit_async(event))
+        task.add_done_callback(self._on_emit_done)
+
+    @staticmethod
+    def _on_emit_done(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception():
+            log.debug("concept_emit_task_failed", error=str(task.exception()))
 
     async def _emit_async(self, event: QuestionAskedEvent) -> None:
         """

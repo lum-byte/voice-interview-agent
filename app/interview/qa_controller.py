@@ -1148,7 +1148,7 @@ class _MessageBuilder:
 
 # ── main controller ────────────────────────────────────────────────────────────
 
-class QAController:
+class _QAControllerBase:
     """
     Central state machine for structured interview sessions.
 
@@ -2048,7 +2048,7 @@ class QAAdminClient:
 # ── enhanced QAController ─────────────────────────────────────────────────────
 # Extend with recovery integration, analytics, and admin client
 
-class QAController(QAController):  # type: ignore[no-redef]
+class _QAControllerWithRecovery(_QAControllerBase):
     """
     Extended QAController adding:
       - Session recovery on load
@@ -2904,7 +2904,7 @@ class LLMInputBuilder:
 
 # ── enhanced QAController (v2) ─────────────────────────────────────────────────
 
-class QAControllerV2(QAController):   # type: ignore[name-defined]
+class QAControllerV2(_QAControllerWithRecovery):
     """
     Production QAController extended with:
       - DifficultyScaler → richer LLM inputs
@@ -3723,6 +3723,7 @@ async def build_next_llm_input_for_voice_graph(
         return None
 
 
-# ── module-level singleton (overrides old qa_controller = QAController()) ─────
+# ── module-level singleton ────────────────────────────────────────────────────
+# Hierarchy: _QAControllerBase → _QAControllerWithRecovery → QAControllerV2
 
 qa_controller = QAControllerV2()

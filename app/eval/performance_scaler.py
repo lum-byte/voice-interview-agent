@@ -317,6 +317,14 @@ class DifficultySignal:
     trajectory:       Trajectory
     confidence:       float        # 0.0–1.0: how much we trust this signal
     reasoning:        str          # one-line human-readable explanation
+    engine_contributions: dict[str, Any] = field(default_factory=dict)
+    # Per-engine attribution for observability and debugging.
+    # Keys: "bayes", "doubt", "zpd", "trajectory", "ig", "probe", "cross"
+    # Values: the dominant scalar or label each engine contributed.
+    # Example: {"bayes": "intermediate(H=0.82)", "zpd": "escalate",
+    #           "trajectory": "rising(slope=0.04,r2=0.91)",
+    #           "ig": "diff=0.62", "probe": "none", "doubt": 0.55,
+    #           "cross": "python→dsa(corr=0.70)"}
     ts:               float = field(default_factory=time.monotonic)
 
     def to_log_dict(self) -> dict:
@@ -331,6 +339,7 @@ class DifficultySignal:
             "confidence":      round(self.confidence, 3),
             "entropy":         round(self.belief_entropy, 3),
             "reasoning":       self.reasoning,
+            "engines":         self.engine_contributions,
         }
 
 
@@ -1620,18 +1629,53 @@ class PerformanceScaler:
                 f"doubt={state.doubt_coeff:.2f}; action={action.value}"
             )
 
+        # ── Per-engine attribution ─────────────────────────────────────────────
+        # One entry per engine. Gives exact visibility into which engine drove
+        # any given level decision. Logged via to_log_dict() → structured logs.
+        engine_contributions = {
+            # Engine 1: Bayesian belief — MAP estimate + uncertainty
+            "bayes": f"{belief.map_level}(H={belief.entropy():.2f},"
+                     f"p={belief.probs[LEVELS.index(belief.map_level)]:.2f})",
+
+            # Engine 2: DoubtEngine — skepticism coefficient
+            "doubt": round(state.doubt_coeff, 3),
+
+            # Engine 3: ZPDHunter — action + accumulated pressure
+            "zpd": d_state.last_action.value,
+
+            # Engine 4: TrajectoryAnalyzer — shape + regression quality
+            "trajectory": f"{traj.value}(slope={slope:.3f},r2={r2:.2f})",
+
+            # Engine 5: InformationGainOracle — difficulty it resolved to
+            "ig": f"diff={d_state.current_difficulty:.2f}→{effective_level}-{diff_hint}",
+
+            # Engine 6: ProbeOracle — pending probe or none
+            "probe": (
+                f"{d_state.probe_type.value}" if d_state.probe_pending and d_state.probe_type
+                else "none"
+            ),
+
+            # Engine 7: DomainCrossInferenceGraph — noted at domain init;
+            # confirmed_level shows if cross-prior was validated by scores
+            "cross": (
+                f"confirmed={d_state.confirmed_level}" if d_state.confirmed_level
+                else f"map={belief.map_level}(unconfirmed)"
+            ),
+        }
+
         return DifficultySignal(
-            session_id      = state.session_id,
-            domain          = domain,
-            effective_level = effective_level,
-            difficulty_hint = diff_hint,
-            action          = action,
-            probe_flag      = d_state.probe_pending,
-            probe_type      = d_state.probe_type,
-            belief_entropy  = belief.entropy(),
-            trajectory      = traj,
-            confidence      = confidence,
-            reasoning       = reasoning,
+            session_id           = state.session_id,
+            domain               = domain,
+            effective_level      = effective_level,
+            difficulty_hint      = diff_hint,
+            action               = action,
+            probe_flag           = d_state.probe_pending,
+            probe_type           = d_state.probe_type,
+            belief_entropy       = belief.entropy(),
+            trajectory           = traj,
+            confidence           = confidence,
+            reasoning            = reasoning,
+            engine_contributions = engine_contributions,
         )
 
     def _default_signal(self, session_id: str, domain: str) -> DifficultySignal: # noqa
@@ -1640,17 +1684,18 @@ class PerformanceScaler:
         Starts at intermediate — the stated-level-agnostic safe default.
         """
         return DifficultySignal(
-            session_id      = session_id,
-            domain          = domain,
-            effective_level = "intermediate",
-            difficulty_hint = "mid",
-            action          = ScalerAction.HOLD,
-            probe_flag      = False,
-            probe_type      = None,
-            belief_entropy  = math.log2(N_LEVELS),   # maximum uncertainty
-            trajectory      = Trajectory.UNKNOWN,
-            confidence      = 0.0,
-            reasoning       = "default: no state found, safe intermediate fallback",
+            session_id           = session_id,
+            domain               = domain,
+            effective_level      = "intermediate",
+            difficulty_hint      = "mid",
+            action               = ScalerAction.HOLD,
+            probe_flag           = False,
+            probe_type           = None,
+            belief_entropy       = math.log2(N_LEVELS),   # maximum uncertainty
+            trajectory           = Trajectory.UNKNOWN,
+            confidence           = 0.0,
+            reasoning            = "default: no state found, safe intermediate fallback",
+            engine_contributions = {"default": "no_state"},
         )
 
     def _update_global_belief(self, state: SessionScalerState) -> None: # noqa

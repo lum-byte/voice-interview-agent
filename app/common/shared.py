@@ -620,6 +620,12 @@ class InMemoryLRU:
             if len(self._store) > self._max:
                 self._store.popitem(last=False)  # evict LRU
 
+    async def delete(self, key: str) -> None:
+        if self._max == 0:
+            return
+        async with self._lock:
+            self._store.pop(key, None)
+
     @property
     def stats(self) -> dict[str, int]:
         total = self._hits + self._misses
