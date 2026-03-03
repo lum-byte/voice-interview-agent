@@ -1,0 +1,545 @@
+# ============================================================
+# Voice AI Platform – Metrics Catalog
+# ============================================================
+#
+# This file lists all Prometheus metrics exposed by the Voice AI system.
+#
+# Coverage includes:
+# - PCM audio pipeline (VAD, AGC, AEC, jitter buffer, transcoding)
+# - STT (Whisper) instrumentation
+# - LLM generation + token accounting
+# - TTS streaming pipeline
+# - Evaluation engine scoring
+# - Session lifecycle management
+# - Circuit breakers, rate limiting, bulkheads
+# - Kafka, Redis, Mongo integrations
+# - Controller (PTT, interrupts, pipeline control)
+# - System-level process metrics
+#
+# Exported via: http://app:8000/metrics
+# Scraped by: Prometheus
+#
+# Total metrics: ~600+
+#
+# ============================================================
+
+# HELP system_degraded_mode 1 when system is operating in degraded mode
+# HELP system_degraded_mode_entries_total Times system entered degraded mode
+# HELP system_degraded_mode_entries_created Times system entered degraded mode
+# HELP load_shedding_rejected_total Requests rejected by load shedding
+# HELP pipeline_queue_full_total Times a bounded pipeline queue rejected a put()
+# HELP session_created_total New sessions registered
+# HELP session_created_created New sessions registered
+# HELP session_ended_total Sessions ended (explicit or expiry)
+# HELP session_rejected_total Registration rejections
+# HELP session_turns_total Conversation turns persisted
+# HELP session_turns_created Conversation turns persisted
+# HELP session_lru_hits_total Session reads served from LRU
+# HELP session_lru_hits_created Session reads served from LRU
+# HELP session_lock_conflicts_total IP already-locked conflicts
+# HELP session_lock_conflicts_created IP already-locked conflicts
+# HELP session_active Sessions currently holding an IP lock
+# HELP session_history_turns Number of turns in history at time of LLM call
+# HELP session_history_turns_created Number of turns in history at time of LLM call
+# HELP sanitize_calls_total sanitize_for_tts() invocations
+# HELP sanitize_calls_created sanitize_for_tts() invocations
+# HELP sanitize_empty_total Inputs that were empty after coercion
+# HELP sanitize_empty_created Inputs that were empty after coercion
+# HELP sanitize_truncated_total Outputs truncated to max_chars
+# HELP sanitize_truncated_created Outputs truncated to max_chars
+# HELP sanitize_warnings_total Warning tags emitted
+# HELP sanitize_char_delta Characters removed per call (original_len - sanitized_len)
+# HELP sanitize_char_delta_created Characters removed per call (original_len - sanitized_len)
+# HELP sanitize_input_len Character length of raw input
+# HELP sanitize_input_len_created Character length of raw input
+# HELP pcm_input_chunks_total PCM mic chunks captured
+# HELP pcm_input_bytes_total PCM mic bytes captured
+# HELP pcm_input_bytes_created PCM mic bytes captured
+# HELP pcm_input_overflows_total PortAudio input overflows
+# HELP pcm_input_overflows_created PortAudio input overflows
+# HELP pcm_input_chunks_dropped_total Input chunks dropped (queue full)
+# HELP pcm_input_chunks_dropped_created Input chunks dropped (queue full)
+# HELP pcm_output_chunks_total PCM chunks written to speaker
+# HELP pcm_output_bytes_total PCM bytes written to speaker
+# HELP pcm_output_bytes_created PCM bytes written to speaker
+# HELP pcm_output_underruns_total Output queue starvation events
+# HELP pcm_output_underruns_created Output queue starvation events
+# HELP pcm_output_stream_recreations_total Output stream re-opens
+# HELP pcm_output_stream_recreations_created Output stream re-opens
+# HELP pcm_vad_transitions_total VAD state transitions
+# HELP pcm_vad_segments_total Complete speech segments yielded
+# HELP pcm_vad_segments_created Complete speech segments yielded
+# HELP pcm_converter_calls_total PCM format conversions
+# HELP pcm_input_stream_active 1 when PCMInputStream is running
+# HELP pcm_output_stream_active 1 when PCMOutputStream is running
+# HELP pcm_output_queue_depth Chunks waiting in output queue
+# HELP pcm_vad_active 1 when VAD believes speech is ongoing
+# HELP pcm_convert_latency_seconds PCMConverter call duration
+# HELP pcm_convert_latency_seconds_created PCMConverter call duration
+# HELP pcm_output_write_latency_seconds PCMOutputStream write duration (sounddevice or FFmpeg path)
+# HELP pcm_output_write_latency_seconds_created PCMOutputStream write duration (sounddevice or FFmpeg path)
+# HELP pcm_chunk_duration_seconds Audio duration of individual PCMChunks
+# HELP pcm_chunk_duration_seconds_created Audio duration of individual PCMChunks
+# HELP pcm_spectral_vad_decisions_total SpectralVAD frame decisions
+# HELP pcm_aec_residual_rms Echo canceller residual RMS after AEC
+# HELP pcm_aec_residual_rms_created Echo canceller residual RMS after AEC
+# HELP pcm_agc_gain_applied AGC gain factor applied to chunk
+# HELP pcm_agc_gain_applied_created AGC gain factor applied to chunk
+# HELP pcm_noise_suppressor_reduction_db Noise suppression applied (dB)
+# HELP pcm_noise_suppressor_reduction_db_created Noise suppression applied (dB)
+# HELP pcm_dynamics_gain_reduction_db Dynamics processor gain reduction (dB)
+# HELP pcm_dynamics_gain_reduction_db_created Dynamics processor gain reduction (dB)
+# HELP pcm_jitter_buffer_depth_packets Number of packets in jitter buffer
+# HELP pcm_jitter_buffer_late_drops_total Jitter buffer late-packet discards
+# HELP pcm_jitter_buffer_late_drops_created Jitter buffer late-packet discards
+# HELP pcm_jitter_buffer_concealment_total Jitter buffer PLC concealment events
+# HELP pcm_jitter_buffer_concealment_created Jitter buffer PLC concealment events
+# HELP pcm_mixer_clipping_events_total Stream mixer post-mix clipping events
+# HELP pcm_mixer_clipping_events_created Stream mixer post-mix clipping events
+# HELP pcm_interrupt_detections_total Barge-in / interrupt events detected
+# HELP pcm_interrupt_detections_created Barge-in / interrupt events detected
+# HELP pcm_pipeline_stage_latency_seconds Per-stage processing latency
+# HELP pcm_pipeline_stage_latency_seconds_created Per-stage processing latency
+# HELP pcm_diagnostics_clipping_events_total Diagnostic clipping detection events
+# HELP pcm_diagnostics_clipping_events_created Diagnostic clipping detection events
+# HELP pcm_diagnostics_silence_events_total Diagnostic sustained silence events
+# HELP pcm_diagnostics_silence_events_created Diagnostic sustained silence events
+# HELP pcm_diagnostics_dc_offset_events_total Diagnostic DC offset events
+# HELP pcm_diagnostics_dc_offset_events_created Diagnostic DC offset events
+# HELP pcm_serializer_bytes_in_total Raw bytes serialized to wire format
+# HELP pcm_serializer_bytes_in_created Raw bytes serialized to wire format
+# HELP pcm_serializer_bytes_out_total Wire-format bytes deserialized to PCM
+# HELP pcm_serializer_bytes_out_created Wire-format bytes deserialized to PCM
+# HELP pcm_pool_hits_total Object pool cache hits
+# HELP pcm_pool_hits_created Object pool cache hits
+# HELP pcm_pool_misses_total Object pool cache misses (new alloc)
+# HELP pcm_pool_misses_created Object pool cache misses (new alloc)
+# HELP pcm_drift_corrections_total Sample-clock drift correction events
+# HELP pcm_drift_corrections_created Sample-clock drift correction events
+# HELP pcm_transcode_calls_total PCM → encoded-format transcode calls
+# HELP pcm_transcode_latency_seconds Wall-clock duration of FFmpeg transcode subprocess
+# HELP pcm_transcode_latency_seconds_created Wall-clock duration of FFmpeg transcode subprocess
+# HELP pcm_transcode_bytes_in_total Raw PCM bytes fed into the transcoder
+# HELP pcm_transcode_bytes_in_created Raw PCM bytes fed into the transcoder
+# HELP pcm_transcode_bytes_out_total Encoded bytes produced by the transcoder
+# HELP pcm_transcode_bytes_out_created Encoded bytes produced by the transcoder
+# HELP stt_requests_total Total STT requests
+# HELP stt_requests_created Total STT requests
+# HELP stt_latency_seconds End-to-end STT latency
+# HELP stt_latency_seconds_created End-to-end STT latency
+# HELP stt_time_to_first_segment_seconds Latency from call start to first segment yielded (stream mode)
+# HELP stt_time_to_first_segment_seconds_created Latency from call start to first segment yielded (stream mode)
+# HELP stt_file_size_mb Audio file size distribution
+# HELP stt_file_size_mb_created Audio file size distribution
+# HELP stt_chunks_per_stream Wav chunks per streaming transcription
+# HELP stt_chunks_per_stream_created Wav chunks per streaming transcription
+# HELP stt_active_requests STT jobs currently in flight
+# HELP stt_circuit_breaker_open 1 when the STT breaker is OPEN
+# HELP stt_latency_budget_exceeded_total STT requests aborted due to blown SLA
+# HELP stt_latency_budget_exceeded_created STT requests aborted due to blown SLA
+# HELP stt_pcm_chunks_received_total PCMChunks received by transcribe_chunk()
+# HELP stt_pcm_input_chunk_rms RMS of PCMChunks entering transcribe_chunk() (normalised float32 scale)
+# HELP stt_pcm_input_chunk_rms_created RMS of PCMChunks entering transcribe_chunk() (normalised float32 scale)
+# HELP stt_pcm_chunk_duration_seconds Duration of PCMChunks sent to Whisper
+# HELP stt_pcm_chunk_duration_seconds_created Duration of PCMChunks sent to Whisper
+# HELP stt_pcm_wav_bytes_sent_total WAV bytes encoded from PCMChunks and sent to Whisper
+# HELP stt_pcm_wav_bytes_sent_created WAV bytes encoded from PCMChunks and sent to Whisper
+# HELP stt_pcm_confidence_rejects_total STTSegments suppressed by PCMConfidenceFilter
+# HELP stt_pcm_confidence_rejects_created STTSegments suppressed by PCMConfidenceFilter
+# HELP stt_pcm_format_conversions_total PCMChunk format conversions to Whisper target (16 kHz mono int16)
+# HELP stt_pcm_format_conversions_created PCMChunk format conversions to Whisper target (16 kHz mono int16)
+# HELP qa_sessions_created_total QA sessions initialised
+# HELP qa_sessions_created_created QA sessions initialised
+# HELP qa_turns_committed_total Q/A turns committed
+# HELP qa_domain_rotations_total Domain rotation events
+# HELP qa_domain_rotations_created Domain rotation events
+# HELP qa_sessions_completed_total Interviews marked complete
+# HELP qa_sessions_completed_created Interviews marked complete
+# HELP qa_ats_calls_total ATS intro extraction calls
+# HELP qa_redis_ops_total Redis read/write ops
+# HELP qa_redis_ops_created Redis read/write ops
+# HELP qa_lru_hits_total In-process LRU cache hits
+# HELP qa_lru_hits_created In-process LRU cache hits
+# HELP qa_stage_transitions_total Stage machine transitions
+# HELP qa_stage_transitions_created Stage machine transitions
+# HELP qa_commit_turn_latency_seconds commit_turn() wall clock
+# HELP qa_commit_turn_latency_seconds_created commit_turn() wall clock
+# HELP qa_ats_extraction_latency_seconds ATS intro extraction end-to-end
+# HELP qa_ats_extraction_latency_seconds_created ATS intro extraction end-to-end
+# HELP qa_active_sessions Sessions currently in 'interview' stage
+# HELP qa_guardrails_triggered_total Guardrail evaluations that triggered
+# HELP qa_fingerprint_dedups_total Question fingerprint dedup hits
+# HELP qa_fingerprint_dedups_created Question fingerprint dedup hits
+# HELP qa_checkpoints_saved_total Domain boundary checkpoints saved
+# HELP qa_checkpoints_saved_created Domain boundary checkpoints saved
+# HELP qa_checkpoints_restored_total Checkpoint restores on recovery
+# HELP qa_checkpoints_restored_created Checkpoint restores on recovery
+# HELP qa_prefetch_hits_total Prefetch buffer cache hits
+# HELP qa_prefetch_hits_created Prefetch buffer cache hits
+# HELP qa_prefetch_misses_total Prefetch buffer misses
+# HELP qa_prefetch_misses_created Prefetch buffer misses
+# HELP qa_difficulty_transitions_total Difficulty level transitions
+# HELP qa_state_violations_total State machine violations caught
+# HELP qa_guardrail_hard_stops_total Hard-stop guardrail triggers
+# HELP qa_guardrail_hard_stops_created Hard-stop guardrail triggers
+# HELP qa_timing_records_total Turn timing records committed
+# HELP qa_timing_records_created Turn timing records committed
+# HELP qa_late_patches_total Late-patch corrections applied
+# HELP qa_turn_time_per_domain_seconds Time candidate took to answer per domain
+# HELP llm_requests_total Total LLM requests
+# HELP llm_cache_hits_total Cache hits
+# HELP llm_lru_hits_total LRU hits
+# HELP llm_lru_hits_created LRU hits
+# HELP llm_budget_exceeded_total Budget exceeded
+# HELP llm_budget_exceeded_created Budget exceeded
+# HELP llm_response_validated_total Validator corrections
+# HELP llm_fallback_used_total Primary→fallback switches
+# HELP llm_injection_blocks_total Prompt injection blocks
+# HELP llm_injection_blocks_created Prompt injection blocks
+# HELP llm_policy_blocks_total Content policy blocks
+# HELP llm_diversity_retries_total Diversity retry attempts
+# HELP llm_bank_fallbacks_total Static bank fallback uses
+# HELP llm_ats_schema_failures_total ATS JSON schema fails
+# HELP llm_ats_schema_failures_created ATS JSON schema fails
+# HELP llm_eval_calls_total Eval mode LLM calls
+# HELP llm_batch_ats_calls_total Batch ATS processing calls
+# HELP llm_stream_word_cuts_total Streaming word-count cutoffs
+# HELP llm_stream_word_cuts_created Streaming word-count cutoffs
+# HELP llm_latency_seconds LLM call latency
+# HELP llm_time_to_first_token_seconds Time to first token
+# HELP llm_tokens_used Token counts
+# HELP llm_question_similarity_score N-gram cosine similarity vs recent questions
+# HELP llm_question_similarity_score_created N-gram cosine similarity vs recent questions
+# HELP llm_eval_latency_seconds Eval mode LLM call latency
+# HELP llm_eval_latency_seconds_created Eval mode LLM call latency
+# HELP llm_batch_ats_throughput_per_minute Batch ATS processing throughput
+# HELP llm_batch_ats_throughput_per_minute_created Batch ATS processing throughput
+# HELP llm_active_requests In-flight requests
+# HELP llm_circuit_breaker_open Circuit breaker state
+# HELP tts_requests_total Total TTS requests
+# HELP tts_requests_created Total TTS requests
+# HELP tts_latency_seconds End-to-end TTS latency
+# HELP tts_latency_seconds_created End-to-end TTS latency
+# HELP tts_time_to_first_byte_seconds Latency from synthesize_stream() to first audio bytes
+# HELP tts_time_to_first_byte_seconds_created Latency from synthesize_stream() to first audio bytes
+# HELP tts_characters_synthesized Char count per request
+# HELP tts_characters_synthesized_created Char count per request
+# HELP tts_chunks_per_request Audio chunks per request
+# HELP tts_chunks_per_request_created Audio chunks per request
+# HELP tts_stream_sentence_chars Size of each sentence flushed by AsyncSentenceBuffer
+# HELP tts_stream_sentence_chars_created Size of each sentence flushed by AsyncSentenceBuffer
+# HELP tts_active_requests TTS jobs currently in flight
+# HELP tts_circuit_breaker_open 1 when the TTS breaker is OPEN
+# HELP tts_latency_budget_exceeded_total TTS requests aborted due to blown SLA
+# HELP tts_latency_budget_exceeded_created TTS requests aborted due to blown SLA
+# HELP tts_apology_fallback_total Times the cached apology audio was served
+# HELP tts_apology_fallback_created Times the cached apology audio was served
+# HELP tts_pcm_chunks_emitted_total PCMChunks emitted from the TTS PCM pipeline
+# HELP tts_pcm_chunk_rms RMS amplitude of TTS PCMChunks (normalised float scale)
+# HELP tts_pcm_chunk_rms_created RMS amplitude of TTS PCMChunks (normalised float scale)
+# HELP tts_pcm_quality_retries_total PCMChunk quality-gate retry events
+# HELP tts_pcm_quality_retries_created PCMChunk quality-gate retry events
+# HELP tts_pcm_time_to_first_chunk_seconds Time from synthesize_pcm_stream() entry to first PCMChunk yielded
+# HELP tts_pcm_time_to_first_chunk_seconds_created Time from synthesize_pcm_stream() entry to first PCMChunk yielded
+# HELP tts_pcm_wav_bytes_collected_total WAV bytes produced by PCMStreamToWAVCollector
+# HELP tts_pcm_wav_bytes_collected_created WAV bytes produced by PCMStreamToWAVCollector
+# HELP tts_pcm_sentence_gap_chunks_total Silence PCMChunks injected between TTS sentences
+# HELP tts_pcm_sentence_gap_chunks_created Silence PCMChunks injected between TTS sentences
+# HELP player_plays_total File playback sessions started
+# HELP player_plays_created File playback sessions started
+# HELP player_finished_total File playback sessions completed normally
+# HELP player_finished_created File playback sessions completed normally
+# HELP player_stopped_total File playback sessions stopped early
+# HELP player_stopped_created File playback sessions stopped early
+# HELP player_errors_total File playback errors
+# HELP player_errors_created File playback errors
+# HELP player_stream_chunks_total PCM chunks written to OutputStream
+# HELP player_stream_chunks_created PCM chunks written to OutputStream
+# HELP player_stream_bytes_total Bytes written to OutputStream
+# HELP player_stream_bytes_created Bytes written to OutputStream
+# HELP player_stream_decode_errors_total Chunks that failed sf.read()
+# HELP player_stream_decode_errors_created Chunks that failed sf.read()
+# HELP player_stream_write_errors_total OutputStream.write() failures
+# HELP player_stream_write_errors_created OutputStream.write() failures
+# HELP player_stream_recreations_total OutputStream rebuilt (format change/crash)
+# HELP player_stream_recreations_created OutputStream rebuilt (format change/crash)
+# HELP player_stream_drops_total Chunks dropped because queue was full
+# HELP player_stream_drops_created Chunks dropped because queue was full
+# HELP player_pcm_chunks_total PCMChunks played via PCM-native path
+# HELP player_pcm_chunks_created PCMChunks played via PCM-native path
+# HELP player_pcm_enhanced_total PCMChunks processed through PlaybackEnhancer
+# HELP player_pcm_enhanced_created PCMChunks processed through PlaybackEnhancer
+# HELP player_pcm_interrupt_events_total Barge-in interrupts detected during playback
+# HELP player_pcm_interrupt_events_created Barge-in interrupts detected during playback
+# HELP player_audio_duration_seconds Audio file duration
+# HELP player_audio_duration_seconds_created Audio file duration
+# HELP player_start_latency_seconds File-path first-sample lag
+# HELP player_start_latency_seconds_created File-path first-sample lag
+# HELP player_chunk_enqueue_latency_seconds play_audio_bytes() wall time (decode + enqueue)
+# HELP player_chunk_enqueue_latency_seconds_created play_audio_bytes() wall time (decode + enqueue)
+# HELP player_write_latency_seconds OutputStream.write() duration on writer thread
+# HELP player_write_latency_seconds_created OutputStream.write() duration on writer thread
+# HELP player_stream_queue_depth Current items waiting in write queue
+# HELP player_stream_active 1 when OutputStream is open
+# HELP recorder_recordings_total Recording sessions started
+# HELP recorder_recordings_created Recording sessions started
+# HELP recorder_recordings_saved_total Recordings saved to disk
+# HELP recorder_recordings_saved_created Recordings saved to disk
+# HELP recorder_recordings_empty_total Recordings rejected: no audio frames captured
+# HELP recorder_recordings_empty_created Recordings rejected: no audio frames captured
+# HELP recorder_recordings_too_short_total Recordings rejected: below min duration
+# HELP recorder_recordings_too_short_created Recordings rejected: below min duration
+# HELP recorder_recordings_silent_total Recordings rejected: no speech detected by VAD
+# HELP recorder_recordings_silent_created Recordings rejected: no speech detected by VAD
+# HELP recorder_recordings_maxed_total Recordings truncated at max duration cap
+# HELP recorder_recordings_maxed_created Recordings truncated at max duration cap
+# HELP recorder_errors_total Unhandled errors during recording
+# HELP recorder_errors_created Unhandled errors during recording
+# HELP recorder_duration_seconds PTT hold duration for accepted recordings
+# HELP recorder_duration_seconds_created PTT hold duration for accepted recordings
+# HELP recorder_rms RMS level of accepted recordings (normalised float32 scale 0–1)
+# HELP recorder_rms_created RMS level of accepted recordings (normalised float32 scale 0–1)
+# HELP audit_turns_routed_total Turns fanned out
+# HELP audit_domain_evals_fired_total Domain eval dispatches
+# HELP audit_sessions_opened_total Sessions opened
+# HELP audit_sessions_opened_created Sessions opened
+# HELP audit_sessions_closed_total Sessions closed
+# HELP audit_dlq_enqueued_total Turns added to dead-letter Q
+# HELP audit_dlq_enqueued_created Turns added to dead-letter Q
+# HELP audit_dlq_retried_total Dead-letter retry attempts
+# HELP audit_redis_ops_total Redis read/write ops
+# HELP audit_redis_ops_created Redis read/write ops
+# HELP audit_lru_hits_total LRU cache hits
+# HELP audit_lru_hits_created LRU cache hits
+# HELP audit_idempotency_blocks_total Duplicate eval dispatches blocked
+# HELP audit_idempotency_blocks_created Duplicate eval dispatches blocked
+# HELP audit_transcript_fanouts_total Transcript writer fan-outs
+# HELP audit_transcript_fanouts_created Transcript writer fan-outs
+# HELP audit_eval_fanouts_total Eval engine fan-outs
+# HELP audit_route_turn_latency_seconds route_turn() end-to-end wall clock
+# HELP audit_route_turn_latency_seconds_created route_turn() end-to-end wall clock
+# HELP audit_dlq_depth Dead-letter queue current depth
+# HELP audit_active_sessions Sessions currently open in audit bus
+# HELP eval_turns_total Evaluation attempts
+# HELP eval_turns_skipped_total Evaluations skipped
+# HELP eval_budget_exhausted_total Sessions over token cap
+# HELP eval_budget_exhausted_created Sessions over token cap
+# HELP eval_cache_hits_total Score cache hits
+# HELP eval_cache_hits_created Score cache hits
+# HELP eval_circuit_trips_total Circuit breaker trips
+# HELP eval_circuit_trips_created Circuit breaker trips
+# HELP eval_tokens_consumed_total Total tokens consumed by evaluation
+# HELP eval_tokens_consumed_created Total tokens consumed by evaluation
+# HELP eval_turn_latency_seconds Time from score_turn() call to Redis write
+# HELP eval_turn_latency_seconds_created Time from score_turn() call to Redis write
+# HELP eval_overall_score Distribution of overall scores
+# HELP eval_overall_score_created Distribution of overall scores
+# HELP eval_active Evaluations currently in flight
+# HELP voice_pipeline_total Total pipeline executions
+# HELP voice_pipeline_stage_errors_total Errors per stage
+# HELP voice_pipeline_stage_retries_total Retry attempts per stage (excludes first attempt)
+# HELP voice_pipeline_stage_latency_seconds Per-stage wall-clock latency
+# HELP voice_pipeline_stage_latency_seconds_created Per-stage wall-clock latency
+# HELP voice_pipeline_latency_seconds Total pipeline wall-clock latency
+# HELP voice_pipeline_latency_seconds_created Total pipeline wall-clock latency
+# HELP voice_pipeline_cancellations_total Cancelled pipeline runs
+# HELP voice_pipeline_active Pipelines currently in flight (run() only)
+# HELP voice_pipeline_degraded_total Pipelines that completed via a fallback or apology path
+# HELP voice_pipeline_degraded_created Pipelines that completed via a fallback or apology path
+# HELP voice_pipeline_load_shed_total Requests rejected by the instance load shedder
+# HELP voice_pipeline_budget_breached_total Stage executions aborted because the SLA budget was already blown
+# HELP voice_pipeline_stream_full_active Concurrent stream_full() sessions currently producing audio
+# HELP voice_pipeline_late_patch_total STT late-patches applied when early-fire transcript was partial
+# HELP voice_pcm_pipeline_active Concurrent PCM pipeline sessions
+# HELP voice_pcm_chunks_total Total PCMChunks processed across all pipeline stages
+# HELP voice_pcm_barge_in_total Barge-in interruptions detected during TTS playback
+# HELP voice_pcm_barge_in_created Barge-in interruptions detected during TTS playback
+# HELP voice_pcm_format_negotiations_total PCM format negotiations between pipeline stages
+# HELP voice_pcm_ring_buffer_overruns_total Ring buffer capacity overruns (old data evicted)
+# HELP voice_pcm_ring_buffer_overruns_created Ring buffer capacity overruns (old data evicted)
+# HELP voice_pcm_diagnostics_alerts_total Audio diagnostics alert events by type
+# HELP voice_stagebus_enqueue_total Messages enqueued to inter-stage bus
+# HELP voice_stagebus_dequeue_total Messages dequeued from inter-stage bus
+# HELP voice_stagebus_overflow_total Messages lost due to queue overflow
+# HELP voice_stagebus_dlq_total Messages sent to the dead letter queue
+# HELP voice_stagebus_depth Current depth of inter-stage message queues
+# HELP voice_stagebus_throughput_msgs_per_sec Per-stage-pair throughput (messages per second over 1s window)
+# HELP voice_session_open_total Sessions opened via SessionLifecycleManager
+# HELP voice_session_open_created Sessions opened via SessionLifecycleManager
+# HELP voice_session_close_total Sessions closed via SessionLifecycleManager
+# HELP voice_session_open_latency_seconds Wall-clock time to open a session (includes health checks)
+# HELP voice_session_open_latency_seconds_created Wall-clock time to open a session (includes health checks)
+# HELP voice_session_close_latency_seconds Wall-clock time to close a session (includes flush/drain)
+# HELP voice_session_close_latency_seconds_created Wall-clock time to close a session (includes flush/drain)
+# HELP voice_session_duration_seconds Total session duration from open to close
+# HELP voice_session_duration_seconds_created Total session duration from open to close
+# HELP voice_watchdog_heartbeats_total Watchdog heartbeat ticks
+# HELP voice_watchdog_heartbeats_created Watchdog heartbeat ticks
+# HELP voice_watchdog_recoveries_total Automatic pipeline recoveries triggered by watchdog
+# HELP voice_watchdog_alerts_total Watchdog alert events emitted to observability
+# HELP voice_ptt_total Push-to-talk recording sessions
+# HELP voice_ptt_duration_seconds Duration of PTT recording hold
+# HELP voice_ptt_duration_seconds_created Duration of PTT recording hold
+# HELP voice_pipeline_starts_total Pipeline executions started by mode
+# HELP voice_pipeline_starts_created Pipeline executions started by mode
+# HELP voice_pipeline_completions_total Pipeline executions completed by mode and status
+# HELP voice_pipeline_completions_created Pipeline executions completed by mode and status
+# HELP integration_audit_bus_opens_total Audit bus open_session calls
+# HELP integration_audit_bus_closes_total Audit bus close_session calls
+# HELP integration_transcript_opens_total Transcript writer open calls
+# HELP integration_transcript_opens_created Transcript writer open calls
+# HELP integration_transcript_writes_total Transcript writer write calls
+# HELP integration_transcript_writes_created Transcript writer write calls
+# HELP integration_transcript_flushes_total Transcript writer flush calls
+# HELP integration_finalize_eval_total finalize_session_eval calls
+# HELP voice_kafka_produce_total Total messages produced to Kafka
+# HELP voice_kafka_produce_errors_total Total Kafka produce errors
+# HELP voice_kafka_produce_latency_seconds Kafka produce latency
+# HELP voice_kafka_consume_total Total messages consumed from Kafka
+# HELP voice_kafka_consume_lag Kafka consumer lag (messages behind)
+# HELP voice_kafka_dlq_total Total messages sent to dead letter topic
+# HELP api_requests_total Total HTTP requests
+# HELP api_requests_created Total HTTP requests
+# HELP api_upload_size_bytes Uploaded audio file sizes
+# HELP api_upload_size_bytes_created Uploaded audio file sizes
+# HELP api_request_latency_seconds HTTP request latency
+# HELP api_request_latency_seconds_created HTTP request latency
+# HELP python_gc_objects_collected_total Objects collected during gc
+# HELP python_gc_objects_uncollectable_total Uncollectable objects found during GC
+# HELP python_gc_collections_total Number of times this generation was collected
+# HELP python_info Python platform information
+# HELP process_virtual_memory_bytes Virtual memory size in bytes.
+# HELP process_resident_memory_bytes Resident memory size in bytes.
+# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.
+# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.
+# HELP process_open_fds Number of open file descriptors.
+# HELP process_max_fds Maximum number of open file descriptors.
+# HELP ai_pipeline_requests_total Total pipeline executions
+# HELP ai_pipeline_latency_seconds End-to-end pipeline wall-clock latency
+# HELP ai_pipeline_inflight Pipelines currently in flight
+# HELP ai_pipeline_stage_latency_seconds Per-stage wall-clock latency
+# HELP ai_pipeline_stage_errors_total Errors per pipeline stage
+# HELP ai_pipeline_stage_retries_total Retry attempts per stage
+# HELP ai_pipeline_load_shed_total Requests rejected by load shedder
+# HELP ai_pipeline_aborted_total Pipelines aborted due to non-recoverable fault
+# HELP ai_pipeline_degraded_total Pipelines completed via fallback/apology path
+# HELP ai_pipeline_cancelled_total Pipelines cancelled (e.g. PTT interrupt)
+# HELP ai_stt_requests_total STT transcription requests
+# HELP ai_stt_latency_seconds STT transcription latency
+# HELP ai_stt_latency_seconds_created STT transcription latency
+# HELP ai_stt_audio_duration_seconds Duration of audio submitted to STT
+# HELP ai_stt_audio_duration_seconds_created Duration of audio submitted to STT
+# HELP ai_stt_audio_bytes File size of audio submitted to STT
+# HELP ai_stt_audio_bytes_created File size of audio submitted to STT
+# HELP ai_stt_language_confidence Whisper language detection confidence score
+# HELP ai_stt_transcript_chars Character count of returned transcript
+# HELP ai_stt_transcript_chars_created Character count of returned transcript
+# HELP ai_stt_empty_audio_total STT requests with empty or silent audio
+# HELP ai_stt_empty_audio_created STT requests with empty or silent audio
+# HELP ai_stt_low_confidence_total STT results with language confidence below threshold
+# HELP ai_stt_low_confidence_created STT results with language confidence below threshold
+# HELP ai_stt_remote_fallback_total STT requests routed to remote fallback endpoint
+# HELP ai_stt_remote_fallback_created STT requests routed to remote fallback endpoint
+# HELP ai_stt_path_rejected_total Audio paths rejected due to security validation
+# HELP ai_stt_path_rejected_created Audio paths rejected due to security validation
+# HELP ai_llm_requests_total LLM generation requests
+# HELP ai_llm_latency_seconds LLM generation latency (first-token for stream)
+# HELP ai_llm_tokens_prompt Prompt token count per LLM request
+# HELP ai_llm_tokens_completion Completion token count per LLM request
+# HELP ai_llm_tokens_total Cumulative tokens consumed by LLM
+# HELP ai_llm_cache_hits_total LLM requests served from Redis/LRU cache
+# HELP ai_llm_cache_misses_total LLM requests that hit the model (not cached)
+# HELP ai_llm_cache_misses_created LLM requests that hit the model (not cached)
+# HELP ai_llm_cache_stampede_total Redis SETNX lock collisions (cache stampede prevented)
+# HELP ai_llm_cache_stampede_created Redis SETNX lock collisions (cache stampede prevented)
+# HELP ai_llm_model_fallback_total LLM requests that fell back from primary to secondary model
+# HELP ai_llm_response_truncated_total LLM responses truncated before reaching TTS
+# HELP ai_llm_response_truncated_created LLM responses truncated before reaching TTS
+# HELP ai_llm_history_turns Conversation history depth at time of LLM call
+# HELP ai_llm_history_turns_created Conversation history depth at time of LLM call
+# HELP ai_tts_requests_total TTS synthesis requests
+# HELP ai_tts_latency_seconds TTS synthesis latency
+# HELP ai_tts_input_chars Character count fed to TTS
+# HELP ai_tts_input_chars_created Character count fed to TTS
+# HELP ai_tts_chunk_errors_total TTS synthesis chunk stitching errors
+# HELP ai_tts_chunk_errors_created TTS synthesis chunk stitching errors
+# HELP ai_tts_apology_fallback_total TTS requests that returned pre-rendered apology audio
+# HELP ai_tts_apology_fallback_created TTS requests that returned pre-rendered apology audio
+# HELP ai_tts_s3_uploads_total TTS audio S3 upload attempts
+# HELP ai_tts_file_cleanups_total Local TTS cache files removed by background cleanup
+# HELP ai_tts_file_cleanups_created Local TTS cache files removed by background cleanup
+# HELP ai_eval_requests_total Evaluation engine scoring attempts
+# HELP ai_eval_latency_seconds Evaluation engine scoring latency
+# HELP ai_eval_latency_seconds_created Evaluation engine scoring latency
+# HELP ai_eval_scores Distribution of evaluation scores (0-10)
+# HELP ai_eval_scores_created Distribution of evaluation scores (0-10)
+# HELP ai_eval_tokens_total Cumulative tokens consumed by evaluation engine
+# HELP ai_eval_tokens_created Cumulative tokens consumed by evaluation engine
+# HELP ai_eval_budget_exhausted_total Sessions that exhausted the evaluation token budget
+# HELP ai_eval_budget_exhausted_created Sessions that exhausted the evaluation token budget
+# HELP ai_eval_skipped_total Evaluation calls skipped (sampling, short answer, dedup)
+# HELP ai_eval_model_fallback_total Evaluation requests that fell back to secondary model
+# HELP ai_eval_model_fallback_created Evaluation requests that fell back to secondary model
+# HELP ai_session_active Sessions currently holding an IP lock
+# HELP ai_session_created_total New sessions registered
+# HELP ai_session_created_created New sessions registered
+# HELP ai_session_ended_total Sessions ended
+# HELP ai_session_rejected_total Session registration rejections
+# HELP ai_session_turns Number of conversation turns per completed session
+# HELP ai_session_turns_created Number of conversation turns per completed session
+# HELP ai_session_duration_seconds Wall-clock duration of completed sessions
+# HELP ai_session_duration_seconds_created Wall-clock duration of completed sessions
+# HELP ai_session_ip_changes_total IP address changes accepted within sessions
+# HELP ai_session_ip_changes_created IP address changes accepted within sessions
+# HELP ai_session_ip_limit_total Sessions terminated due to IP change limit
+# HELP ai_session_ip_limit_created Sessions terminated due to IP change limit
+# HELP ai_session_lru_hits_total Session reads served from in-process LRU (Redis down)
+# HELP ai_session_lru_hits_created Session reads served from in-process LRU (Redis down)
+# HELP ai_memory_compressions_total Conversation history compression events
+# HELP ai_memory_compressions_created Conversation history compression events
+# HELP ai_memory_compression_ratio Ratio of turns preserved after compression (0-1)
+# HELP ai_memory_compression_ratio_created Ratio of turns preserved after compression (0-1)
+# HELP ai_memory_lru_fallback_total Memory reads served from LRU (session_store degraded)
+# HELP ai_memory_lru_fallback_created Memory reads served from LRU (session_store degraded)
+# HELP ai_sanitize_total Sanitization passes
+# HELP ai_sanitize_injection_total Prompt injection patterns detected in LLM output
+# HELP ai_sanitize_injection_created Prompt injection patterns detected in LLM output
+# HELP ai_sanitize_truncated_total Texts truncated by sanitizer char cap
+# HELP ai_sanitize_truncated_created Texts truncated by sanitizer char cap
+# HELP ai_sanitize_char_reduction Character reduction ratio after sanitization
+# HELP ai_sanitize_char_reduction_created Character reduction ratio after sanitization
+# HELP ai_circuit_breaker_opened_total Circuit breaker OPEN transitions
+# HELP ai_circuit_breaker_half_open_total Circuit breaker HALF_OPEN probe attempts
+# HELP ai_circuit_breaker_closed_total Circuit breaker CLOSED (recovery) transitions
+# HELP ai_circuit_breaker_rejected_total Calls rejected because breaker is OPEN
+# HELP ai_circuit_breaker_state Circuit breaker state: 0=CLOSED 1=HALF_OPEN 2=OPEN
+# HELP ai_rate_limit_acquired_total Rate limiter tokens successfully acquired
+# HELP ai_rate_limit_exhausted_total Rate limiter rejections (bucket empty)
+# HELP ai_rate_limit_wait_seconds Time spent waiting for rate limiter token
+# HELP ai_bulkhead_inflight Concurrent operations currently holding a bulkhead slot
+# HELP ai_bulkhead_saturated_total Attempts that found the bulkhead at full capacity
+# HELP ai_bulkhead_wait_seconds Time spent waiting for bulkhead slot
+# HELP ai_latency_budget_breached_total Stage executions aborted because SLA budget was blown
+# HELP ai_latency_budget_remaining_pct Remaining SLA budget at stage start (0-100)
+# HELP ai_controller_ptt_presses_total Total PTT key press-and-release cycles
+# HELP ai_controller_ptt_presses_created Total PTT key press-and-release cycles
+# HELP ai_controller_interrupts_total Pipelines interrupted by PTT press while active
+# HELP ai_controller_interrupts_created Pipelines interrupted by PTT press while active
+# HELP ai_controller_empty_recordings_total PTT releases where audio was too short or empty
+# HELP ai_controller_empty_recordings_created PTT releases where audio was too short or empty
+# HELP ai_controller_recording_duration_seconds Microphone hold duration per PTT press
+# HELP ai_controller_recording_duration_seconds_created Microphone hold duration per PTT press
+# HELP ai_controller_pipeline_errors_total Unhandled pipeline exceptions surfaced to controller
+# HELP ai_controller_pipeline_errors_created Unhandled pipeline exceptions surfaced to controller
+# HELP ai_redis_disconnects_total Redis connection failures
+# HELP ai_redis_disconnects_created Redis connection failures
+# HELP ai_redis_recovered_total Redis reconnections after outage
+# HELP ai_redis_recovered_created Redis reconnections after outage
+# HELP ai_redis_degraded_mode 1 when operating without Redis (LRU fallback active)
+# HELP ai_transcript_turns_total Conversation turns written to transcript sinks
+# HELP ai_transcript_turns_created Conversation turns written to transcript sinks
+# HELP ai_transcript_drops_total Transcript entries dropped due to queue overflow
+# HELP ai_transcript_drops_created Transcript entries dropped due to queue overflow
+# HELP ai_mongo_event_drops_total Structured events dropped because the MongoDB write queue was full
+# HELP ai_mongo_event_drops_created Structured events dropped because the MongoDB write queue was full
+# HELP ai_mongo_reconnects_total MongoDB reconnection attempts made by the writer thread after a write failure
