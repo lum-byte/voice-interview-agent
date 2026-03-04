@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from app.pgs._core import TurnRecord # noqa
+from app.context_extractor._core import TurnRecord # noqa
 
 if TYPE_CHECKING:
     pass

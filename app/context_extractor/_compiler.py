@@ -4,7 +4,7 @@ import math
 import random as _rng
 from typing import TYPE_CHECKING
 
-from app.pgs._core import (
+from app.context_extractor._core import (
     BehavioralVector,
     ConstraintSet,
     Pacing,

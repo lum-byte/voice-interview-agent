@@ -308,20 +308,20 @@ from app.interview.qa_controller import ( # noqa
 conversation_memory = None
 transcript_writer   = None
 
-# PGS — psychographic signal engine.
-# Same lazy pattern as EQS: imported once, cached. If the pgs package is not
+# Context extractor — session style calibration.
+# Same lazy pattern as EQS: imported once, cached. If the package is not
 # installed the reference stays None and all call sites no-op silently.
-_pgs_engine: Any = None
+_cx_engine: Any = None
 
-def _get_pgs_engine() -> Any:
-    global _pgs_engine
-    if _pgs_engine is None:
+def _get_cx_engine() -> Any:
+    global _cx_engine
+    if _cx_engine is None:
         try:
-            from app.pgs import pgs as _p  # type: ignore
-            _pgs_engine = _p
+            from app.context_extractor import pgs as _p  # type: ignore
+            _cx_engine = _p
         except Exception: # noqa
             pass
-    return _pgs_engine
+    return _cx_engine
 
 from app.user_tracking.session_service.conversation_memory import (
     qa_audit_bus as _qa_audit_bus,
@@ -2052,17 +2052,17 @@ class SessionLifecycleManager:
             except Exception as exc:
                 log.debug("session_eqs_deregister_error", error=str(exc))
 
-            # ── 9b. PGS — evict behavioral session ────────────────────────────
-            # Runs after EQS deregister so both cognition layers clean up in order.
+            # ── 9b. Session context cleanup ────────────────────────────────────
+            # Runs after EQS deregister so both layers clean up in order.
             # Eviction purges all in-process signal windows + Redis keys for the
             # session. Non-blocking: evict is a best-effort cleanup, never critical.
             try:
-                _pgs = _get_pgs_engine()
-                if _pgs is not None:
-                    await _pgs.evict_session(session_id)
-                    log.debug("session_pgs_evicted", sid=session_id[:8])
+                _cx = _get_cx_engine()
+                if _cx is not None:
+                    await _cx.evict_session(session_id)
+                    log.debug("session_cx_evicted", sid=session_id[:8])
             except Exception as exc:
-                log.debug("session_pgs_evict_error", sid=session_id[:8], error=str(exc))
+                log.debug("session_cx_evict_error", sid=session_id[:8], error=str(exc))
 
             # ── 10. Question prefetch cancel ───────────────────────────────────
             try:
@@ -3163,7 +3163,7 @@ async def _node_llm_qa_path(
 
             # 8. If domain switched, prepend a transition phrase
             domain_label = _DOMAIN_REGISTRY.get(llm_input.domain, {}).get("label", llm_input.domain)
-            if committed.domain_switched:
+            if committed.domain_rotated:
                 next_question = (
                     f"Let's move on to {domain_label}. {next_question}"
                 )
@@ -3176,7 +3176,7 @@ async def _node_llm_qa_path(
 
             span.set_attribute("domain", llm_input.domain)
             span.set_attribute("turn_index", committed.turn_index)
-            span.set_attribute("domain_switched", committed.domain_switched)
+            span.set_attribute("domain_switched", committed.domain_rotated)
 
             return (next_question, "interview", llm_input.domain, vad_hint) # noqa
 
@@ -3347,14 +3347,14 @@ def _schedule_eval_if_enabled(
                     score = float(result.score)
 
                 if score is not None:
-                    _pgs = _get_pgs_engine()
-                    if _pgs is not None:
-                        await _pgs.push_score(
-                            session_id = session_id,
-                            turn_index = turn_index,
-                            score      = max(0.0, min(1.0, score / 10.0))
-                                         if score > 1.0 else score,
-                            domain     = domain,
+                    _cx = _get_cx_engine()
+                    if _cx is not None:
+                        await _cx.push_score(
+                            session_id    = session_id,
+                            turn_index    = turn_index,
+                            score         = max(0.0, min(1.0, score / 10.0))
+                            if score > 1.0 else score,
+                            domain        = domain,
                         )
         except Exception as exc:
             log.debug("eval_schedule_failed", sid=session_id[:8], error=str(exc))

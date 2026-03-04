@@ -8,7 +8,7 @@ from typing import Any # noqa
 
 import redis.asyncio as aioredis
 
-from app.pgs._core import (
+from app.context_extractor._core import (
     BehavioralVector,
     ConstraintSet,
     SessionState,
@@ -19,11 +19,11 @@ _REDIS_URL      = os.getenv("REDIS_URL")
 _REDIS_CONN     = int(os.getenv("REDIS_MAX_CONN", "200"))
 _TTL            = int(os.getenv("SESSION_TTL_S", "3600")) + int(os.getenv("SESSION_GRACE_S", "60"))
 
-_PFX_STATE      = "pgs:s:v1:"
-_PFX_VEC        = "pgs:v:v1:"
-_PFX_CS         = "pgs:c:v1:"
-_PFX_TURNS      = "pgs:t:v1:"
-_PFX_WEIGHTS    = "pgs:w:v1:"
+_PFX_STATE      = "context_extractor:s:v1:"
+_PFX_VEC        = "context_extractor:v:v1:"
+_PFX_CS         = "context_extractor:c:v1:"
+_PFX_TURNS      = "context_extractor:t:v1:"
+_PFX_WEIGHTS    = "context_extractor:w:v1:"
 
 _LRU_MAX        = 128
 

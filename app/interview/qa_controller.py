@@ -125,19 +125,19 @@ from app.eval.question_selector import (
 from app.monitoring.observability import get_logger
 from app.eval.concept_tracker import concept_tracker, QuestionAskedEvent
 
-# PGS is imported lazily at first use — avoids circular import at module load.
+# Context extractor is imported lazily at first use — avoids circular import at module load.
 # The module-level reference is set once and cached for the process lifetime.
-_pgs: Any = None
+_cx: Any = None
 
-def _get_pgs() -> Any:
-    global _pgs
-    if _pgs is None:
+def _get_cx() -> Any:
+    global _cx
+    if _cx is None:
         try:
-            from app.pgs import pgs as _pgs_singleton  # type: ignore
-            _pgs = _pgs_singleton
+            from app.context_extractor import pgs as _cx_singleton  # type: ignore
+            _cx = _cx_singleton
         except Exception: # noqa
             pass
-    return _pgs
+    return _cx
 
 log = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -2921,26 +2921,26 @@ class LLMInputBuilder:
             if steer_suffix:
                 sys_text += f"\n\n{steer_suffix}"
 
-        # ── PGS constraint suffix ─────────────────────────────────────────────
+        # ── Conversational style constraints ──────────────────────────────────
         # Appended last so it overrides any conflicting stylistic instruction.
-        # The constraint set is craft language only — no psychological terms.
-        # get_constraints() is non-blocking: returns neutral on any error or
-        # when fewer than 3 turns have been committed (system hasn't converged).
+        # Constraints are craft language only — no psychological terms.
+        # Non-blocking: returns neutral on any error or when fewer than 3 turns
+        # have been committed (system hasn't converged).
         try:
-            _pgs_ref = _get_pgs()
-            if _pgs_ref is not None:
-                cs = await _pgs_ref.get_constraints(
-                    session_id    = doc.session_id,
-                    domain        = domain,
-                    n_turns       = doc.turn_index,
-                    stated_level  = level,
-                    active_domain = domain,
+            _cx_ref = _get_cx()
+            if _cx_ref is not None:
+                cs = await _cx_ref.get_constraints(
+                    session_id=doc.session_id,
+                    domain=domain,
+                    n_turns=doc.turn_index,
+                    stated_level=level,
+                    active_domain=domain,
                 )
-                pgs_suffix = cs.to_suffix()
-                if pgs_suffix:
-                    sys_text += f"\n\n{pgs_suffix}"
-        except Exception as _pgs_exc:
-            log.debug("pgs_constraint_suffix_failed", sid=doc.session_id[:8], error=str(_pgs_exc))
+                cx_suffix = cs.to_suffix()
+                if cx_suffix:
+                    sys_text += f"\n\n{cx_suffix}"
+        except Exception as _cx_exc:
+            log.debug("style_constraints_failed", sid=doc.session_id[:8], error=str(_cx_exc))
 
         messages = [
             SystemMessage(content=sys_text),
@@ -3142,15 +3142,15 @@ class QAControllerV2(_QAControllerWithRecovery):
             _stage_transitions.labels(from_stage="intro", to_stage="interview").inc()
             _active_sessions.inc()
 
-            _pgs_ref = _get_pgs()
-            if _pgs_ref is not None:
+            _cx_ref = _get_cx()
+            if _cx_ref is not None:
                 asyncio.create_task(
-                    _pgs_ref.open_session(
+                    _cx_ref.open_session(
                         session_id=session_id,
                         stated_level=ats_result.level,
                         domains=doc.domains,
                     ),
-                    name=f"pgs_open_{session_id[:8]}",
+                    name=f"cx_open_{session_id[:8]}",
                 )
 
             # ── Apply weighted targets over the random defaults just assigned ─────
@@ -3335,31 +3335,31 @@ class QAControllerV2(_QAControllerWithRecovery):
             difficulty=None,  # scaler reads its own current_difficulty
         )
 
-        # ── PGS behavioral ingestion (fire-and-forget, off critical path) ─────
+        # ── Conversational context ingestion (fire-and-forget, off critical path) ─────
         # Must fire AFTER scaler.notify_turn_committed so difficulty state is set.
         # Timing: answer_duration_s from the timing record if present, else 0.
-        # pgs.ingest() never raises — it degrades silently on any internal error.
-        _pgs_ref = _get_pgs()
-        if _pgs_ref is not None:
-            _pgs_duration = timing.answer_duration_s if timing else 0.0
-            _pgs_difficulty = (
+        # ingest() never raises — it degrades silently on any internal error.
+        _cx_ref = _get_cx()
+        if _cx_ref is not None:
+            _cx_duration = timing.answer_duration_s if timing else 0.0
+            _cx_difficulty = (
                 self._scaler.get_current_difficulty(session_id, committed.domain)
                 if hasattr(self._scaler, "get_current_difficulty")
                 else "medium"
             )
             asyncio.create_task(
-                _pgs_ref.ingest(
-                    session_id   = session_id,
-                    turn_index   = committed.turn_index,
-                    domain       = committed.domain,
-                    level        = doc.candidate.level if doc.candidate else "intermediate",
-                    question     = llm_question,
-                    answer       = candidate_answer,
-                    answer_words = len(candidate_answer.split()),
-                    duration_s   = _pgs_duration,
-                    difficulty   = _pgs_difficulty,
+                _cx_ref.ingest(
+                    session_id=session_id,
+                    turn_index=committed.turn_index,
+                    domain=committed.domain,
+                    level=doc.candidate.level if doc.candidate else "intermediate",
+                    question=llm_question,
+                    answer=candidate_answer,
+                    answer_words=len(candidate_answer.split()),
+                    duration_s=_cx_duration,
+                    difficulty=_cx_difficulty,
                 ),
-                name=f"pgs_ingest_{session_id[:8]}_{committed.turn_index}",
+                name=f"cx_ingest_{session_id[:8]}_{committed.turn_index}",
             )
 
         # ── Emit concept tracking event (fire-and-forget via Kafka) ───────────

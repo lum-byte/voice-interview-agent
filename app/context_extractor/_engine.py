@@ -1,32 +1,40 @@
+"""
+Context extraction layer for interview responses.
+
+Derives linguistic and behavioral signals (e.g., hedging,
+deflection, elaboration, response velocity) and converts them
+into constraint vectors used to guide interviewer prompts.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import math
-import statistics
-import time
+import statistics # noqa
+import time # noqa
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from app.pgs._core import (
+from app.context_extractor._core import (
     BehavioralVector,
     SessionState,
     TurnRecord,
     _IW,
-    _TM,
+    _TM, # noqa
     _n,
     diff_numeric,
-    level_numeric,
+    level_numeric, # noqa
 )
-from app.pgs._signals._velocity     import VelocityEngine
-from app.pgs._signals._elaboration  import ElaborationEngine
-from app.pgs._signals._hedge        import HedgeEngine
-from app.pgs._signals._deflection   import DeflectionEngine
-from app.pgs._signals._recovery     import RecoveryEngine
-from app.pgs._signals._consistency  import ConsistencyEngine
-from app.pgs._signals._comfort      import ComfortEngine
-from app.pgs._signals._probe        import ProbeOracle
-from app.pgs._store                 import PGSStore
+from app.context_extractor._signals._velocity     import VelocityEngine  # noqa
+from app.context_extractor._signals._elaboration  import ElaborationEngine # noqa
+from app.context_extractor._signals._hedge        import HedgeEngine # noqa
+from app.context_extractor._signals._deflection   import DeflectionEngine # noqa
+from app.context_extractor._signals._recovery     import RecoveryEngine # noqa
+from app.context_extractor._signals._consistency  import ConsistencyEngine # noqa
+from app.context_extractor._signals._comfort      import ComfortEngine # noqa
+from app.context_extractor._signals._probe        import ProbeOracle # noqa
+from app.context_extractor._store                 import PGSStore # noqa
 
 if TYPE_CHECKING:
     pass

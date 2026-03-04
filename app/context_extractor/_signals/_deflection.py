@@ -6,8 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from app.pgs._core import TurnRecord
-from app.pgs._normalizer import _normalizer
+from app.context_extractor._core import TurnRecord
+from app.context_extractor._normalizer import _normalizer
 
 if TYPE_CHECKING:
     pass
