@@ -302,6 +302,7 @@ from app.interview.qa_controller import ( # noqa
     QAAnalytics as _QAAnalytics,
     SessionAnalytics as _SessionAnalytics,
     QADocument as _QADocument,
+    LLMInterviewInput
 )
 
 conversation_memory = None
@@ -330,6 +331,8 @@ from app.eval.evaluation_engine import ( # noqa
     TurnScore as _TurnScore,
     SessionReport as _SessionReport,
 )
+
+from app.audio_essentials.vad_context import ContextGatedVAD, VADContextHintBuilder, VADContextHint
 
 # ── dev flag ───────────────────────────────────────────────────────────────────
 # Controls whether the audio_sink_dev node is compiled into the graph at all.
@@ -1689,6 +1692,7 @@ class SessionResources:
     degraded:          bool           = False
     qa_document:       Any            = None
     eval_report:       Any            = None
+    eqs:               Any            = None  # EpistemicQuestionSelector | None
 
     @property
     def duration_s(self) -> float:
@@ -1767,10 +1771,10 @@ class SessionLifecycleManager:
                 doc, is_new = await _qa_controller.get_or_create(session_id)
                 resources.qa_document = doc
                 if is_new:
-                    log.info("session_qa_created", session_id=session_id[:8])
+                    log.info("session_qa_created", sid=session_id[:8])
             except Exception as exc:
                 degraded = True
-                log.error("session_qa_create_failed", session_id=session_id[:8], error=str(exc))
+                log.error("session_qa_create_failed", sid=session_id[:8], error=str(exc))
 
             # ── 2. Mic health check ───────────────────────────────────────────
             if FF_SESSION_LIFECYCLE:
@@ -1782,12 +1786,12 @@ class SessionLifecycleManager:
                     resources.mic_healthy = rec_health.healthy if rec_health else True
                     if not resources.mic_healthy:
                         degraded = True
-                        log.warning("session_mic_unhealthy", session_id=session_id[:8])
+                        log.warning("session_mic_unhealthy", sid=session_id[:8])
                 except asyncio.TimeoutError:
-                    log.warning("session_mic_health_timeout", session_id=session_id[:8])
+                    log.warning("session_mic_health_timeout", sid=session_id[:8])
                     resources.mic_healthy = True  # assume healthy on timeout
                 except Exception as exc:
-                    log.warning("session_mic_health_error", session_id=session_id[:8], error=str(exc))
+                    log.warning("session_mic_health_error", sid=session_id[:8], error=str(exc))
 
             # ── 3. Speaker health check ───────────────────────────────────────
             if FF_SESSION_LIFECYCLE:
@@ -1799,11 +1803,11 @@ class SessionLifecycleManager:
                     resources.speaker_healthy = play_health.healthy if play_health else True
                     if not resources.speaker_healthy:
                         degraded = True
-                        log.warning("session_speaker_unhealthy", session_id=session_id[:8])
+                        log.warning("session_speaker_unhealthy", sid=session_id[:8])
                 except asyncio.TimeoutError:
-                    log.warning("session_speaker_health_timeout", session_id=session_id[:8])
+                    log.warning("session_speaker_health_timeout", sid=session_id[:8])
                 except Exception as exc:
-                    log.warning("session_speaker_health_error", session_id=session_id[:8], error=str(exc))
+                    log.warning("session_speaker_health_error", sid=session_id[:8], error=str(exc))
 
             # ── 4. PCM format negotiation ─────────────────────────────────────
             if FF_PCM_PIPELINE or _should_use_pcm_pipeline(session_id):
@@ -1826,14 +1830,14 @@ class SessionLifecycleManager:
 
                     log.info(
                         "session_pcm_formats_negotiated",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                         mic=str(resources.mic_format),
                         stt=str(resources.negotiated_stt_fmt),
                         tts=str(resources.negotiated_tts_fmt),
                     )
                 except Exception as exc:
                     _pcm_format_negotiations.labels(result="failed").inc()
-                    log.warning("session_pcm_negotiation_failed", session_id=session_id[:8], error=str(exc))
+                    log.warning("session_pcm_negotiation_failed", sid=session_id[:8], error=str(exc))
 
             # ── 5. Audio diagnostics init ─────────────────────────────────────
             if FF_AUDIO_DIAGNOSTICS:
@@ -1853,13 +1857,44 @@ class SessionLifecycleManager:
                 if _qa_audit_bus is not None:
                     await _qa_audit_bus.open_session(session_id)
             except Exception as exc:
-                log.warning("session_audit_bus_open_failed", session_id=session_id[:8], error=str(exc))
+                log.warning("session_audit_bus_open_failed", sid=session_id[:8], error=str(exc))
 
             # ── 8. Transcript writer begin ────────────────────────────────────
             try:
                 await _transcript_open_session(session_id)
             except Exception as exc:
-                log.warning("session_transcript_begin_failed", session_id=session_id[:8], error=str(exc))
+                log.warning("session_transcript_begin_failed", sid=session_id[:8], error=str(exc))
+
+            # ── 9. EpistemicQuestionSelector — create for this session ────────
+            try:
+                from app.eval.question_selector import (
+                    EpistemicQuestionSelector,
+                    register_selector,
+                )
+                stated_level = (
+                    resources.qa_document.candidate.level
+                    if resources.qa_document and resources.qa_document.candidate
+                    else None
+                )
+                # Pass the same Redis client qa_controller uses.
+                # EQS is fault-tolerant: degrades to LRU if Redis is unavailable.
+                import redis.asyncio as _aioredis
+                _eqs_redis = await _aioredis.from_url(
+                    __import__("os").getenv("REDIS_URL", ""),
+                    encoding="utf-8", decode_responses=True,
+                ) if __import__("os").getenv("REDIS_URL") else None
+
+                selector = await EpistemicQuestionSelector.create(
+                    session_id=session_id,
+                    redis=_eqs_redis,
+                    stated_level=stated_level,
+                )
+                resources.eqs = selector
+                register_selector(session_id, selector)
+                log.info("session_eqs_created", sid=session_id[:8])
+            except Exception as exc:
+                log.warning("session_eqs_create_failed",
+                            sid=session_id[:8], error=str(exc))
 
             # ── finalise ──────────────────────────────────────────────────────
             resources.degraded = degraded
@@ -1873,7 +1908,7 @@ class SessionLifecycleManager:
 
             log.info(
                 "session_opened",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 degraded=degraded,
                 mic_healthy=resources.mic_healthy,
                 speaker_healthy=resources.speaker_healthy,
@@ -1928,7 +1963,7 @@ class SessionLifecycleManager:
                     if dlq:
                         log.info(
                             "session_dlq_drained",
-                            session_id=session_id[:8],
+                            sid=session_id[:8],
                             stage_pair=bus._pair, # noqa
                             entries=len(dlq),
                         )
@@ -1958,7 +1993,7 @@ class SessionLifecycleManager:
                             session_id, reason=f"session_close:{reason}"
                         )
             except Exception as exc:
-                log.warning("session_qa_close_error", session_id=session_id[:8], error=str(exc))
+                log.warning("session_qa_close_error", sid=session_id[:8], error=str(exc))
 
             # ── 5. Evaluation engine — generate session report ────────────────
             try:
@@ -1966,35 +2001,45 @@ class SessionLifecycleManager:
                 summary["eval_report"] = eval_report.to_dict()
                 resources.eval_report = eval_report
             except Exception as exc:
-                log.warning("session_eval_report_error", session_id=session_id[:8], error=str(exc))
+                log.warning("session_eval_report_error", sid=session_id[:8], error=str(exc))
 
             # ── 6. Dispatch final eval batch for any unscored turns ───────────
             try:
                 if _finalize_session_eval is not None:
                     await _finalize_session_eval(session_id)
             except Exception as exc:
-                log.warning("session_final_eval_error", session_id=session_id[:8], error=str(exc))
+                log.warning("session_final_eval_error", sid=session_id[:8], error=str(exc))
 
             # ── 7. Audit bus session close ────────────────────────────────────
             try:
                 if _qa_audit_bus is not None:
                     await _qa_audit_bus.close_session(session_id)
             except Exception as exc:
-                log.warning("session_audit_bus_close_error", session_id=session_id[:8], error=str(exc))
+                log.warning("session_audit_bus_close_error", sid=session_id[:8], error=str(exc))
 
             # ── 8. Transcript writer flush ────────────────────────────────────
             try:
                 await _transcript_flush_session(session_id)
             except Exception as exc:
-                log.warning("session_transcript_flush_error", session_id=session_id[:8], error=str(exc))
+                log.warning("session_transcript_flush_error", sid=session_id[:8], error=str(exc))
 
-            # ── 9. Question prefetch cancel ───────────────────────────────────
+            # ── 9. EQS — deregister ───────────────────────────────────────────
+            try:
+                from app.eval.question_selector import deregister_selector
+                deregister_selector(session_id)
+                if resources.eqs is not None:
+                    log.debug("session_eqs_deregistered", sid=session_id[:8],
+                              **resources.eqs.health())
+            except Exception as exc:
+                log.debug("session_eqs_deregister_error", error=str(exc))
+
+            # ── 10. Question prefetch cancel ───────────────────────────────────
             try:
                 _qa_prefetch_buffer.cancel_session(session_id)
             except Exception: # noqa
                 pass
 
-            # ── 10. Temp file cleanup ─────────────────────────────────────────
+            # ── 11. Temp file cleanup ─────────────────────────────────────────
             cleaned = 0
             for path in resources.temp_files:
                 try:
@@ -2013,7 +2058,7 @@ class SessionLifecycleManager:
 
             log.info(
                 "session_closed",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 reason=reason,
                 duration_s=round(resources.duration_s, 1),
                 close_latency_s=round(close_latency, 3),
@@ -2329,7 +2374,7 @@ def _build_graph_for_instance(
             streaming  = False,
         ) as span:
             try:
-                response_text, _qa_stage, _qa_domain = await _node_llm_qa_path(
+                response_text, _qa_stage, _qa_domain, _ = await _node_llm_qa_path(
                     state=state,
                     session_id=session_id,
                     rid=rid,
@@ -2863,7 +2908,7 @@ async def _node_llm_qa_path(
     session_id: str | None,
     rid:        str,
     span:       Any,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, VADContextHint | None]:
     """
     Route the LLM node through the QA controller pipeline.
 
@@ -2884,10 +2929,10 @@ async def _node_llm_qa_path(
         # direct call to the LLM if available.
         try:
             result = await _llm_direct_call(text, rid)
-            return (result, "none", "none") # noqa
+            return (result, "none", "none", None) # noqa
         except Exception as exc:
             log.warning("graph_llm_direct_failed", request_id=rid, error=str(exc))
-            return (_APOLOGY_FALLBACK, "none", "none") # noqa
+            return (_APOLOGY_FALLBACK, "none", "none", None) # noqa
 
     span.set_attribute("qa_path", True)
 
@@ -2895,13 +2940,13 @@ async def _node_llm_qa_path(
     try:
         doc = await _qa_controller.get_document(session_id)
     except Exception as exc:
-        log.error("qa_path_get_doc_failed", session_id=session_id[:8], error=str(exc))
-        return (_APOLOGY_FALLBACK, "unknown", "none") # noqa
+        log.error("qa_path_get_doc_failed", sid=session_id[:8], error=str(exc))
+        return (_APOLOGY_FALLBACK, "unknown", "none", None) # noqa
 
     if doc is None:
         # Session not yet created — treat as greeting
-        log.info("qa_path_no_doc_greeting", session_id=session_id[:8])
-        return (_GREETING_TEXT, "greeting", "none") # noqa
+        log.info("qa_path_no_doc_greeting", sid=session_id[:8])
+        return (_GREETING_TEXT, "greeting", "none", None) # noqa
 
     current_stage = doc.stage
 
@@ -2910,10 +2955,10 @@ async def _node_llm_qa_path(
     # ══════════════════════════════════════════════════════════════════════
 
     if current_stage == "greeting":
-        log.info("qa_path_greeting", session_id=session_id[:8])
+        log.info("qa_path_greeting", sid=session_id[:8])
         span.set_attribute("qa_stage", "greeting")
         greeting_text = await _qa_controller.get_greeting(session_id)  # advances stage → "intro"
-        return (greeting_text, "greeting", "none") # noqa
+        return (greeting_text, "greeting", "none", None) # noqa
 
     # ══════════════════════════════════════════════════════════════════════
     #  INTRO STAGE — ATS extraction + seed
@@ -2935,14 +2980,14 @@ async def _node_llm_qa_path(
                 if rule_result.confidence < _ATS_RULE_CONFIDENCE_THRESHOLD:
                     log.info(
                         "qa_path_ats_rule_low_confidence",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                         confidence=round(rule_result.confidence, 2),
                     )
                     ats_result = await _ats_llm_extract(candidate_answer, rid)
                 else:
                     ats_result = rule_result
             except Exception as exc:
-                log.warning("qa_path_ats_rule_failed", session_id=session_id[:8], error=str(exc))
+                log.warning("qa_path_ats_rule_failed", sid=session_id[:8], error=str(exc))
                 ats_result = await _ats_llm_extract(candidate_answer, rid)
 
             # If LLM failed but rule extractor found domains, use the rule result
@@ -2950,19 +2995,20 @@ async def _node_llm_qa_path(
             if ats_result is None and rule_result is not None and rule_result.domains:
                 log.info(
                     "qa_path_ats_llm_failed_using_rule_fallback",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     domains=rule_result.domains,
                     level=rule_result.level,
                 )
                 ats_result = rule_result
 
             if ats_result is None or not ats_result.domains:
-                log.error("qa_path_ats_extraction_failed", session_id=session_id[:8])
+                log.error("qa_path_ats_extraction_failed", sid=session_id[:8])
                 return (
                     "I didn't quite catch all of that. Could you tell me again about "
                     "the programming languages you use and your experience level?",
                     "intro",
                     "none",
+                    None,
                 )
 
             # 3. Seed QA document from ATS result → advances stage to "interview"
@@ -2984,19 +3030,20 @@ async def _node_llm_qa_path(
 
             log.info(
                 "qa_path_intro_complete",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domains=ats_result.domains,
                 level=ats_result.level,
             )
-            return (intro_response, "interview", ats_result.domains[0] if ats_result.domains else "general") # noqa
+            return (intro_response, "interview", ats_result.domains[0] if ats_result.domains else "general", None) # noqa
 
         except Exception as exc:
-            log.error("qa_path_intro_error", session_id=session_id[:8], error=str(exc))
+            log.error("qa_path_intro_error", sid=session_id[:8], error=str(exc))
             return (
                 "I'd like to learn more about your background. What programming "
                 "languages are you most comfortable with?",
                 "intro",
                 "none",
+                None,
             )
 
     # ══════════════════════════════════════════════════════════════════════
@@ -3013,11 +3060,11 @@ async def _node_llm_qa_path(
             if guardrail_result.should_stop:
                 log.info(
                     "qa_path_guardrail_stop",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     reason=guardrail_result.rule,
                 )
                 await _qa_controller.mark_complete(session_id, reason=guardrail_result.rule)
-                return (_CLOSING_TEXT, "complete", doc.active_domain or "none") # noqa
+                return (_CLOSING_TEXT, "complete", doc.active_domain or "none", None) # noqa
 
             # 2. Build the next LLM input through the QA controller
             #    This call also handles domain rotation when the current
@@ -3026,9 +3073,9 @@ async def _node_llm_qa_path(
 
             if llm_input is None:
                 # All domains exhausted — interview is complete
-                log.info("qa_path_all_domains_done", session_id=session_id[:8])
+                log.info("qa_path_all_domains_done", sid=session_id[:8])
                 await _qa_controller.mark_complete(session_id, reason="all_domains_exhausted")
-                return (_CLOSING_TEXT, "complete", doc.active_domain or "none") # noqa
+                return (_CLOSING_TEXT, "complete", doc.active_domain or "none", None) # noqa
 
             # 3. Check prefetch buffer for a pre-generated question
             prefetched = None
@@ -3038,12 +3085,34 @@ async def _node_llm_qa_path(
             # 4. Generate the question (or use prefetched)
             if prefetched and not await _qa_controller._fingerprints.is_duplicate(session_id, llm_input.domain, prefetched): # noqa
                 next_question = prefetched
-                log.info("qa_path_prefetch_hit", session_id=session_id[:8], domain=llm_input.domain)
+                log.info("qa_path_prefetch_hit", sid=session_id[:8], domain=llm_input.domain)
             else:
                 next_question = await _generate_interview_question(llm_input, rid, session_id)
 
             # 5. Commit the turn
             committed = await _qa_controller.commit_turn(session_id, candidate_answer, next_question)
+
+            def _derive_scaler_action(llm_input: LLMInterviewInput) -> str:
+                """Derive a ScalerActionKind value from LLMInterviewInput fields."""
+                if llm_input.domain_switched:
+                    return "bridge"
+                if llm_input.is_first_in_domain:
+                    return "coast"  # first question — candidate establishes context
+                if llm_input.domain == "system_design" and llm_input.q_index_in_domain >= 1:
+                    return "escalate"
+                if llm_input.domain == "behavioral":
+                    return "coast"
+                if llm_input.q_index_in_domain == 0:
+                    return "coast"
+                return "probe_verify"
+
+            vad_hint = VADContextHintBuilder.from_state_dict({ # noqa
+                "qa_stage": "interview",
+                "scaler_action": _derive_scaler_action(llm_input),
+                "domain": llm_input.domain,
+                "is_first_in_domain": llm_input.is_first_in_domain,
+                "is_domain_switch": llm_input.domain_switched,
+            }, turn_index=committed.turn_index)
 
             # 6. Fire off evaluation (fire-and-forget, off critical path)
             _schedule_eval_if_enabled(
@@ -3069,7 +3138,7 @@ async def _node_llm_qa_path(
                 )
                 log.info(
                     "qa_path_domain_switch",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     new_domain=llm_input.domain,
                     turn_index=committed.turn_index,
                 )
@@ -3078,12 +3147,12 @@ async def _node_llm_qa_path(
             span.set_attribute("turn_index", committed.turn_index)
             span.set_attribute("domain_switched", committed.domain_switched)
 
-            return (next_question, "interview", llm_input.domain) # noqa
+            return (next_question, "interview", llm_input.domain, vad_hint) # noqa
 
         except Exception as exc:
             log.error(
                 "qa_path_interview_error",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 error=str(exc),
                 turn_index=doc.turn_index,
             )
@@ -3103,26 +3172,26 @@ async def _node_llm_qa_path(
                     await _qa_controller.commit_turn(session_id, candidate_answer, fallback_q)
                     log.info(
                         "qa_path_static_fallback_used",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                         domain=doc.active_domain,
                     )
-                    return (fallback_q, "interview", doc.active_domain or "general")  # noqa
+                    return (fallback_q, "interview", doc.active_domain or "general", None)  # noqa
             except Exception as fb_exc:
-                log.error("qa_path_static_fallback_failed", session_id=session_id[:8], error=str(fb_exc))
+                log.error("qa_path_static_fallback_failed", sid=session_id[:8], error=str(fb_exc))
 
-            return (_APOLOGY_FALLBACK, "interview", doc.active_domain or "general")  # noqa
+            return (_APOLOGY_FALLBACK, "interview", doc.active_domain or "general", None)  # noqa
 
     # ══════════════════════════════════════════════════════════════════════
     #  COMPLETE STAGE
     # ══════════════════════════════════════════════════════════════════════
     if current_stage == "complete":
         span.set_attribute("qa_stage", "complete")
-        log.info("qa_path_complete", session_id=session_id[:8])
-        return (_CLOSING_TEXT, "complete", "none") # noqa
+        log.info("qa_path_complete", sid=session_id[:8])
+        return (_CLOSING_TEXT, "complete", "none", None) # noqa
 
     # ── unknown stage (defensive) ──────────────────────────────────────────
-    log.error("qa_path_unknown_stage", session_id=session_id[:8], stage=current_stage)
-    return (_APOLOGY_FALLBACK, current_stage, "none") # noqa
+    log.error("qa_path_unknown_stage", sid=session_id[:8], stage=current_stage)
+    return (_APOLOGY_FALLBACK, current_stage, "none", None) # noqa
 
 
 # ── QA path helpers ────────────────────────────────────────────────────────────
@@ -3154,7 +3223,7 @@ async def _generate_interview_question(
         if injection_detected:
             log.warning(
                 "qa_injection_detected",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 request_id=rid,
             )
             # Proceed with sanitised version — the detector returns the cleaned text
@@ -3177,13 +3246,13 @@ async def _generate_interview_question(
     # 3. Fingerprint deduplication
     is_dup = await _qa_controller._fingerprints.is_duplicate(session_id, llm_input.domain, question) # noqa
     if is_dup:
-        log.info("qa_question_duplicate", session_id=session_id[:8])
+        log.info("qa_question_duplicate", sid=session_id[:8])
         raise ValueError("Duplicate question with no variant available")
 
     # 4. Diversity check against recent questions
     too_similar, sim_score = _question_diversity_enforcer.is_too_similar(session_id, llm_input.domain, question)
     if too_similar:
-        log.info("qa_question_too_similar", session_id=session_id[:8], similarity=round(sim_score, 3))
+        log.info("qa_question_too_similar", sid=session_id[:8], similarity=round(sim_score, 3))
         raise ValueError("Question too similar to recent questions")
 
     # Record for future dedup and diversity checks
@@ -3235,7 +3304,7 @@ def _schedule_eval_if_enabled(
         )
     except Exception as exc:
         # create_task itself can fail if the loop is closing
-        log.debug("eval_schedule_failed", session_id=session_id[:8], error=str(exc))
+        log.debug("eval_schedule_failed", sid=session_id[:8], error=str(exc))
 
 
 async def _prefetch_next_question(session_id: str, current_domain: str) -> None:
@@ -3271,11 +3340,11 @@ async def _prefetch_next_question(session_id: str, current_domain: str) -> None:
         _qa_prefetch_buffer.put(session_id, predicted_domain, question)
         log.debug(
             "qa_prefetch_stored",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             domain=predicted_domain,
         )
     except Exception as exc:
-        log.debug("qa_prefetch_error", session_id=session_id[:8], error=str(exc))
+        log.debug("qa_prefetch_error", sid=session_id[:8], error=str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3697,7 +3766,7 @@ class VoiceGraph:
                             "request_id": rid,
                         }
 
-                        response_text, qa_stage, qa_domain = await _node_llm_qa_path(
+                        response_text, qa_stage, qa_domain, _ = await _node_llm_qa_path(
                             state=pseudo_state,
                             session_id=session_id,
                             rid=rid,
@@ -3935,7 +4004,7 @@ class VoiceGraph:
                     capacity=int(self._cfg.pcm_ring_buffer_seconds * mic_format.sample_rate),
                     fmt=mic_format,
                 )
-                vad_gate = PCMVADGate(
+                vad_gate = ContextGatedVAD(
                     fmt=mic_format,
                     hangover_s=self._cfg.pcm_vad_hangover_frames / mic_format.sample_rate,
                 )
@@ -4197,12 +4266,14 @@ class VoiceGraph:
                                     "session_id": session_id,
                                     "request_id": rid,
                                 }
-                                response_text, qa_stage, qa_domain = await _node_llm_qa_path(
+                                response_text, qa_stage, qa_domain, vad_hint = await _node_llm_qa_path(
                                     state=pseudo_state,
                                     session_id=session_id,
                                     rid=rid,
                                     span=span,
                                 )
+                                if vad_hint is not None:
+                                    vad_gate.apply_context(vad_hint)
 
                                 # Sanitize LLM output before TTS: strip markdown,
                                 # cap length, remove any injected control tokens.
@@ -5052,14 +5123,14 @@ async def _audit_bus_open_session(session_id: str) -> None:
 
     if _qa_audit_bus is None:
         # Bus not wired — normal in dev/test mode or early startup. Not an error.
-        log.debug("audit_bus_open_skipped_not_wired", session_id=session_id[:8])
+        log.debug("audit_bus_open_skipped_not_wired", sid=session_id[:8])
         return
 
     try:
         await _qa_audit_bus.open_session(session_id)
         state["open_sessions"] += 1
         _integ_audit_opens.labels(status="ok").inc()
-        log.debug("audit_bus_session_opened", session_id=session_id[:8])
+        log.debug("audit_bus_session_opened", sid=session_id[:8])
 
     except Exception as exc:
         state["open_failures"] += 1
@@ -5068,7 +5139,7 @@ async def _audit_bus_open_session(session_id: str) -> None:
         _integ_audit_opens.labels(status="error").inc()
         log.warning(
             "audit_bus_open_session_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             error=str(exc),
             note="session will proceed without audit bus — eval scheduling may be impaired",
         )
@@ -5087,14 +5158,14 @@ async def _audit_bus_close_session(session_id: str) -> None:
     state = _integration_state["audit_bus"]
 
     if _qa_audit_bus is None:
-        log.debug("audit_bus_close_skipped_not_wired", session_id=session_id[:8])
+        log.debug("audit_bus_close_skipped_not_wired", sid=session_id[:8])
         return
 
     try:
         await _qa_audit_bus.close_session(session_id)
         state["closed_sessions"] += 1
         _integ_audit_closes.labels(status="ok").inc()
-        log.debug("audit_bus_session_closed", session_id=session_id[:8])
+        log.debug("audit_bus_session_closed", sid=session_id[:8])
 
     except Exception as exc:
         state["close_failures"] += 1
@@ -5103,7 +5174,7 @@ async def _audit_bus_close_session(session_id: str) -> None:
         _integ_audit_closes.labels(status="error").inc()
         log.warning(
             "audit_bus_close_session_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             error=str(exc),
             note="session close will continue — audit bus close failure is non-fatal",
         )
@@ -5232,14 +5303,14 @@ async def _transcript_open_session(session_id: str) -> None:
     state = _integration_state["transcript_writer"]
 
     if _transcript_writer is None:
-        log.debug("transcript_open_skipped_not_wired", session_id=session_id[:8])
+        log.debug("transcript_open_skipped_not_wired", sid=session_id[:8])
         return
 
     try:
         await _transcript_writer.open_session(session_id)
         state["sessions_opened"] += 1
         _integ_tx_opens.labels(status="ok").inc()
-        log.debug("transcript_session_opened", session_id=session_id[:8])
+        log.debug("transcript_session_opened", sid=session_id[:8])
 
     except Exception as exc:
         state["write_failures"] += 1
@@ -5248,7 +5319,7 @@ async def _transcript_open_session(session_id: str) -> None:
         _integ_tx_opens.labels(status="error").inc()
         log.warning(
             "transcript_open_session_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             error=str(exc),
             note="transcript write failure is non-fatal — pipeline continues",
         )
@@ -5286,7 +5357,7 @@ async def _transcript_write_turn(
     if _transcript_writer is None:
         log.debug(
             "transcript_write_skipped_not_wired",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             request_id=request_id,
         )
         return
@@ -5298,7 +5369,7 @@ async def _transcript_write_turn(
     if not user_text.strip() and not assistant_text.strip():
         log.debug(
             "transcript_write_skipped_empty_turn",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             request_id=request_id,
         )
         return
@@ -5320,7 +5391,7 @@ async def _transcript_write_turn(
         _integ_tx_writes.labels(status="error").inc()
         log.warning(
             "transcript_write_turn_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             request_id=request_id,
             error=str(exc),
         )
@@ -5348,7 +5419,7 @@ async def _transcript_flush_session(
     state = _integration_state["transcript_writer"]
 
     if _transcript_writer is None:
-        log.debug("transcript_flush_skipped_not_wired", session_id=session_id[:8])
+        log.debug("transcript_flush_skipped_not_wired", sid=session_id[:8])
         return
 
     # ── Step 1: write the session footer ─────────────────────────────────────
@@ -5364,7 +5435,7 @@ async def _transcript_flush_session(
         _integ_tx_flushes.labels(status="close_error").inc()
         log.warning(
             "transcript_close_session_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             error=str(exc),
         )
 
@@ -5376,7 +5447,7 @@ async def _transcript_flush_session(
     try:
         await _transcript_writer.flush(timeout=timeout)
         _integ_tx_flushes.labels(status="flush_ok").inc()
-        log.debug("transcript_queue_flushed", session_id=session_id[:8])
+        log.debug("transcript_queue_flushed", sid=session_id[:8])
 
     except Exception as exc:
         state["flush_failures"] += 1
@@ -5384,7 +5455,7 @@ async def _transcript_flush_session(
         _integ_tx_flushes.labels(status="flush_error").inc()
         log.warning(
             "transcript_flush_failed",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             timeout=timeout,
             error=str(exc),
         )
@@ -5575,7 +5646,7 @@ async def _run_finalize_session_eval(
             result["error"] = f"eval circuit breaker open — state={breaker_state}"
             log.info(
                 "finalize_eval_skipped_circuit_open",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 breaker_state=breaker_state,
             )
             _integ_eval_finals.labels(status="circuit_open").inc()
@@ -5609,7 +5680,7 @@ async def _run_finalize_session_eval(
                 _integ_eval_finals.labels(status="ok").inc()
                 log.info(
                     "finalize_eval_complete",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     attempt=attempt,
                     path="wired",
                 )
@@ -5620,7 +5691,7 @@ async def _run_finalize_session_eval(
                 if attempt == 0:
                     log.warning(
                         "finalize_eval_attempt_failed_retrying",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                         attempt=attempt,
                         error=str(exc),
                     )
@@ -5634,7 +5705,7 @@ async def _run_finalize_session_eval(
             _integ_eval_finals.labels(status="error").inc()
             log.warning(
                 "finalize_eval_wired_failed_using_fallback",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 error=str(last_exc),
                 note="falling back to direct eval_engine.get_session_report()",
             )
@@ -5659,7 +5730,7 @@ async def _run_finalize_session_eval(
             _integ_eval_finals.labels(status="fallback_ok").inc()
             log.info(
                 "finalize_eval_fallback_report_generated",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 turns_evaluated=eval_report.turns_evaluated,
                 turns_skipped=eval_report.turns_skipped,
                 avg_overall=round(eval_report.avg_overall, 2),
@@ -5675,7 +5746,7 @@ async def _run_finalize_session_eval(
             _integ_eval_finals.labels(status="fallback_error").inc()
             log.warning(
                 "finalize_eval_fallback_failed",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 error=str(exc),
                 note="eval report will be absent from session close summary",
             )
@@ -5841,12 +5912,26 @@ async def _ats_mode_extract(intro_input: Any, request_id: str) -> Any:
     LLM_service which enforces json_object response_format.
     """
     llm_node = get_llm_node()
-    # extract_intro → use extract_ats
     result = await llm_node.extract_ats(
         intro_text=intro_input,
         request_id=request_id,
     )
-    return result
+    # extract_ats returns a JSON string — parse it into ATSExtractionResult
+    try:
+        parsed = json.loads(result)
+        return _ATSExtractionResult(
+            name=parsed.get("name", ""),
+            domains=parsed.get("domains", []),
+            level=parsed.get("level", "intermediate"),
+            languages=parsed.get("languages", []),
+            notes=parsed.get("notes", ""),
+            confidence=0.9,
+            method=parsed.get("_fallback", "llm"),
+            raw=parsed,
+        )
+    except Exception as exc:
+        log.error("ats_mode_extract_parse_failed", request_id=request_id, error=str(exc))
+        return None
 
 
 async def _llm_generate_question(prompt_ctx: Any, rid: str) -> str:
@@ -6647,7 +6732,7 @@ async def export_session_transcript(session_id: str) -> list[dict[str, Any]]:
             turns.append(turn_dict)
 
     except Exception as exc:
-        log.error("export_transcript_failed", session_id=session_id[:8], error=str(exc))
+        log.error("export_transcript_failed", sid=session_id[:8], error=str(exc))
 
     return turns
 
@@ -6661,7 +6746,7 @@ async def export_session_jsonl(session_id: str) -> str:
         if _qa_controller:
             return await _qa_controller.export_session_jsonl(session_id)
     except Exception as exc:
-        log.error("export_jsonl_failed", session_id=session_id[:8], error=str(exc))
+        log.error("export_jsonl_failed", sid=session_id[:8], error=str(exc))
     return ""
 
 

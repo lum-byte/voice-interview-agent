@@ -1363,6 +1363,22 @@ class PerformanceScaler:
         self._locks.pop(session_id, None)
         log.debug("scaler_session_evicted", session_id=session_id[:8])
 
+    # ── EQS integration ────────────────────────────────────────────────
+    def get_domain_state(
+            self,
+            session_id: str,
+            domain: str,
+    ) -> "DomainScalerState | None":
+        """
+        Non-locking synchronous read for EpistemicQuestionSelector.
+        Safe to call from the same asyncio task as get_current_signal().
+        Returns None if session or domain not yet initialised.
+        """
+        state = self._sessions.get(session_id)
+        if state is None:
+            return None
+        return state.domain_states.get(domain)
+
     # ── Internal computation ───────────────────────────────────────────────────
 
     def _ensure_domain( # noqa

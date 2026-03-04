@@ -39,6 +39,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 from app.common.shared import InMemoryLRU
+import aiokafka # noqa
 
 log = get_logger(__name__)
 
@@ -727,6 +728,17 @@ class ConceptTracker:
             log.debug("concept_signal_error", error=str(exc))
             return self._empty_signal(session_id, domain)
 
+    async def get_coverage_map(
+            self,
+            session_id: str,
+            domain: str,
+    ) -> "ConceptCoverageMap":
+        """
+        Direct coverage map read for EpistemicQuestionSelector.
+        Falls back to an empty map if nothing is stored yet.
+        """
+        return await self._store.load(session_id, domain)
+
     async def evict_session(self, session_id: str, domains: list[str]) -> None:
         """Called by QAControllerV2.close_session_v2() to clean up Redis."""
         await self._store.delete(session_id, domains)
@@ -763,58 +775,6 @@ class ConceptTracker:
 # ── Module-level singleton ────────────────────────────────────────────────────
 
 concept_tracker = ConceptTracker()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# § INTEGRATION INSTRUCTIONS
-#
-# [1] qa_controller.py — QAControllerV2.commit_turn()
-#     Add import at top of file:
-#         from app.eval.concept_tracker import concept_tracker, QuestionAskedEvent
-#
-#     In commit_turn(), after `committed = await super().commit_turn(...)`:
-#         concept_tracker.emit(QuestionAskedEvent(
-#             session_id = session_id,
-#             domain     = committed.domain,
-#             question   = llm_question,
-#             turn_index = committed.turn_index,
-#             level      = doc.candidate.level,
-#         ))
-#
-# [2] qa_controller.py — LLMInputBuilder.build()
-#     Add import at top of file (same import as above).
-#
-#     In LLMInputBuilder.build(), after computing `sys_text` and before
-#     returning the LLMInterviewInput, append the steering suffix:
-#
-#         steering = await concept_tracker.get_steering_signal(
-#             session_id = doc.session_id,
-#             domain     = domain,
-#             n_turns    = q_index,
-#         )
-#         steer_suffix = steering.to_suffix_instruction()
-#         if steer_suffix:
-#             sys_text += f"\n\n{steer_suffix}"
-#
-#     That's it. The LLM sees a slightly longer suffix. Nothing else changes.
-#
-# [3] voice_graph.py — on_startup() / on_shutdown()
-#     Add import:
-#         from app.eval.concept_tracker import concept_tracker
-#
-#     In on_startup():
-#         await concept_tracker.start()
-#
-#     In on_shutdown():
-#         await concept_tracker.stop()
-#
-# [4] qa_controller.py — QAControllerV2.close_session_v2()
-#     After qa_prefetch_buffer.cancel_session() and self._scaler.evict_session():
-#         doc = await self.get_document(session_id)
-#         if doc:
-#             await concept_tracker.evict_session(session_id, doc.domains)
-#
-# ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
 # § ANSWER SIGNAL DATA STRUCTURES

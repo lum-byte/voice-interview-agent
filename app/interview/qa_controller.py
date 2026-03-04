@@ -111,6 +111,15 @@ from app.common.shared import (
 from app.eval.performance_scaler import (
     PerformanceScaler,
     apply_signal_to_llm_input,
+    TrajectoryAnalyzer,
+    Trajectory,
+)
+
+from app.eval.question_selector import (
+    EpistemicQuestionSelector, # noqa
+    spec_to_llm_input_patch,
+    should_use_eqs,
+    get_selector,
 )
 
 from app.monitoring.observability import get_logger
@@ -937,7 +946,7 @@ class _QARedisClient:
                 return None
         except (CircuitBreakerOpen, Exception) as exc:
             _redis_ops.labels(op="get", status="error").inc()
-            log.warning("qa_redis_get_failed", session_id=session_id[:8], error=str(exc))
+            log.warning("qa_redis_get_failed", sid=session_id[:8], error=str(exc))
 
         return None
 
@@ -970,7 +979,7 @@ class _QARedisClient:
                 _redis_ops.labels(op="delete", status="ok").inc()
         except Exception as exc:
             _redis_ops.labels(op="delete", status="error").inc()
-            log.warning("qa_redis_delete_failed", session_id=session_id[:8], error=str(exc))
+            log.warning("qa_redis_delete_failed", sid=session_id[:8], error=str(exc))
 
     async def health(self) -> bool:
         try:
@@ -1226,7 +1235,7 @@ class _QAControllerBase:
             await self._redis.set(doc)
             _sessions_created.inc()
             span.set_attribute("is_new", True)
-            log.info("qa_session_created", session_id=session_id[:8])
+            log.info("qa_session_created", sid=session_id[:8])
             return doc, True
 
     # ── greeting ───────────────────────────────────────────────────────────────
@@ -1396,7 +1405,7 @@ class _QAControllerBase:
 
             doc = await self._redis.get(session_id)
             if doc is None:
-                log.error("qa_get_llm_input_no_doc", session_id=session_id[:8])
+                log.error("qa_get_llm_input_no_doc", sid=session_id[:8])
                 return None
 
             if doc.stage == QAStage.COMPLETE.value:
@@ -1426,7 +1435,7 @@ class _QAControllerBase:
             span.set_attribute("domain_switched",inp.domain_switched)
             span.set_attribute("q_index",        inp.q_index_in_domain)
 
-            log.info("qa_llm_input_built", **inp.to_log_dict(), session_id=session_id[:8])
+            log.info("qa_llm_input_built", **inp.to_log_dict(), sid=session_id[:8])
             return inp
 
     def _build_llm_input(self, doc: QADocument, last_answer: str) -> LLMInterviewInput:
@@ -1525,7 +1534,7 @@ class _QAControllerBase:
         t0 = time.monotonic()
 
         if not llm_question or not llm_question.strip():
-            log.error("qa_commit_empty_question", session_id=session_id[:8])
+            log.error("qa_commit_empty_question", sid=session_id[:8])
             return None
 
         async with self._session_lock(session_id):
@@ -1534,11 +1543,11 @@ class _QAControllerBase:
 
                 doc = await self._redis.get(session_id)
                 if doc is None:
-                    log.error("qa_commit_no_doc", session_id=session_id[:8])
+                    log.error("qa_commit_no_doc", sid=session_id[:8])
                     return None
 
                 if doc.stage == QAStage.COMPLETE.value:
-                    log.warning("qa_commit_already_complete", session_id=session_id[:8])
+                    log.warning("qa_commit_already_complete", sid=session_id[:8])
                     return None
 
                 domain = doc.active_domain
@@ -1613,6 +1622,14 @@ class _QAControllerBase:
             await self._redis.set(doc)
         return CLOSING_TEXT
 
+    async def mark_complete(self, session_id: str, reason: str = "") -> None:
+        """Force stage to 'complete'. Called by guardrail hard-stops."""
+        doc = await self._redis.get(session_id)
+        if doc and doc.stage != QAStage.COMPLETE.value:
+            doc.stage = QAStage.COMPLETE.value
+            await self._redis.set(doc)
+        log.info("qa_marked_complete", sid=session_id[:8], reason=reason)
+
     # ── document access ────────────────────────────────────────────────────────
 
     async def get_document(self, session_id: str) -> QADocument | None:
@@ -1623,7 +1640,7 @@ class _QAControllerBase:
         """Remove session from Redis on explicit session end."""
         await self._redis.delete(session_id)
         self._doc_lock.pop(session_id, None)
-        log.info("qa_session_evicted", session_id=session_id[:8])
+        log.info("qa_session_evicted", sid=session_id[:8])
 
     async def health(self) -> ServiceHealthState:
         """Return health state for /health endpoint."""
@@ -2004,7 +2021,7 @@ class QAAdminClient:
             return False
 
         if domain_key in doc.domains:
-            log.info("qa_admin_inject_already_present", domain=domain_key, session_id=session_id[:8])
+            log.info("qa_admin_inject_already_present", domain=domain_key, sid=session_id[:8])
             return True   # idempotent
 
         target = q_target or random.randint(QA_MIN_PER_DOMAIN, QA_MAX_PER_DOMAIN)
@@ -2096,7 +2113,7 @@ class _QAControllerWithRecovery(_QAControllerBase):
             await self._redis.set(doc)
             _sessions_created.inc()
             span.set_attribute("is_new", True)
-            log.info("qa_session_created", session_id=session_id[:8])
+            log.info("qa_session_created", sid=session_id[:8])
             return doc, True
 
     async def get_session_analytics(self, session_id: str) -> SessionAnalytics | None:
@@ -2464,7 +2481,7 @@ class QACheckpointStore:
                     from app.interview.qa_controller import QADocument  # type: ignore
                     return QADocument.from_json(raw)
         except Exception as exc:
-            log.warning("qa_checkpoint_restore_failed", session_id=session_id[:8], error=str(exc))
+            log.warning("qa_checkpoint_restore_failed", sid=session_id[:8], error=str(exc))
         return None
 
     async def list_checkpoints(self, session_id: str) -> list[str]:
@@ -2759,7 +2776,7 @@ class QuestionPrefetchBuffer:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log.debug("qa_prefetch_failed", session_id=session_id[:8], error=str(exc))
+            log.debug("qa_prefetch_failed", sid=session_id[:8], error=str(exc))
             _prefetch_misses.inc()
         finally:
             async with self._lock:
@@ -2869,16 +2886,17 @@ class LLMInputBuilder:
             )
 
         # ── Concept steering suffix ───────────────────────────────────────────
-        # get_steering_signal() reads Redis coverage map built by the Kafka
-        # consumer. Falls back cleanly (empty string) if no data yet.
-        steering = await concept_tracker.get_steering_signal(
-            session_id=doc.session_id,
-            domain=domain,
-            n_turns=q_index,
-        )
-        steer_suffix = steering.to_suffix_instruction()
-        if steer_suffix:
-            sys_text += f"\n\n{steer_suffix}"
+        # Skip when EQS is active — it injects a joint concept+difficulty suffix
+        # in QAControllerV2.get_llm_input() after build() returns.
+        if not (should_use_eqs(q_index, domain) and get_selector(doc.session_id)):
+            steering = await concept_tracker.get_steering_signal(
+                session_id=doc.session_id,
+                domain=domain,
+                n_turns=q_index,
+            )
+            steer_suffix = steering.to_suffix_instruction()
+            if steer_suffix:
+                sys_text += f"\n\n{steer_suffix}"
 
         messages = [
             SystemMessage(content=sys_text),
@@ -2957,7 +2975,7 @@ class QAControllerV2(_QAControllerWithRecovery):
                 if doc is None:
                     log.warning(
                         "qa_advance_stage_no_doc",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                         new_stage=new_stage,
                     )
                     return
@@ -2981,7 +2999,7 @@ class QAControllerV2(_QAControllerWithRecovery):
                 span.set_attribute("prev_stage", prev_stage)
                 log.info(
                     "qa_stage_advanced",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     prev_stage=prev_stage,
                     new_stage=new_stage,
                 )
@@ -3020,7 +3038,7 @@ class QAControllerV2(_QAControllerWithRecovery):
                 if doc is None:
                     log.warning(
                         "qa_set_raw_intro_no_doc",
-                        session_id=session_id[:8],
+                        sid=session_id[:8],
                     )
                     return
 
@@ -3031,7 +3049,7 @@ class QAControllerV2(_QAControllerWithRecovery):
 
                 log.info(
                     "qa_raw_intro_stored",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     intro_chars=len(raw_intro),
                 )
 
@@ -3090,7 +3108,7 @@ class QAControllerV2(_QAControllerWithRecovery):
 
             log.info(
                 "qa_seed_weighted_targets_applied",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 targets={k: v for k, v in weighted_targets.items()},
             )
 
@@ -3118,7 +3136,7 @@ class QAControllerV2(_QAControllerWithRecovery):
         # ── GUARD 2: stage != interview → not ready ──
         if doc.stage != QAStage.INTERVIEW.value:
             log.warning("qa_v2_get_llm_input_wrong_stage",
-                        session_id=session_id[:8], stage=doc.stage)
+                        sid=session_id[:8], stage=doc.stage)
             return None
 
         # ── GUARD 3: pre-rotation safety net ──
@@ -3131,16 +3149,47 @@ class QAControllerV2(_QAControllerWithRecovery):
 
         llm_input = await self._input_builder.build(doc, candidate_answer)
 
-        # ── Apply adaptive difficulty from PerformanceScaler ──────────────────
-        # get_current_signal() is always safe — returns a default if no state.
-        signal = await self._scaler.get_current_signal(session_id, doc.active_domain)
-        llm_input = apply_signal_to_llm_input(signal, llm_input)
+        domain = doc.active_domain
+        q_index = doc.questions_in_active_domain
+        eqs = get_selector(session_id)
 
-        log.debug(
-            "qa_scaler_signal",
-            session_id=session_id[:8],
-            **signal.to_log_dict(),
-        )
+        if should_use_eqs(q_index, domain) and eqs is not None:
+            # ── EQS path: joint (concept × difficulty) selection ──────────────
+            d_state = self._scaler.get_domain_state(session_id, domain)
+            coverage_map = await concept_tracker.get_coverage_map(session_id, domain)
+
+            traj = Trajectory.UNKNOWN
+            if d_state and d_state.score_history:
+                traj, _, _ = TrajectoryAnalyzer.analyze(
+                    d_state.score_history,
+                    d_state.difficulty_history,
+                )
+
+            spec = await eqs.select(
+                d_state=d_state,
+                coverage_map=coverage_map,
+                domain=domain,
+                q_index=q_index,
+                trajectory=traj,
+                score_history=d_state.score_history if d_state else [],
+            )
+            llm_input = spec_to_llm_input_patch(spec, llm_input)
+
+            log.debug(
+                "qa_eqs_spec",
+                sid=session_id[:8],
+                **spec.to_log_dict(),
+            )
+
+        else:
+            # ── Legacy path: unchanged ────────────────────────────────────────
+            signal = await self._scaler.get_current_signal(session_id, domain)
+            llm_input = apply_signal_to_llm_input(signal, llm_input)
+            log.debug(
+                "qa_scaler_signal",
+                sid=session_id[:8],
+                **signal.to_log_dict(),
+            )
 
         return llm_input
 
@@ -3313,11 +3362,11 @@ class QAControllerV2(_QAControllerWithRecovery):
             async with self._session_lock(session_id):
                 doc = await self._redis.get(session_id)
                 if doc is None:
-                    log.warning("qa_patch_no_doc", session_id=session_id[:8])
+                    log.warning("qa_patch_no_doc", sid=session_id[:8])
                     return False
 
                 if not doc.turns:
-                    log.warning("qa_patch_no_turns", session_id=session_id[:8])
+                    log.warning("qa_patch_no_turns", sid=session_id[:8])
                     return False
 
                 target = doc.turns[turn_index]
@@ -3440,7 +3489,7 @@ class QAControllerV2(_QAControllerWithRecovery):
                 # The DLQ in QAAuditBus will handle retry if the bus itself failed.
                 log.warning(
                     "qa_close_finalize_eval_failed",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     error=str(exc),
                 )
 
@@ -3453,7 +3502,7 @@ class QAControllerV2(_QAControllerWithRecovery):
         if doc:
             await concept_tracker.evict_session(session_id, doc.domains)
 
-        log.info("qa_session_v2_closed", session_id=session_id[:8])
+        log.info("qa_session_v2_closed", sid=session_id[:8])
 
     # ── checkpoint access ──────────────────────────────────────────────────────
 
@@ -3502,7 +3551,7 @@ class QAControllerV2(_QAControllerWithRecovery):
                 next_llm_input = next_input,
             )
         except Exception as exc:
-            log.debug("qa_prefetch_build_failed", session_id=session_id[:8], error=str(exc))
+            log.debug("qa_prefetch_build_failed", sid=session_id[:8], error=str(exc))
 
     # ── guardrail status ───────────────────────────────────────────────────────
 
@@ -3596,7 +3645,7 @@ class QAControllerV2(_QAControllerWithRecovery):
             if ok:
                 log.info(
                     "qa_domain_rescore_triggered",
-                    session_id=session_id[:8],
+                    sid=session_id[:8],
                     domain=domain,
                     path="audit_bus",
                 )
@@ -3605,13 +3654,13 @@ class QAControllerV2(_QAControllerWithRecovery):
             # the domain — fall through to QADocument-based fallback below.
             log.warning(
                 "qa_domain_rescore_audit_bus_no_pairs",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domain=domain,
             )
         except Exception as exc:
             log.warning(
                 "qa_domain_rescore_audit_bus_failed",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domain=domain,
                 error=str(exc),
             )
@@ -3621,7 +3670,7 @@ class QAControllerV2(_QAControllerWithRecovery):
         # Reads directly from QADocument.turns — bypasses DLQ and idempotency.
         log.warning(
             "qa_domain_rescore_using_fallback",
-            session_id=session_id[:8],
+            sid=session_id[:8],
             domain=domain,
         )
 
@@ -3629,7 +3678,7 @@ class QAControllerV2(_QAControllerWithRecovery):
         if not pairs:
             log.error(
                 "qa_domain_rescore_no_pairs",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domain=domain,
             )
             return False
@@ -3652,7 +3701,7 @@ class QAControllerV2(_QAControllerWithRecovery):
             )
             log.info(
                 "qa_domain_rescore_triggered",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domain=domain,
                 pairs=len(pairs),
                 path="direct_fallback",
@@ -3661,7 +3710,7 @@ class QAControllerV2(_QAControllerWithRecovery):
         except Exception as exc:
             log.error(
                 "qa_domain_rescore_failed",
-                session_id=session_id[:8],
+                sid=session_id[:8],
                 domain=domain,
                 error=str(exc),
             )
@@ -3726,8 +3775,8 @@ async def build_next_llm_input_for_voice_graph(
     except Exception as exc:
         log.error(
             "qa_build_llm_input_failed",
-            session_id = session_id[:8] if session_id else "?",
-            error      = str(exc),
+            sid=session_id[:8] if session_id else "?",
+            error=str(exc),
         )
         return None
 

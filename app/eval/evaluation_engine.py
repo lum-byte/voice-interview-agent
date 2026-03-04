@@ -791,6 +791,44 @@ class EvaluationEngine:
                     except Exception as _scaler_exc:
                         log.debug("perf_scaler_push_failed", error=str(_scaler_exc))
 
+                    # ── EQS outcome + entropy feedback ─────────────────────────
+                    # Fire-and-forget: EQS never blocks the eval pipeline.
+                    try:
+                        from app.eval.question_selector import get_selector
+                        from app.eval.performance_scaler import performance_scaler
+                        _eqs = get_selector(session_id)
+                        if _eqs is not None:
+                            _norm = result.overall / 10.0
+
+                            # Record outcome for weight adapter + Thompson arm
+                            _spec_placeholder = type(
+                                "_S", (), {
+                                    "concept_cluster": "",
+                                    "eig": 0.0,
+                                }
+                            )()
+                            asyncio.create_task(
+                                _eqs.record_outcome(
+                                    domain=domain,
+                                    turn_index=turn_index,
+                                    spec=_spec_placeholder,
+                                    eval_score=result.overall,
+                                ),
+                                name=f"eqs_outcome_{session_id[:8]}_{turn_index}",
+                            )
+
+                            # Record new belief entropy for momentum tracker
+                            _d = performance_scaler.get_domain_state(session_id, domain)
+                            if _d is not None:
+                                from app.eval.question_selector import entropy_bits
+                                _new_entropy = entropy_bits(list(_d.belief.probs))
+                                asyncio.create_task(
+                                    _eqs.record_entropy(turn_index, _new_entropy),
+                                    name=f"eqs_entropy_{session_id[:8]}_{turn_index}",
+                                )
+                    except Exception as _eqs_exc:
+                        log.debug("eqs_feedback_failed", error=str(_eqs_exc))
+
                     await self._rset(cache_key, raw_json, ttl=EVAL_TTL_S)
 
                     # Deduct from session budget
