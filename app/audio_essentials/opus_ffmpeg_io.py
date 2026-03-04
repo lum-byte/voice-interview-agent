@@ -1036,7 +1036,7 @@ class AdaptiveJitterBuffer:
         Blocks until the packet is due or a gap exceeds the target delay.
 
         Returns:
-            (opus_bytes, is_concealment) — concealment=True signals PLC was used.
+            (opus_bytes, is_concealment) — concealment=True _signals PLC was used.
         """
         while True:
             async with self._lock:

@@ -37,7 +37,7 @@ GUARDRAILS:
      Invalid responses trigger rule-based fallback via qa_controller.
 
   3. Neither InterviewerMode nor ATSMode has access to session history,
-     full QA state, or evaluation signals. These are structurally excluded
+     full QA state, or evaluation _signals. These are structurally excluded
      from the message lists they receive.
 
   4. All modes operate through the same resilience stack:

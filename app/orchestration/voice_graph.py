@@ -308,6 +308,21 @@ from app.interview.qa_controller import ( # noqa
 conversation_memory = None
 transcript_writer   = None
 
+# PGS — psychographic signal engine.
+# Same lazy pattern as EQS: imported once, cached. If the pgs package is not
+# installed the reference stays None and all call sites no-op silently.
+_pgs_engine: Any = None
+
+def _get_pgs_engine() -> Any:
+    global _pgs_engine
+    if _pgs_engine is None:
+        try:
+            from app.pgs import pgs as _p  # type: ignore
+            _pgs_engine = _p
+        except Exception: # noqa
+            pass
+    return _pgs_engine
+
 from app.user_tracking.session_service.conversation_memory import (
     qa_audit_bus as _qa_audit_bus,
     route_committed_turn_to_audit as _route_committed_turn, # noqa
@@ -1896,6 +1911,10 @@ class SessionLifecycleManager:
                 log.warning("session_eqs_create_failed",
                             sid=session_id[:8], error=str(exc))
 
+            # PGS open_session fires from qa_controller.seed_from_intro() after
+            # ATS extraction completes — domains and level are populated by then.
+
+
             # ── finalise ──────────────────────────────────────────────────────
             resources.degraded = degraded
             async with self._lock:
@@ -2032,6 +2051,18 @@ class SessionLifecycleManager:
                               **resources.eqs.health())
             except Exception as exc:
                 log.debug("session_eqs_deregister_error", error=str(exc))
+
+            # ── 9b. PGS — evict behavioral session ────────────────────────────
+            # Runs after EQS deregister so both cognition layers clean up in order.
+            # Eviction purges all in-process signal windows + Redis keys for the
+            # session. Non-blocking: evict is a best-effort cleanup, never critical.
+            try:
+                _pgs = _get_pgs_engine()
+                if _pgs is not None:
+                    await _pgs.evict_session(session_id)
+                    log.debug("session_pgs_evicted", sid=session_id[:8])
+            except Exception as exc:
+                log.debug("session_pgs_evict_error", sid=session_id[:8], error=str(exc))
 
             # ── 10. Question prefetch cancel ───────────────────────────────────
             try:
@@ -3287,24 +3318,54 @@ def _schedule_eval_if_enabled(
 
     The engine's own adaptive sampling, budget cap, and circuit breaker decide
     whether this particular turn actually gets scored.
+
+    When the eval engine returns a score, it is forwarded to PGS so the
+    behavioral signal engines can update their score-dependent computations
+    (recovery velocity, consistency, probe oracle). This bridge runs in the
+    same background task — zero additional latency on the critical path.
     """
     if not _eval_enabled:
         return
 
-    try:
-        asyncio.create_task(
-            _eval_engine.schedule_turn(
+    async def _eval_and_pgs_bridge() -> None:
+        try:
+            result = await _eval_engine.schedule_turn(
                 session_id=session_id,
                 turn_index=turn_index,
                 question=question,
                 answer=candidate_answer,
                 domain=domain,
-            ),
+            )
+            # forward score to PGS if the eval engine returned one
+            if result is not None:
+                score: float | None = None
+                if isinstance(result, (int, float)):
+                    score = float(result)
+                elif hasattr(result, "overall"):
+                    score = float(result.overall)
+                elif hasattr(result, "score"):
+                    score = float(result.score)
+
+                if score is not None:
+                    _pgs = _get_pgs_engine()
+                    if _pgs is not None:
+                        await _pgs.push_score(
+                            session_id = session_id,
+                            turn_index = turn_index,
+                            score      = max(0.0, min(1.0, score / 10.0))
+                                         if score > 1.0 else score,
+                            domain     = domain,
+                        )
+        except Exception as exc:
+            log.debug("eval_schedule_failed", sid=session_id[:8], error=str(exc))
+
+    try:
+        asyncio.create_task(
+            _eval_and_pgs_bridge(),
             name=f"eval_{session_id[:8]}_{turn_index}",
         )
     except Exception as exc:
-        # create_task itself can fail if the loop is closing
-        log.debug("eval_schedule_failed", sid=session_id[:8], error=str(exc))
+        log.debug("eval_task_create_failed", sid=session_id[:8], error=str(exc))
 
 
 async def _prefetch_next_question(session_id: str, current_domain: str) -> None:

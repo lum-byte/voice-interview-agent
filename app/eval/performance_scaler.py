@@ -967,7 +967,7 @@ class ProbeOracle:
                 reasons.append(f"perfect_streak({PROBE_STREAK_NEEDED})")
 
         if not probe_scores:
-            return (False, None, 0.0, "no probe signals") # noqa
+            return (False, None, 0.0, "no probe _signals") # noqa
 
         best_action = max(probe_scores, key=lambda a: probe_scores[a])
         confidence  = min(1.0, probe_scores[best_action])
@@ -1378,6 +1378,17 @@ class PerformanceScaler:
         if state is None:
             return None
         return state.domain_states.get(domain)
+
+    def get_current_difficulty(self, session_id: str, domain: str) -> float:
+        """
+        Synchronous read of current_difficulty for the given domain.
+        Used by PGS ingest to pass accurate difficulty to behavioral engines.
+        Returns 0.45 (medium) if session or domain not yet initialised.
+        """
+        d_state = self.get_domain_state(session_id, domain)
+        if d_state is None:
+            return 0.45
+        return d_state.current_difficulty
 
     # ── Internal computation ───────────────────────────────────────────────────
 

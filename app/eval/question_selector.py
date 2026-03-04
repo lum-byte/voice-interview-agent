@@ -347,7 +347,7 @@ CONCEPT_PREREQUISITES: dict[str, dict[str, list[str]]] = {
         "file_systems":       ["memory_basics"],
         "io_systems":         ["file_systems"],
         "ipc":                ["processes", "synchronization"],
-        "signals":            ["processes", "ipc"],
+        "_signals":            ["processes", "ipc"],
         "system_calls":       ["processes", "threads"],
         "kernel_user_space":  ["system_calls", "virtual_memory"],
     },
@@ -431,7 +431,7 @@ CONCEPT_DISCRIMINABILITY: dict[str, dict[str, float]] = {
         "processes": 0.9, "threads": 1.3, "scheduling": 1.8,
         "memory_basics": 1.1, "virtual_memory": 1.8, "paging_segmentation": 2.0,
         "synchronization": 2.0, "deadlocks": 2.1, "file_systems": 1.5,
-        "io_systems": 1.7, "ipc": 1.9, "signals": 1.8,
+        "io_systems": 1.7, "ipc": 1.9, "_signals": 1.8,
         "system_calls": 1.6, "kernel_user_space": 2.3,
     },
     "cpp": {
@@ -1320,7 +1320,7 @@ class EpistemicMomentumTracker:
     """
     Tracks the rate of belief entropy reduction across successive turns.
 
-    The core insight: a fast-converging belief distribution signals that
+    The core insight: a fast-converging belief distribution _signals that
     the IRT likelihood is doing its job — the questions are discriminative
     and the candidate is not near any level boundary. At this point,
     continuing to maximise EIG is redundant; the system should pivot to
@@ -1653,7 +1653,7 @@ class EQSWeightAdapter:
     After enough eval scores arrive, the adapter adjusts weights to maximise
     the correlation between the composite score at selection time and the
     actual eval score that subsequently arrives. This is a form of
-    self-supervised meta-learning: the EQS learns which signals actually
+    self-supervised meta-learning: the EQS learns which _signals actually
     predict good candidate responses for this specific session.
 
     Update rule (projected stochastic gradient ascent):

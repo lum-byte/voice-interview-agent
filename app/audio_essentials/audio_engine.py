@@ -383,7 +383,7 @@ class AudioHealthReport:
     status: Literal["ok", "degraded", "failed"]
     clipping_rate: float      # fraction of recent chunks clipping
     silence_rate: float       # fraction of recent chunks silent
-    dc_offset_mean: float     # mean DC offset (signals hardware fault)
+    dc_offset_mean: float     # mean DC offset (_signals hardware fault)
     dropout_count: int        # seq number gaps detected
     rms_mean: float           # mean RMS level
     notes: list[str]          # human-readable issue list
@@ -4217,7 +4217,7 @@ class PCMEchoCanceller:
         w(n+1) = w(n) + μ · e(n) · x_buffer / (||x_buffer||² + δ)
 
     Parameters:
-        fmt:          PCMFormat of both mic and reference signals.
+        fmt:          PCMFormat of both mic and reference _signals.
         filter_len:   Adaptive filter length in samples. Default 512 (32 ms @ 16 kHz).
         step_size:    NLMS step size μ. Default 0.05. Higher = faster adaptation.
         regularisation: NLMS δ (prevents division by zero). Default 1e-6.

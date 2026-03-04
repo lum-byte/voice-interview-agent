@@ -10,7 +10,7 @@ MENTAL MODEL:
   The LLM is a QUESTION GENERATOR, not a conversational assistant.
   It receives the minimum possible context to produce the next question.
   It does NOT receive conversation history. It does NOT receive evaluation
-  signals. It does NOT receive the full QA state. It receives:
+  _signals. It does NOT receive the full QA state. It receives:
 
       domain | level | last_question | last_answer | domain_switch_flag
 
@@ -124,6 +124,20 @@ from app.eval.question_selector import (
 
 from app.monitoring.observability import get_logger
 from app.eval.concept_tracker import concept_tracker, QuestionAskedEvent
+
+# PGS is imported lazily at first use — avoids circular import at module load.
+# The module-level reference is set once and cached for the process lifetime.
+_pgs: Any = None
+
+def _get_pgs() -> Any:
+    global _pgs
+    if _pgs is None:
+        try:
+            from app.pgs import pgs as _pgs_singleton  # type: ignore
+            _pgs = _pgs_singleton
+        except Exception: # noqa
+            pass
+    return _pgs
 
 log = get_logger(__name__)
 tracer = get_tracer(__name__)
@@ -478,7 +492,7 @@ class ATSRuleExtractor:
       2. Fallback when LLM call fails
       3. Confidence comparison to decide if LLM result is trustworthy
 
-    Confidence is computed from how many signals were successfully extracted.
+    Confidence is computed from how many _signals were successfully extracted.
     A 0.4 confidence means: name unclear, level ambiguous, <2 domains found.
     A 0.9 confidence means: name found, clear level signal, 3+ domains found.
     """
@@ -586,7 +600,7 @@ JSON schema (strict — return exactly these keys):
   "domains":  ["<domain_key>", ...],
   "level":    "beginner" | "intermediate" | "advanced",
   "languages": ["<language name>", ...],
-  "notes":    "<one sentence of extra signals, or empty string>"
+  "notes":    "<one sentence of extra _signals, or empty string>"
 }
 
 Valid domain_key values (use ONLY these exact strings):
@@ -2784,12 +2798,21 @@ class QuestionPrefetchBuffer:
                 if task and not task.done():
                     task.cancel()
 
+
     def cancel_session(self, session_id: str) -> None:
         """Cancel any in-flight prefetch for a session on session close."""
         task = self._in_flight.pop(session_id, None)
         if task and not task.done():
             task.cancel()
 
+    def get(self, session_id: str, domain: str) -> str | None: # noqa
+        """
+        Retrieve a prefetched question if one completed for this session/domain.
+        Returns None if no result is cached — caller falls back to live generation.
+        Currently a stub: prefetch warms the LLM cache; retrieval happens via
+        stream_question() cache hit. Always returns None to use that path.
+        """
+        return None
 
 # Module-level prefetch buffer singleton
 qa_prefetch_buffer = QuestionPrefetchBuffer()
@@ -2897,6 +2920,27 @@ class LLMInputBuilder:
             steer_suffix = steering.to_suffix_instruction()
             if steer_suffix:
                 sys_text += f"\n\n{steer_suffix}"
+
+        # ── PGS constraint suffix ─────────────────────────────────────────────
+        # Appended last so it overrides any conflicting stylistic instruction.
+        # The constraint set is craft language only — no psychological terms.
+        # get_constraints() is non-blocking: returns neutral on any error or
+        # when fewer than 3 turns have been committed (system hasn't converged).
+        try:
+            _pgs_ref = _get_pgs()
+            if _pgs_ref is not None:
+                cs = await _pgs_ref.get_constraints(
+                    session_id    = doc.session_id,
+                    domain        = domain,
+                    n_turns       = doc.turn_index,
+                    stated_level  = level,
+                    active_domain = domain,
+                )
+                pgs_suffix = cs.to_suffix()
+                if pgs_suffix:
+                    sys_text += f"\n\n{pgs_suffix}"
+        except Exception as _pgs_exc:
+            log.debug("pgs_constraint_suffix_failed", sid=doc.session_id[:8], error=str(_pgs_exc))
 
         messages = [
             SystemMessage(content=sys_text),
@@ -3098,6 +3142,17 @@ class QAControllerV2(_QAControllerWithRecovery):
             _stage_transitions.labels(from_stage="intro", to_stage="interview").inc()
             _active_sessions.inc()
 
+            _pgs_ref = _get_pgs()
+            if _pgs_ref is not None:
+                asyncio.create_task(
+                    _pgs_ref.open_session(
+                        session_id=session_id,
+                        stated_level=ats_result.level,
+                        domains=doc.domains,
+                    ),
+                    name=f"pgs_open_{session_id[:8]}",
+                )
+
             # ── Apply weighted targets over the random defaults just assigned ─────
             for domain, target in weighted_targets.items():
                 if domain in doc.domain_progress:
@@ -3279,6 +3334,33 @@ class QAControllerV2(_QAControllerWithRecovery):
             answer_text=candidate_answer,
             difficulty=None,  # scaler reads its own current_difficulty
         )
+
+        # ── PGS behavioral ingestion (fire-and-forget, off critical path) ─────
+        # Must fire AFTER scaler.notify_turn_committed so difficulty state is set.
+        # Timing: answer_duration_s from the timing record if present, else 0.
+        # pgs.ingest() never raises — it degrades silently on any internal error.
+        _pgs_ref = _get_pgs()
+        if _pgs_ref is not None:
+            _pgs_duration = timing.answer_duration_s if timing else 0.0
+            _pgs_difficulty = (
+                self._scaler.get_current_difficulty(session_id, committed.domain)
+                if hasattr(self._scaler, "get_current_difficulty")
+                else "medium"
+            )
+            asyncio.create_task(
+                _pgs_ref.ingest(
+                    session_id   = session_id,
+                    turn_index   = committed.turn_index,
+                    domain       = committed.domain,
+                    level        = doc.candidate.level if doc.candidate else "intermediate",
+                    question     = llm_question,
+                    answer       = candidate_answer,
+                    answer_words = len(candidate_answer.split()),
+                    duration_s   = _pgs_duration,
+                    difficulty   = _pgs_difficulty,
+                ),
+                name=f"pgs_ingest_{session_id[:8]}_{committed.turn_index}",
+            )
 
         # ── Emit concept tracking event (fire-and-forget via Kafka) ───────────
         # Only the question travels — answer never leaves this process boundary.

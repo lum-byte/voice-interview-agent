@@ -325,7 +325,7 @@ _pcm_chunk_rms = make_histogram(
     buckets=(0.001, 0.005, 0.01, 0.03, 0.05, 0.1, 0.2, 0.5),
 )
 
-# Counts quality-gate retries. A high rate here signals model instability.
+# Counts quality-gate retries. A high rate here _signals model instability.
 _pcm_quality_retries = make_counter(
     "tts_pcm_quality_retries_total",
     "PCMChunk quality-gate retry events",

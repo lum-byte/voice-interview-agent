@@ -3280,7 +3280,7 @@ _LIVE_REFRESH_HZ = 12    # dashboard redraws per second
 #  Feeds every subsystem, then renders a Rich Text log line.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Events whose presence signals the start / end of a long op (for spinners)
+# Events whose presence _signals the start / end of a long op (for spinners)
 _SPINNER_START_EVENTS = {
     "llm_stream_started", "tts_synthesis_started",
     "stt_transcription_started", "pipeline_stage_started",
@@ -4115,7 +4115,7 @@ class _DualSinkRenderer:  # type: ignore[no-redef]  # noqa: F811
         if event_dict.get("voice"):
             m.voice = str(event_dict["voice"])
 
-        # Mark service down if event signals total failure
+        # Mark service down if event _signals total failure
         if event.endswith("_unavailable") or "circuit_open" in event:
             m.status = "down"
 

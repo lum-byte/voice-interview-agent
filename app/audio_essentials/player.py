@@ -482,7 +482,7 @@ async def play_audio_bytes(
     (~1–5 ms, unavoidable), it enqueues the data and returns in ~microseconds.
     The actual OutputStream.write() runs on the dedicated writer thread.
 
-    Stops any active file-path playback (signals stop, does NOT join) so the
+    Stops any active file-path playback (_signals stop, does NOT join) so the
     two paths never write to the device simultaneously.
 
     Args:
@@ -558,7 +558,7 @@ def stop_stream() -> None:
     Stop the streaming path and close the PCMOutputStream.
 
     Calls PCMOutputStream.stop() which cancels any pending async writes and
-    closes the underlying hardware stream. Also signals the interrupt detector
+    closes the underlying hardware stream. Also _signals the interrupt detector
     that playback has stopped.
 
     Safe to call at any time from any thread.

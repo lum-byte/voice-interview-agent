@@ -867,7 +867,7 @@ class CandidateClaimEntry:
 @dataclass
 class CandidateSignalMap:
     """
-    Per-session per-domain store of all answer signals extracted so far.
+    Per-session per-domain store of all answer _signals extracted so far.
     Sits alongside ConceptCoverageMap in Redis.
 
     Responsibilities:
@@ -1007,7 +1007,7 @@ class CandidateSignalMap:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # § UPDATED ConceptSteeringSignal
-# Replaces the original. Three new list fields for answer-axis signals.
+# Replaces the original. Three new list fields for answer-axis _signals.
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Monkey-patch the existing ConceptSteeringSignal with the new fields and
@@ -1115,7 +1115,7 @@ class ConceptSteeringSignal:  # noqa: F811 — intentional rebind
 
 class AnswerSignalExtractor:
     """
-    Extracts concept-level signals from a candidate's spoken answer.
+    Extracts concept-level _signals from a candidate's spoken answer.
 
     Pass 1 — REGISTRY CLAIM DETECTION
         Checks answer against CONCEPT_REGISTRY[domain] keywords.
@@ -1665,7 +1665,7 @@ def _build_extended_tracker() -> "ConceptTracker":
                 avoid = coverage.covered_concepts()[:MAX_AVOID_HINTS]
                 focus = coverage.uncovered_concepts(domain)[:MAX_FOCUS_HINTS]
 
-                # Axis 2: answer signals
+                # Axis 2: answer _signals
                 pending             = signal_map.pending_probes(current_turn=n_turns)
                 probe_concepts      = [e.concept for e in pending if e.signal_type in ("claimed", "slip") and e.press_urgency > 0.3][:MAX_PROBE_HINTS]
                 weak_concepts       = [e.concept for e in pending if e.signal_type == "weak" and e.press_urgency > 0.3][:MAX_WEAK_HINTS]

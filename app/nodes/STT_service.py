@@ -278,7 +278,7 @@ _pcm_wav_bytes_sent = make_counter(
     "WAV bytes encoded from PCMChunks and sent to Whisper",
 )
 
-# Counts confidence filter rejections — high rate signals noisy audio or
+# Counts confidence filter rejections — high rate _signals noisy audio or
 # model regression; calibrate PCM_CONFIDENCE_THRESHOLD accordingly.
 _pcm_confidence_rejects = make_counter(
     "stt_pcm_confidence_rejects_total",

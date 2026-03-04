@@ -111,7 +111,7 @@ groups:
       - record: job:ai_pipeline_stage_error_rate:rate2m
         expr: sum(rate(ai_pipeline_stage_errors_total[2m])) by (stage, error_type)
 
-      # Per-stage retry rate — retries without errors signals flaky upstream.
+      # Per-stage retry rate — retries without errors _signals flaky upstream.
       - record: job:ai_pipeline_stage_retry_rate:rate2m
         expr: sum(rate(ai_pipeline_stage_retries_total[2m])) by (stage)
 
