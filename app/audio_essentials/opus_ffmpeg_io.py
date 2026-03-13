@@ -1,8 +1,8 @@
 """
 opus_ffmpeg_io.py — Elite Opus/FFmpeg Audio Pipeline
 
-A ground-up rewrite of the codec layer, benchmarked against Discord, WebRTC,
-and Zoom for voice quality, latency, and operational resilience.
+A ground-up rewrite of the codec layer 
+for voice quality, latency, and operational resilience.
 
 Design goals:
   1. Asyncio-native — zero blocking calls on the event loop
